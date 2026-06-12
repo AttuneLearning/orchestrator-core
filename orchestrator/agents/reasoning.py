@@ -24,13 +24,15 @@ from .base import (ComplexityAssessment, GateReview, IssueSpec, TriageDecision,
 
 class Reasoner(Protocol):
     def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]: ...
-    def plan_issue(self, issue: Issue) -> str: ...
+    def plan_issue(self, issue: Issue, rules: str = "") -> str: ...
     def gate_review(self, issue: Issue, gate_type: str,
-                    recent: Optional[list[dict[str, Any]]] = None) -> GateReview: ...
+                    recent: Optional[list[dict[str, Any]]] = None,
+                    rules: str = "") -> GateReview: ...
     def score_drift(self, issue: Issue,
                     recent: Optional[list[dict[str, Any]]] = None) -> float: ...
     def triage_message(self, message: dict[str, Any]) -> TriageDecision: ...
     def assess_complexity(self, issue: Issue) -> ComplexityAssessment: ...
+    def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]: ...
 
 
 class StubReasoner:
@@ -43,10 +45,10 @@ class StubReasoner:
         ]
         return specs[:max_subissues]
 
-    def plan_issue(self, issue: Issue) -> str:
+    def plan_issue(self, issue: Issue, rules: str = "") -> str:
         return f"Plan for '{issue.title}': implement, add tests, verify, complete."
 
-    def gate_review(self, issue, gate_type, recent=None) -> GateReview:
+    def gate_review(self, issue, gate_type, recent=None, rules: str = "") -> GateReview:
         # Stub passes every gate so issues flow to done in the happy path.
         return GateReview(passed=True, reasons=[f"{gate_type} exit criteria met (stub)"])
 
@@ -62,6 +64,10 @@ class StubReasoner:
         # Stub never decomposes, keeping hermetic runs simple and bounded;
         # decomposition paths are exercised by tests with an injected reasoner.
         return ComplexityAssessment(decompose=False, subissues=[])
+
+    def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]:
+        # Stub never proposes rules; gap-detection paths are test-injected.
+        return None
 
 
 class AnthropicReasoner:
@@ -101,23 +107,32 @@ class AnthropicReasoner:
         ]
         return specs[:max_subissues]
 
-    def plan_issue(self, issue: Issue) -> str:
+    def plan_issue(self, issue: Issue, rules: str = "") -> str:
         system = "Produce a concise implementation plan (3-6 steps) for the issue."
-        return self._ask(system, f"Issue: {issue.title}\n\n{issue.description}")
+        user = f"Issue: {issue.title}\n\n{issue.description}"
+        if rules:
+            user += f"\n\n{rules}"
+        return self._ask(system, user)
 
-    def gate_review(self, issue, gate_type, recent=None) -> GateReview:
+    def gate_review(self, issue, gate_type, recent=None, rules: str = "") -> GateReview:
         system = (
             f"You are the reviewer for the '{gate_type}' gate of a 5-phase issue "
             "pipeline (intake, implementation, qa_gate, completion, comms_response). "
-            'Decide if the gate passes. Output JSON: {"passed": bool, "reasons": [str]}.'
+            "Decide if the gate passes. If applicable rules are listed, verify "
+            "each one; a violated rule fails the gate and its id goes in "
+            '"violated_rules". Output JSON: {"passed": bool, "reasons": [str], '
+            '"violated_rules": [str]}.'
         )
         user = (
             f"Issue: {issue.title}\nState: {issue.state}\nGate: {gate_type}\n"
             f"Recent events: {json.dumps(recent or [])[:1500]}"
         )
+        if rules:
+            user += f"\n\n{rules}"
         data = extract_json(self._ask(system, user))
         return GateReview(passed=bool(data.get("passed")),
-                          reasons=list(data.get("reasons", [])))
+                          reasons=list(data.get("reasons", [])),
+                          violated_rules=list(data.get("violated_rules", [])))
 
     def score_drift(self, issue, recent=None) -> float:
         system = (
@@ -169,6 +184,23 @@ class AnthropicReasoner:
         ]
         return ComplexityAssessment(decompose=bool(data.get("decompose")) and bool(specs),
                                     subissues=specs)
+
+    def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]:
+        system = (
+            "An issue completed with NO architecture rules governing its kind of "
+            "work. Decide whether a reusable decision should be recorded. Only "
+            "propose genuinely reusable, project-level decisions — not one-off "
+            "details. Output JSON: null, or {\"domain\": str, \"title\": str, "
+            '"decision": str (ONE imperative sentence agents will follow), '
+            '"context": str (why), "applies_to": {"work_types": [str], '
+            '"teams": [str], "repos": [str]}}.'
+        )
+        user = (f"Issue: {issue.title}\nTeam: {issue.team}\n"
+                f"Work type: {issue.work_type}\n\n{issue.description}")
+        data = extract_json(self._ask(system, user))
+        if not data or not isinstance(data, dict) or not data.get("decision"):
+            return None
+        return data
 
 
 def make_reasoner(settings: Settings) -> Reasoner:

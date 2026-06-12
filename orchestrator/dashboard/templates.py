@@ -54,6 +54,7 @@ def page(title: str, body: str) -> str:
         f"<title>{escape(title)} · orchestrator</title><style>{_CSS}</style></head><body>"
         "<header><nav>"
         "<a href='/'>Fleet</a><a href='/agents'>Agents</a>"
+        "<a href='/adrs'>ADRs</a>"
         "<a href='/api/state'>JSON</a>"
         "</nav></header><main>"
         f"{body}"
@@ -183,6 +184,63 @@ def issue_detail(issue: dict[str, Any], events: list[dict[str, Any]]) -> str:
         f"{directive}"
         f"<p>{escape(issue['description'] or '')}</p>"
         f"<h2>Timeline ({len(events)} events)</h2>{ev_html or '<p class=muted>No events.</p>'}"
+    ))
+
+
+def adrs_page(adrs: list[dict[str, Any]]) -> str:
+    def section(title: str, items: list[dict[str, Any]], approvable: bool) -> str:
+        if not items:
+            return ""
+        rows = "".join(
+            f"<tr><td><a href='/adrs/{escape(a['adr_key'])}'>{escape(a['adr_key'])}</a></td>"
+            f"<td>{escape(a['title'])}</td>"
+            f"<td>{escape(', '.join((a['applies_to'] or {}).get('repos') or []) or 'project-wide')}</td>"
+            f"<td>{escape(a['decision'][:90])}</td>"
+            + (f"<td><form method='post' action='/adrs/{escape(a['adr_key'])}/approve'>"
+               "<button class='alt'>Approve</button></form></td>" if approvable else "<td></td>")
+            + "</tr>"
+            for a in items
+        )
+        return (f"<h2>{escape(title)}</h2><table><tr><th>Key</th><th>Title</th>"
+                f"<th>Scope</th><th>Rule</th><th></th></tr>{rows}</table>")
+
+    by = lambda s: [a for a in adrs if a["status"] == s]  # noqa: E731
+    body = (
+        "<h1>ADR governance rules</h1>"
+        + section("Proposed (awaiting your approval)", by("proposed"), True)
+        + section("Accepted (live)", by("accepted"), False)
+        + section("Superseded / deprecated",
+                  by("superseded") + by("deprecated"), False)
+        or "<p class='muted'>No ADRs yet.</p>"
+    )
+    return page("ADRs", body)
+
+
+def adr_detail(adr: dict[str, Any], incoming: list[str]) -> str:
+    def links(keys: list[str]) -> str:
+        return ", ".join(f"<a href='/adrs/{escape(k)}'>{escape(k)}</a>"
+                         for k in keys) or "<span class='muted'>—</span>"
+
+    sel = adr["applies_to"] or {}
+    approve = ""
+    if adr["status"] == "proposed":
+        approve = (f"<form method='post' action='/adrs/{escape(adr['adr_key'])}/approve'>"
+                   "<button class='alt'>Approve (goes live next tick)</button></form>")
+    return page(adr["adr_key"], (
+        f"<h1>{escape(adr['adr_key'])}: {escape(adr['title'])} "
+        f"{_state(adr['status'])}</h1>{approve}"
+        f"<h2>Rule (what agents receive)</h2><pre>{escape(adr['decision'])}</pre>"
+        f"<h2>Rationale (humans only)</h2><p>{escape(adr['context'] or '—')}</p>"
+        "<h2>Scope</h2><p class='muted'>"
+        f"work_types: {escape(', '.join(sel.get('work_types') or []) or 'all')} · "
+        f"teams: {escape(', '.join(sel.get('teams') or []) or 'all')} · "
+        f"repos: {escape(', '.join(sel.get('repos') or []) or 'project-wide')}</p>"
+        "<h2>Links</h2>"
+        f"<p>related: {links(adr['related'] or [])}<br>"
+        f"supersedes: {links(adr['supersedes'] or [])}<br>"
+        f"patterns: {escape(', '.join(adr['patterns'] or []) or '—')}<br>"
+        f"linked from: {links(incoming)}</p>"
+        f"<p class='muted'>proposed by {escape(adr['proposed_by'])}</p>"
     ))
 
 

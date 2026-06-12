@@ -20,9 +20,42 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
 
     @mcp.tool()
     def adr_create(domain: str, title: str, decision: str = "",
-                   context: str = "") -> dict[str, Any]:
-        """Create an ADR (ADR-{DOMAIN}-{NNN}). Mirror of /adr create."""
-        return repo.create_adr(pool, domain, title, decision, context)
+                   context: str = "",
+                   work_types: Optional[list[str]] = None,
+                   teams: Optional[list[str]] = None,
+                   repos: Optional[list[str]] = None,
+                   related: Optional[list[str]] = None,
+                   supersedes: Optional[list[str]] = None,
+                   patterns: Optional[list[str]] = None,
+                   proposed_by: str = "agent") -> dict[str, Any]:
+        """Propose an ADR rule (ADR-{DOMAIN}-{NNN}). Mirror of /adr suggest.
+
+        decision = one compact imperative directive agents will receive.
+        Empty selector dimensions match everything; repos=[] = project-wide.
+        Proposals are inert until a human approves (adr_approve)."""
+        return repo.create_adr(
+            pool, domain, title, decision, context,
+            applies_to={"work_types": work_types or [], "teams": teams or [],
+                        "repos": repos or []},
+            related=related, supersedes=supersedes, patterns=patterns,
+            status="proposed", proposed_by=proposed_by,
+        )
+
+    @mcp.tool()
+    def adr_list(status: Optional[str] = None,
+                 domain: Optional[str] = None) -> list[dict[str, Any]]:
+        """List ADR rules, optionally by status/domain. Mirror of /adr status."""
+        return repo.list_adrs(pool, status=status, domain=domain)
+
+    @mcp.tool()
+    def adr_get(adr_key: str) -> Optional[dict[str, Any]]:
+        """Fetch one ADR rule by key. Mirror of /adr review."""
+        return repo.get_adr(pool, adr_key)
+
+    @mcp.tool()
+    def adr_approve(adr_key: str, actor: str = "human") -> dict[str, Any]:
+        """Promote a proposed ADR to accepted (it becomes live for agents)."""
+        return repo.approve_adr(pool, adr_key, actor=actor)
 
     @mcp.tool()
     def comms_send(from_team: str, to_team: str, subject: str, body: str = "",

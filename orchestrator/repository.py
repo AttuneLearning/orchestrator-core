@@ -144,7 +144,7 @@ def create_issue(
             RETURNING id, goal_id, title, description, parent_id, depth, team,
                       pipeline, state, gate_type, retry_count, step_count,
                       assigned_agent, triggered_by_message, origin_message_id,
-                      created_at, updated_at
+                      work_type, created_at, updated_at
             """,
             (goal_id, parent_id, depth, team, title, description, pipeline,
              triggered_by_message, origin_message_id),
@@ -208,6 +208,15 @@ def count_issues_for_goal(pool: ConnectionPool, goal_id: int) -> int:
         ).fetchone()[0]
 
 
+def set_work_type(pool: ConnectionPool, issue_id: int, work_type: str) -> None:
+    """Tag an issue's detected work-type (drives ADR rule selection)."""
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE issues SET work_type = %s, updated_at = now() WHERE id = %s",
+            (work_type, issue_id),
+        )
+
+
 def claim_issue(pool: ConnectionPool, issue_id: int, agent_id: int) -> None:
     with pool.connection() as conn, conn.transaction():
         conn.execute(
@@ -250,7 +259,7 @@ def update_state(
             f"UPDATE issues SET {', '.join(sets)} WHERE id = %s RETURNING "
             "id, goal_id, title, description, parent_id, depth, team, pipeline, "
             "state, gate_type, retry_count, step_count, assigned_agent, "
-            "triggered_by_message, origin_message_id, created_at, updated_at",
+            "triggered_by_message, origin_message_id, work_type, created_at, updated_at",
             params,
         ).fetchone()
         _append_event(conn, issue_id, event_type, from_state, to_state, payload or {})
@@ -520,22 +529,90 @@ def memory_search(
 # ADRs & messages (skill-tool backing)
 # --------------------------------------------------------------------------- #
 
+_ADR_COLS = ["id", "adr_key", "domain", "title", "status", "decision", "context",
+             "applies_to", "related", "supersedes", "patterns", "proposed_by",
+             "created_at"]
+_ADR_SELECT = ("SELECT id, adr_key, domain, title, status, decision, context, "
+               "applies_to, related, supersedes, patterns, proposed_by, created_at "
+               "FROM adrs")
+
+
 def create_adr(
-    pool: ConnectionPool, domain: str, title: str, decision: str = "", context: str = ""
+    pool: ConnectionPool,
+    domain: str,
+    title: str,
+    decision: str = "",
+    context: str = "",
+    *,
+    applies_to: Optional[dict[str, Any]] = None,
+    related: Optional[list[str]] = None,
+    supersedes: Optional[list[str]] = None,
+    patterns: Optional[list[str]] = None,
+    status: str = "accepted",
+    proposed_by: str = "human",
 ) -> dict[str, Any]:
+    """Create an ADR rule. decision = the compact directive agents receive;
+    context = rationale (humans only). status='proposed' rules are inert until
+    approve_adr promotes them."""
     with pool.connection() as conn, conn.transaction():
         n = conn.execute(
             "SELECT count(*) FROM adrs WHERE domain = %s", (domain,)
         ).fetchone()[0]
         adr_key = f"ADR-{domain.upper()}-{n + 1:03d}"
         row = conn.execute(
-            "INSERT INTO adrs (adr_key, domain, title, decision, context) "
-            "VALUES (%s, %s, %s, %s, %s) "
-            "RETURNING id, adr_key, domain, title, status, decision, context, created_at",
-            (adr_key, domain, title, decision, context),
+            "INSERT INTO adrs (adr_key, domain, title, decision, context, status, "
+            "applies_to, related, supersedes, patterns, proposed_by) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            f"RETURNING {', '.join(_ADR_COLS)}",
+            (adr_key, domain, title, decision, context, status,
+             Jsonb(applies_to or {}), related or [], supersedes or [],
+             patterns or [], proposed_by),
         ).fetchone()
-    cols = ["id", "adr_key", "domain", "title", "status", "decision", "context", "created_at"]
-    return dict(zip(cols, row))
+    return dict(zip(_ADR_COLS, row))
+
+
+def list_adrs(pool: ConnectionPool, status: Optional[str] = None,
+              domain: Optional[str] = None) -> list[dict[str, Any]]:
+    clauses, params = [], []
+    if status:
+        clauses.append("status = %s")
+        params.append(status)
+    if domain:
+        clauses.append("domain = %s")
+        params.append(domain)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with pool.connection() as conn:
+        rows = conn.execute(_ADR_SELECT + where + " ORDER BY adr_key", params).fetchall()
+    return [dict(zip(_ADR_COLS, r)) for r in rows]
+
+
+def get_adr(pool: ConnectionPool, adr_key: str) -> Optional[dict[str, Any]]:
+    with pool.connection() as conn:
+        row = conn.execute(_ADR_SELECT + " WHERE adr_key = %s", (adr_key,)).fetchone()
+    return dict(zip(_ADR_COLS, row)) if row else None
+
+
+def approve_adr(pool: ConnectionPool, adr_key: str, actor: str = "human") -> dict[str, Any]:
+    """Human gate: promote a proposed rule to accepted (it becomes live).
+
+    Marks any ADRs this rule supersedes as 'superseded'."""
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "UPDATE adrs SET status = 'accepted' "
+            "WHERE adr_key = %s AND status = 'proposed' "
+            f"RETURNING {', '.join(_ADR_COLS)}",
+            (adr_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"ADR {adr_key} not found or not in 'proposed' status")
+        adr = dict(zip(_ADR_COLS, row))
+        for superseded_key in adr["supersedes"] or []:
+            conn.execute(
+                "UPDATE adrs SET status = 'superseded' "
+                "WHERE adr_key = %s AND status = 'accepted'",
+                (superseded_key,),
+            )
+    return adr
 
 
 _MESSAGE_COLS = ["id", "from_team", "to_team", "subject", "body", "priority",
@@ -612,7 +689,7 @@ def archive_message(pool: ConnectionPool, message_id: int) -> None:
 _ISSUE_SELECT = (
     "SELECT id, goal_id, title, description, parent_id, depth, team, pipeline, "
     "state, gate_type, retry_count, step_count, assigned_agent, "
-    "triggered_by_message, origin_message_id, created_at, updated_at FROM issues"
+    "triggered_by_message, origin_message_id, work_type, created_at, updated_at FROM issues"
 )
 
 
@@ -622,7 +699,8 @@ def _issue_from_row(row: tuple) -> Issue:
         parent_id=row[4], depth=row[5], team=row[6], pipeline=row[7],
         state=row[8], gate_type=row[9], retry_count=row[10], step_count=row[11],
         assigned_agent=row[12], triggered_by_message=row[13],
-        origin_message_id=row[14], created_at=row[15], updated_at=row[16],
+        origin_message_id=row[14], work_type=row[15],
+        created_at=row[16], updated_at=row[17],
     )
 
 

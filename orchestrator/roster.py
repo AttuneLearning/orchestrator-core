@@ -21,6 +21,7 @@ class Team:
     role: str
     alias: str
     issue_prefix: str
+    repos: tuple[str, ...] = ()   # repos this team works in; () = unmapped
     sub_teams: tuple[SubTeam, ...] = field(default_factory=tuple)
 
 
@@ -56,6 +57,9 @@ def load_roster(config: dict[str, Any]) -> Roster:
             role=spec.get("role", spec["id"]),
             alias=spec.get("alias", spec["id"]),
             issue_prefix=spec.get("issue_prefix", ""),
+            # registry.yaml spec: each team names its repo(s); accept either key
+            repos=tuple(spec.get("repos") or
+                        ([spec["repo"]] if spec.get("repo") else [])),
             sub_teams=subs,
         )
     return Roster(

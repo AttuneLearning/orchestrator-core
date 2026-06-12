@@ -45,6 +45,7 @@ active_teams:
     alias: api
     role: backend
     issue_prefix: API-ISS
+    repos: [api-repo]
     sub_teams:
       - id: backend-dev
         name: Backend-Dev
@@ -59,6 +60,7 @@ active_teams:
     alias: quality
     role: qa
     issue_prefix: QA-ISS
+    repos: []          # spans all repos -> receives project-wide rules only
     sub_teams:
       - id: qa-dev
         name: QA-Dev
@@ -87,6 +89,7 @@ active_teams:
     alias: ui
     role: frontend
     issue_prefix: UI-ISS
+    repos: [web-repo]
     sub_teams:
       - id: frontend-dev
         name: Frontend-Dev

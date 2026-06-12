@@ -127,6 +127,25 @@ def create_app(pool: Optional[ConnectionPool] = None,
     def agents() -> str:
         return templates.agents_page(_agents_with_staleness(pool))
 
+    @app.get("/adrs", response_class=HTMLResponse)
+    def adrs() -> str:
+        return templates.adrs_page(repo.list_adrs(pool))
+
+    @app.get("/adrs/{adr_key}", response_class=HTMLResponse)
+    def adr_detail(adr_key: str):
+        adr = repo.get_adr(pool, adr_key)
+        if adr is None:
+            return HTMLResponse(templates.page("Not found",
+                                f"<h1>No ADR {adr_key}</h1>"), status_code=404)
+        from ..adr_rules import reverse_links
+        incoming = reverse_links(repo.list_adrs(pool)).get(adr_key, [])
+        return templates.adr_detail(adr, incoming)
+
+    @app.post("/adrs/{adr_key}/approve")
+    def adr_approve(adr_key: str):
+        repo.approve_adr(pool, adr_key, actor="dashboard")
+        return RedirectResponse(f"/adrs/{adr_key}", status_code=303)
+
     @app.post("/issues/{issue_id}/directive")
     def directive(issue_id: int):
         repo.apply_directive(pool, issue_id, "resume", note="dashboard", actor="dashboard")

@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 from psycopg_pool import ConnectionPool
 
+from .. import adr_rules
 from .. import repository as repo
 from ..config import Settings
 from ..models import GoalState, Issue, IssueState
@@ -50,6 +51,7 @@ class TickSummary:
     decomposed: int = 0
     subissues: int = 0
     unblocked: int = 0
+    adr_proposals: int = 0
     assigned: int = 0
     advanced: int = 0
     completed: int = 0
@@ -63,8 +65,8 @@ class TickSummary:
     @property
     def did_work(self) -> bool:
         return any([self.ingested, self.rejected, self.decomposed, self.subissues,
-                    self.unblocked, self.assigned, self.advanced, self.completed,
-                    self.failed, self.quarantined, self.reengaged,
+                    self.unblocked, self.adr_proposals, self.assigned, self.advanced,
+                    self.completed, self.failed, self.quarantined, self.reengaged,
                     self.goals_done, self.goals_paused])
 
 
@@ -113,6 +115,27 @@ class Engine:
             if agent is not None and agent.runtime == "cli":
                 return self.cli_worker
         return self.worker
+
+    def _applicable_rules(self, issue: Issue) -> list[dict]:
+        """Accepted ADR rules matching this issue (work-type ∩ team ∩ repos).
+
+        self._tick_rules is loaded once per tick; the per-issue selection is
+        recomputed on every call, so rule changes apply from the next tick —
+        that's the 'refreshed as needed' contract."""
+        team = self.roster.resolve(issue.team)
+        repos = list(team.repos) if team else []
+        return adr_rules.applicable(
+            self._tick_rules, work_type=issue.work_type,
+            team=issue.team, repos=repos,
+        )
+
+    def _call_with_rules(self, fn, *args, rules: str):
+        """Invoke a reasoner op, tolerating reasoners that predate the rules
+        parameter (optional capability, like assess_complexity/triage)."""
+        try:
+            return fn(*args, rules=rules)
+        except TypeError:
+            return fn(*args)
 
     def _comms_respond(self, issue: Issue) -> None:
         """comms_response gate work: answer the originating team and archive the
@@ -232,6 +255,41 @@ class Engine:
         summary.subissues += len(children)
         return True
 
+    def _maybe_suggest_adr(self, issue: Issue, summary: TickSummary) -> None:
+        """Gap detection: an issue completed with no governing rules — ask the
+        reasoner (optional capability) whether a reusable decision should exist.
+        Drafts land as status='proposed' (inert until a human approves)."""
+        suggest = getattr(self.reasoner, "suggest_adr", None)
+        if suggest is None:
+            return
+        try:
+            # Dedup: if a pending proposal already covers these coordinates,
+            # don't pile on another one for the human to wade through.
+            team = self.roster.resolve(issue.team)
+            pending = adr_rules.applicable(
+                [dict(r, status="accepted")  # treat proposals as live for matching
+                 for r in repo.list_adrs(self.pool, status="proposed")],
+                work_type=issue.work_type, team=issue.team,
+                repos=list(team.repos) if team else [],
+            )
+            if pending:
+                return
+            draft = suggest(issue)
+            if not draft:
+                return
+            adr = repo.create_adr(
+                self.pool, draft["domain"], draft.get("title", issue.title),
+                decision=draft["decision"], context=draft.get("context", ""),
+                applies_to=draft.get("applies_to") or {},
+                status="proposed",
+                proposed_by=f"agent:{issue.assigned_agent or 'reasoner'}",
+            )
+            repo.append_log(self.pool, issue.id, "adr_proposed",
+                            {"adr_key": adr["adr_key"]})
+            summary.adr_proposals += 1
+        except Exception as exc:  # noqa: BLE001 - gap detection must never block flow
+            summary.errors.append(f"suggest_adr issue {issue.id}: {exc}")
+
     def _unblock(self, summary: TickSummary) -> None:
         """Resolve decomposed parents: all children done → ready; any child
         failed/off_rails → the parent fails too (it cannot proceed), which lets
@@ -259,10 +317,19 @@ class Engine:
     def _assign(self, summary: TickSummary) -> None:
         for issue in repo.list_issues(self.pool, states=[IssueState.BACKLOG.value]):
             try:
-                # plan (stored on the log for review/re-engagement), then either
-                # decompose into sub-issues (architect) or mark ready
-                plan = self.reasoner.plan_issue(issue)
-                repo.append_log(self.pool, issue.id, "plan", {"plan": plan})
+                # tag work-type (drives ADR rule selection), plan under the
+                # applicable rules, then either decompose (architect) or mark ready
+                if issue.work_type is None:
+                    issue.work_type = adr_rules.detect_work_type(
+                        f"{issue.title} {issue.description}")
+                    repo.set_work_type(self.pool, issue.id, issue.work_type)
+                rules = self._applicable_rules(issue)
+                block = adr_rules.format_rules_block(rules)
+                plan = self._call_with_rules(self.reasoner.plan_issue, issue,
+                                             rules=block)
+                repo.append_log(self.pool, issue.id, "plan",
+                                {"plan": plan, "work_type": issue.work_type,
+                                 "rules": [r["adr_key"] for r in rules]})
                 if self._maybe_decompose(issue, summary):
                     continue
                 issue = self._transition(issue, IssueState.READY.value)
@@ -321,21 +388,30 @@ class Engine:
                     {"event_type": e.event_type, "to_state": e.to_state}
                     for e in repo.recent_events(self.pool, issue.id, limit=20)
                 ]
-                review = self.reasoner.gate_review(issue, issue.gate_type, recent)
+                rules = self._applicable_rules(issue)
+                review = self._call_with_rules(
+                    self.reasoner.gate_review, issue, issue.gate_type, recent,
+                    rules=adr_rules.format_rules_block(rules),
+                )
                 outcome = apply_gate_decision(
                     pipeline, gate, passed=review.passed,
                     retry_count=issue.retry_count, retry_cap=self.t.retry_cap,
                     triggered_by_message=issue.triggered_by_message,
                 )
+                payload = {"reasons": review.reasons}
+                if getattr(review, "violated_rules", None):
+                    payload["violated_rules"] = review.violated_rules
                 self._transition(
                     issue, outcome.state, gate_type=outcome.gate_type,
                     event_type=outcome.event_type,
-                    payload={"reasons": review.reasons},
+                    payload=payload,
                     retry_count=outcome.retry_count,
                 )
                 if outcome.state == IssueState.DONE.value:
                     self._release_agent(issue)
                     summary.completed += 1
+                    if not rules:
+                        self._maybe_suggest_adr(issue, summary)
                 elif outcome.state == IssueState.FAILED.value:
                     self._release_agent(issue)
                     summary.failed += 1
@@ -398,6 +474,8 @@ class Engine:
 
     def tick(self) -> TickSummary:
         summary = TickSummary()
+        # ADR rules load once per tick: cheap, and edits go live next tick.
+        self._tick_rules = repo.list_adrs(self.pool, status="accepted")
         self._ingest(summary)
         self._decompose(summary)
         self._unblock(summary)

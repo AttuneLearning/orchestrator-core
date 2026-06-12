@@ -63,6 +63,7 @@ class EventType(str, Enum):
     DECOMPOSED = "decomposed"
     VERIFICATION = "verification"
     PROMOTED = "promoted"
+    ADR_PROPOSED = "adr_proposed"
 
 
 @dataclass
@@ -93,6 +94,7 @@ class Issue:
     assigned_agent: Optional[int] = None
     triggered_by_message: bool = False
     origin_message_id: Optional[int] = None
+    work_type: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

@@ -224,3 +224,28 @@ agents (slice I) run `CLI_AGENT_CMD` per implementation step. Semantic memory
 without pgvector. The apply/verify leg (slice F) is **off by default**
 (`APPLY_ENABLED`): artifacts apply only in disposable worktrees, and nothing
 merges without `apply-promote`.
+
+## ADR governance
+
+Architecture decisions are live rules that govern agent work, not documents.
+Each rule = a compact one-line directive (`decision`) + selector
+(`applies_to: {work_types, teams, repos}`; empty dimension = match-all,
+`repos: []` = project-wide) + rationale (`context`, humans only) + backlink
+edges (`related`, `supersedes`, `patterns`).
+
+Every plan and gate review receives exactly the rules matching the issue's
+coordinates (work-type ∩ team ∩ the team's repos from `config/roster.yaml`) —
+the most concise applicable list by construction, re-selected on every call.
+Gate reviewers verify each rule and cite violated ids in the decline payload
+(`violated_rules`), so chronic violations are visible in `issue_events`.
+
+Lifecycle: agents (or sessions, via the `adr_create` MCP tool) **propose**;
+proposals are inert until a human **approves** (`cli adr approve`, or the
+dashboard `/adrs` page) — approval also marks superseded rules. When an issue
+completes with no governing rules, gap detection drafts a proposal for review.
+
+```bash
+.venv/bin/python -m orchestrator.cli adr list --status proposed
+.venv/bin/python -m orchestrator.cli adr show ADR-API-001
+.venv/bin/python -m orchestrator.cli adr approve ADR-API-001
+```

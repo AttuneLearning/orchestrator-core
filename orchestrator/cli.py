@@ -106,6 +106,36 @@ def _cmd_goal_resume(args, settings) -> int:
     return 0
 
 
+def _cmd_adr(args, settings) -> int:
+    pool = get_pool(settings)
+    if args.action == "list":
+        for a in repo.list_adrs(pool, status=args.status):
+            sel = a["applies_to"] or {}
+            scope = ",".join(sel.get("repos") or []) or "project-wide"
+            print(f"  [{a['adr_key']}] {a['status']:10} ({scope}) {a['title']}")
+        return 0
+    if args.key is None:
+        print("adr show/approve require an ADR key")
+        return 1
+    if args.action == "show":
+        a = repo.get_adr(pool, args.key)
+        if a is None:
+            print(f"no ADR {args.key}")
+            return 1
+        print(f"{a['adr_key']}: {a['title']} [{a['status']}] (by {a['proposed_by']})")
+        print(f"  rule:       {a['decision']}")
+        print(f"  rationale:  {a['context']}")
+        print(f"  applies_to: {a['applies_to']}")
+        print(f"  related: {a['related']}  supersedes: {a['supersedes']}  "
+              f"patterns: {a['patterns']}")
+        return 0
+    if args.action == "approve":
+        a = repo.approve_adr(pool, args.key)
+        print(f"{a['adr_key']}: proposed → accepted (live for agents next tick)")
+        return 0
+    return 1
+
+
 def _cmd_apply_promote(args, settings) -> int:
     from .apply.worktree import promote
 
@@ -196,6 +226,13 @@ def build_parser() -> argparse.ArgumentParser:
     gr = sub.add_parser("goal-resume", help="restart a paused goal")
     gr.add_argument("goal_id", type=int)
     gr.set_defaults(func=_cmd_goal_resume)
+
+    ad = sub.add_parser("adr", help="list/show/approve ADR governance rules")
+    ad.add_argument("action", choices=["list", "show", "approve"])
+    ad.add_argument("key", nargs="?", default=None)
+    ad.add_argument("--status", default=None,
+                    help="filter list by status (proposed|accepted|...)")
+    ad.set_defaults(func=_cmd_adr)
 
     ap = sub.add_parser("apply-promote",
                         help="merge an issue's verified worktree branch (human gate)")
