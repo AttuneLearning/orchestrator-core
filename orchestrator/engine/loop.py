@@ -29,6 +29,7 @@ from ..pipelines import Pipeline, first_gate, load_pipelines
 from ..roster import load_roster
 from ..state_machine import apply_gate_decision, validate_transition
 from ..agents.api_worker import ApiWorker
+from ..agents.cli_session import CliSessionWorker
 from ..agents.reasoning import Reasoner, make_reasoner
 from . import focus, offrails, reengagement
 
@@ -47,6 +48,8 @@ class TickSummary:
     ingested: int = 0
     rejected: int = 0
     decomposed: int = 0
+    subissues: int = 0
+    unblocked: int = 0
     assigned: int = 0
     advanced: int = 0
     completed: int = 0
@@ -59,9 +62,10 @@ class TickSummary:
 
     @property
     def did_work(self) -> bool:
-        return any([self.ingested, self.rejected, self.decomposed, self.assigned,
-                    self.advanced, self.completed, self.failed, self.quarantined,
-                    self.reengaged, self.goals_done, self.goals_paused])
+        return any([self.ingested, self.rejected, self.decomposed, self.subissues,
+                    self.unblocked, self.assigned, self.advanced, self.completed,
+                    self.failed, self.quarantined, self.reengaged,
+                    self.goals_done, self.goals_paused])
 
 
 class Engine:
@@ -76,6 +80,7 @@ class Engine:
         self.pool = pool
         self.reasoner = reasoner or make_reasoner(settings)
         self.worker = worker or ApiWorker(settings)
+        self.cli_worker = CliSessionWorker(settings)
         self.pipelines = load_pipelines(settings.pipelines)
         self.roster = load_roster(settings.roster)
         self.t = settings.thresholds
@@ -100,6 +105,14 @@ class Engine:
     def _release_agent(self, issue: Issue) -> None:
         if issue.assigned_agent is not None:
             repo.set_agent_status(self.pool, issue.assigned_agent, "idle")
+
+    def _implementation_worker(self, issue: Issue):
+        """Pick the worker by the assigned agent's runtime (api default)."""
+        if issue.assigned_agent is not None:
+            agent = repo.get_agent(self.pool, issue.assigned_agent)
+            if agent is not None and agent.runtime == "cli":
+                return self.cli_worker
+        return self.worker
 
     def _comms_respond(self, issue: Issue) -> None:
         """comms_response gate work: answer the originating team and archive the
@@ -139,7 +152,10 @@ class Engine:
                                         reason=f"unknown team {msg['to_team']!r}")
                     summary.rejected += 1
                     continue
-                decision = self.reasoner.triage_message(msg)
+                triage = getattr(self.reasoner, "triage_message", None)
+                if triage is None:
+                    continue  # optional capability: leave message pending
+                decision = triage(msg)
                 if decision.accept:
                     goal = repo.create_goal(
                         self.pool, f"[comms] {msg['subject']}", msg.get("body", "")
@@ -173,22 +189,82 @@ class Engine:
             try:
                 specs = self.reasoner.decompose_goal(goal, self.t.max_subissues)
                 room = self.t.max_issues_per_goal
+                pipeline = goal.pipeline if goal.pipeline in self.pipelines \
+                    else self.settings.default_pipeline
                 for spec in specs[:room]:
                     team = self.roster.resolve(spec.team)
                     team_id = team.id if team else spec.team
                     repo.create_issue(self.pool, goal.id, spec.title, spec.description,
-                                      team=team_id)
+                                      team=team_id, pipeline=pipeline)
                     summary.decomposed += 1
                 repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
             except Exception as exc:  # noqa: BLE001 - isolate goal failures
                 summary.errors.append(f"decompose goal {goal.id}: {exc}")
 
+    def _maybe_decompose(self, issue: Issue, summary: TickSummary) -> bool:
+        """Architect check: split an oversized issue into sub-issues and block the
+        parent on them. Called exactly once per issue (when it leaves backlog).
+        Returns True if the issue was decomposed. Caps bound the recursion:
+        depth (MAX_DEPTH), children per split (MAX_SUBISSUES), and total issues
+        per goal (MAX_ISSUES_PER_GOAL)."""
+        if issue.depth >= self.t.max_depth:
+            return False
+        # Optional capability: reasoners without an architect op never decompose.
+        assess = getattr(self.reasoner, "assess_complexity", None)
+        if assess is None:
+            return False
+        assessment = assess(issue)
+        if not assessment.decompose:
+            return False
+        room = self.t.max_issues_per_goal - repo.count_issues_for_goal(self.pool, issue.goal_id)
+        n = min(len(assessment.subissues), self.t.max_subissues, max(room, 0))
+        if n <= 0:
+            repo.append_log(self.pool, issue.id, "error",
+                            {"cap": "max_issues_per_goal",
+                             "wanted": len(assessment.subissues)})
+            return False
+        children = [
+            repo.create_subissue(self.pool, issue, spec.title, spec.description)
+            for spec in assessment.subissues[:n]
+        ]
+        self._transition(issue, IssueState.BLOCKED.value, event_type="decomposed",
+                         payload={"children": [c.id for c in children]})
+        summary.subissues += len(children)
+        return True
+
+    def _unblock(self, summary: TickSummary) -> None:
+        """Resolve decomposed parents: all children done → ready; any child
+        failed/off_rails → the parent fails too (it cannot proceed), which lets
+        goal reconciliation pause the goal for human attention."""
+        for issue in repo.list_issues(self.pool, states=[IssueState.BLOCKED.value]):
+            try:
+                children = repo.list_issues(self.pool, parent_id=issue.id)
+                if not children:
+                    continue  # blocked for some other reason; not ours to resolve
+                states = {c.state for c in children}
+                if states <= {IssueState.DONE.value}:
+                    self._transition(issue, IssueState.READY.value,
+                                     payload={"unblocked_by": [c.id for c in children]})
+                    summary.unblocked += 1
+                elif states & {IssueState.FAILED.value, IssueState.OFF_RAILS.value}:
+                    self._transition(issue, IssueState.FAILED.value,
+                                     payload={"failed_children": [
+                                         c.id for c in children
+                                         if c.state in (IssueState.FAILED.value,
+                                                        IssueState.OFF_RAILS.value)]})
+                    summary.failed += 1
+            except Exception as exc:  # noqa: BLE001
+                summary.errors.append(f"unblock issue {issue.id}: {exc}")
+
     def _assign(self, summary: TickSummary) -> None:
         for issue in repo.list_issues(self.pool, states=[IssueState.BACKLOG.value]):
             try:
-                # plan (stored on the log for review/re-engagement), then mark ready
+                # plan (stored on the log for review/re-engagement), then either
+                # decompose into sub-issues (architect) or mark ready
                 plan = self.reasoner.plan_issue(issue)
                 repo.append_log(self.pool, issue.id, "plan", {"plan": plan})
+                if self._maybe_decompose(issue, summary):
+                    continue
                 issue = self._transition(issue, IssueState.READY.value)
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"plan issue {issue.id}: {exc}")
@@ -217,9 +293,16 @@ class Engine:
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
             try:
                 if issue.gate_type == "implementation":
-                    self.worker.implement(self.pool, issue)
+                    self._implementation_worker(issue).implement(self.pool, issue)
+                elif issue.gate_type == "qa_gate" and self.settings.apply_enabled:
+                    # apply/verify leg (flag-off by default): worktree + verify,
+                    # result logged for the gate reviewer. Never merges.
+                    from ..apply.worktree import apply_and_verify
+                    apply_and_verify(self.pool, issue, self.settings)
                 elif issue.gate_type == "comms_response":
                     self._comms_respond(issue)
+                if issue.assigned_agent is not None:
+                    repo.touch_agent(self.pool, issue.assigned_agent)
                 self._transition(
                     issue, IssueState.IN_REVIEW.value, gate_type=issue.gate_type,
                     event_type="gate_enter", step_count=issue.step_count + 1,
@@ -317,6 +400,7 @@ class Engine:
         summary = TickSummary()
         self._ingest(summary)
         self._decompose(summary)
+        self._unblock(summary)
         self._assign(summary)
         self._advance(summary)
         self._sweep(summary)

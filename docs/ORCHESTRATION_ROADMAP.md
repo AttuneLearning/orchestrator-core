@@ -1,5 +1,8 @@
 # Orchestration Layer — Remaining Development Plan
 
+> **STATUS (2026-06-12): all slices below are implemented** — A–E sequenced,
+> G/H/I/J in parallel, F last and flag-off by default. Kept for design rationale.
+
 > **Status:** Phases 1–4 core is built and verified (branch `orchestrator-core`): Postgres
 > schema + repository, MCP tool layer (15 tools), Anthropic reasoning agent with stub fallback,
 > configurable code provider (stub default), single-threaded engine loop running pipeline #1

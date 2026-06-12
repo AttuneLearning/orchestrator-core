@@ -23,6 +23,22 @@ from ..engine import focus
 from . import templates
 
 _ACTIVE_STATES = ["backlog", "ready", "in_progress", "in_review", "blocked"]
+_STALE_AFTER_S = 600  # busy agent silent this long → flagged stale
+
+
+def _agents_with_staleness(pool: ConnectionPool) -> list[dict[str, Any]]:
+    from datetime import datetime, timezone
+
+    out = []
+    now = datetime.now(timezone.utc)
+    for a in repo.list_agents(pool):
+        d = asdict(a)
+        d["stale"] = bool(
+            a.status == "busy" and a.last_seen is not None
+            and (now - a.last_seen).total_seconds() > _STALE_AFTER_S
+        )
+        out.append(d)
+    return out
 
 
 def _fleet_summary(pool: ConnectionPool, settings: Settings) -> dict[str, Any]:
@@ -87,8 +103,8 @@ def create_app(pool: Optional[ConnectionPool] = None,
             # open-goals list excludes done/paused; fall back to a direct lookup
             with pool.connection() as conn:
                 row = conn.execute(
-                    "SELECT id, title, description, state, created_at, updated_at "
-                    "FROM goals WHERE id = %s", (goal_id,)
+                    "SELECT id, title, description, state, pipeline, created_at, "
+                    "updated_at FROM goals WHERE id = %s", (goal_id,)
                 ).fetchone()
             if row is None:
                 return HTMLResponse(templates.page("Not found",
@@ -109,7 +125,7 @@ def create_app(pool: Optional[ConnectionPool] = None,
 
     @app.get("/agents", response_class=HTMLResponse)
     def agents() -> str:
-        return templates.agents_page([asdict(a) for a in repo.list_agents(pool)])
+        return templates.agents_page(_agents_with_staleness(pool))
 
     @app.post("/issues/{issue_id}/directive")
     def directive(issue_id: int):
@@ -124,7 +140,7 @@ def create_app(pool: Optional[ConnectionPool] = None,
     @app.get("/api/state")
     def api_state() -> JSONResponse:
         summary = _fleet_summary(pool, settings)
-        summary["agents"] = [asdict(a) for a in repo.list_agents(pool)]
+        summary["agents"] = _agents_with_staleness(pool)
         # jsonable_encoder handles datetimes the stdlib json encoder can't.
         return JSONResponse(jsonable_encoder(summary))
 

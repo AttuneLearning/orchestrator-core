@@ -48,8 +48,24 @@ class Settings:
     code_model: str = ""
     code_api_key: str = ""
 
+    # Command template for runtime=cli agents. Placeholders: {prompt} {session_id}
+    cli_agent_cmd: str = ""
+
+    # Apply/verify leg (slice F). OFF by default: artifacts stay stored-only.
+    # When enabled, qa_gate work applies the artifact in an isolated git worktree
+    # of apply_repo_path and runs verify_cmd there. Promotion (merge) only ever
+    # happens via the explicit human CLI directive `apply-promote`.
+    apply_enabled: bool = False
+    apply_repo_path: str = ""
+    verify_cmd: str = ""
+
     default_pipeline: str = "pipeline-1"
     thresholds: Thresholds = field(default_factory=Thresholds)
+
+    embed_provider: str = "stub"           # stub | openai | none
+    embed_base_url: str = ""
+    embed_model: str = ""
+    embed_api_key: str = ""
 
     # Raw parsed YAML for the pipeline/roster modules to consume.
     pipelines: dict[str, Any] = field(default_factory=dict)
@@ -96,8 +112,16 @@ def load_settings() -> Settings:
         code_base_url=pick("CODE_BASE_URL", "code_base_url", ""),
         code_model=pick("CODE_MODEL", "code_model", ""),
         code_api_key=os.getenv("CODE_API_KEY", ""),
+        cli_agent_cmd=pick("CLI_AGENT_CMD", "cli_agent_cmd", ""),
+        apply_enabled=os.getenv("APPLY_ENABLED", "").lower() in ("1", "true", "yes"),
+        apply_repo_path=pick("APPLY_REPO_PATH", "apply_repo_path", ""),
+        verify_cmd=pick("VERIFY_CMD", "verify_cmd", ""),
         default_pipeline=str(s_yaml.get("default_pipeline", "pipeline-1")),
         thresholds=thresholds,
         pipelines=_yaml(CONFIG_DIR / "pipelines.yaml"),
         roster=_yaml(CONFIG_DIR / "roster.yaml"),
+        embed_provider=pick("EMBED_PROVIDER", "embed_provider", "stub"),
+        embed_base_url=pick("EMBED_BASE_URL", "embed_base_url", ""),
+        embed_model=pick("EMBED_MODEL", "embed_model", ""),
+        embed_api_key=os.getenv("EMBED_API_KEY", ""),
     )

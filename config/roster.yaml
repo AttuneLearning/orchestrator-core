@@ -54,6 +54,34 @@ active_teams:
         name: Backend-QA
         function: qa
         issue_prefix: BQA
+  - id: qa
+    name: QA
+    alias: quality
+    role: qa
+    issue_prefix: QA-ISS
+    sub_teams:
+      - id: qa-dev
+        name: QA-Dev
+        function: dev
+        issue_prefix: QA-ISS
+      - id: qa-qa
+        name: QA-QA
+        function: qa
+        issue_prefix: QA-QA
+  - id: platform
+    name: Platform
+    alias: plat
+    role: platform
+    issue_prefix: PLAT-ISS
+    sub_teams:
+      - id: platform-dev
+        name: Platform-Dev
+        function: dev
+        issue_prefix: PLAT-ISS
+      - id: platform-qa
+        name: Platform-QA
+        function: qa
+        issue_prefix: PLAT-QA
   - id: frontend
     name: Frontend
     alias: ui
@@ -72,3 +100,5 @@ active_teams:
 aliases:
   api: backend
   ui: frontend
+  quality: qa
+  plat: platform

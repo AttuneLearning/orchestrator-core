@@ -18,7 +18,8 @@ from typing import Any, Optional, Protocol
 
 from ..config import Settings
 from ..models import Goal, Issue
-from .base import GateReview, IssueSpec, TriageDecision, extract_json
+from .base import (ComplexityAssessment, GateReview, IssueSpec, TriageDecision,
+                   extract_json)
 
 
 class Reasoner(Protocol):
@@ -29,6 +30,7 @@ class Reasoner(Protocol):
     def score_drift(self, issue: Issue,
                     recent: Optional[list[dict[str, Any]]] = None) -> float: ...
     def triage_message(self, message: dict[str, Any]) -> TriageDecision: ...
+    def assess_complexity(self, issue: Issue) -> ComplexityAssessment: ...
 
 
 class StubReasoner:
@@ -55,6 +57,11 @@ class StubReasoner:
         # Stub accepts every inbound request; title derives from the subject.
         return TriageDecision(accept=True, title=message["subject"],
                               description=message.get("body", ""))
+
+    def assess_complexity(self, issue: Issue) -> ComplexityAssessment:
+        # Stub never decomposes, keeping hermetic runs simple and bounded;
+        # decomposition paths are exercised by tests with an injected reasoner.
+        return ComplexityAssessment(decompose=False, subissues=[])
 
 
 class AnthropicReasoner:
@@ -145,6 +152,23 @@ class AnthropicReasoner:
             description=str(data.get("description", "")),
             reason=str(data.get("reason", "")),
         )
+
+    def assess_complexity(self, issue: Issue) -> ComplexityAssessment:
+        system = (
+            "You are the architect. Decide if this issue is too large for one "
+            "agent in one pipeline pass and should be decomposed into smaller "
+            "sub-issues (each independently completable). Decompose only when "
+            "genuinely necessary. Output JSON: "
+            '{"decompose": bool, "subissues": [{"title": str, "description": str}]}.'
+        )
+        user = f"Issue: {issue.title}\n\n{issue.description}"
+        data = extract_json(self._ask(system, user))
+        specs = [
+            IssueSpec(title=d["title"], description=d.get("description", ""))
+            for d in data.get("subissues", [])
+        ]
+        return ComplexityAssessment(decompose=bool(data.get("decompose")) and bool(specs),
+                                    subissues=specs)
 
 
 def make_reasoner(settings: Settings) -> Reasoner:

@@ -1,25 +1,32 @@
 """Memory MCP tools — memory_write / memory_recall / memory_search.
 
-Backed by the memory_notes table. Search is LIKE-based for this phase; pgvector
-semantic search is a deferred follow-up (the embedding column already exists)."""
+Backed by the memory_notes table.  When an embedder is configured (provider !=
+'none') write and search both use semantic embeddings stored in the
+embedding_v vector(256) column (slice H).  Gracefully degrades to ILIKE-only
+search when pgvector is unavailable or the provider is 'none'."""
 
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 from psycopg_pool import ConnectionPool
 
 from .. import repository as repo
+from ..config import Settings
+from ..embeddings import Embedder, make_embedder
 
 
-def register(mcp: FastMCP, pool: ConnectionPool) -> None:
+def register(mcp: FastMCP, pool: ConnectionPool, settings: Optional[Settings] = None) -> None:
+    # Resolve embedder once at registration time.
+    embedder: Optional[Embedder] = make_embedder(settings) if settings is not None else None
 
     @mcp.tool()
     def memory_write(body: str, scope: str = "global") -> dict[str, Any]:
         """Write a scoped memory note (scope: global | pod:* | agent:*)."""
-        return asdict(repo.memory_write(pool, body, scope=scope))
+        embedding = embedder.embed(body) if embedder is not None else None
+        return asdict(repo.memory_write(pool, body, scope=scope, embedding=embedding))
 
     @mcp.tool()
     def memory_recall(scope: str = "global", limit: int = 20) -> list[dict[str, Any]]:
@@ -28,5 +35,8 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
 
     @mcp.tool()
     def memory_search(query: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Substring search across all memory notes."""
-        return [asdict(n) for n in repo.memory_search(pool, query, limit=limit)]
+        """Semantic + substring search across all memory notes."""
+        query_embedding = embedder.embed(query) if embedder is not None else None
+        return [asdict(n) for n in repo.memory_search(
+            pool, query, limit=limit, query_embedding=query_embedding
+        )]

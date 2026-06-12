@@ -38,7 +38,9 @@ _ALLOWED: dict[str, set[str]] = {
                                    IssueState.FAILED.value},
     IssueState.IN_REVIEW.value: {IssueState.IN_PROGRESS.value, IssueState.DONE.value,
                                  IssueState.FAILED.value},
-    IssueState.BLOCKED.value: {IssueState.READY.value, IssueState.IN_PROGRESS.value},
+    # blocked → failed: a decomposed parent whose children failed cannot proceed
+    IssueState.BLOCKED.value: {IssueState.READY.value, IssueState.IN_PROGRESS.value,
+                               IssueState.FAILED.value},
     # terminal / latched
     IssueState.DONE.value: set(),
     IssueState.FAILED.value: set(),

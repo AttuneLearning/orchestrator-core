@@ -24,6 +24,14 @@ class GateReview:
 
 
 @dataclass
+class ComplexityAssessment:
+    """Architect's verdict on whether an issue needs sub-issue decomposition."""
+
+    decompose: bool
+    subissues: list["IssueSpec"]
+
+
+@dataclass
 class TriageDecision:
     """Outcome of triaging an inbound cross-team message (accept → local issue)."""
 

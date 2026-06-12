@@ -38,9 +38,16 @@ def _cmd_register_agent(args, settings) -> int:
 
 
 def _cmd_add_goal(args, settings) -> int:
+    from .pipelines import load_pipelines
+
+    known = load_pipelines(settings.pipelines)
+    if args.pipeline not in known:
+        print(f"unknown pipeline {args.pipeline!r}; available: {', '.join(sorted(known))}")
+        return 1
     pool = get_pool(settings)
-    goal = repo.create_goal(pool, args.title, args.description or "")
-    print(f"created goal {goal.id}: {goal.title}")
+    goal = repo.create_goal(pool, args.title, args.description or "",
+                            pipeline=args.pipeline)
+    print(f"created goal {goal.id}: {goal.title} (pipeline={goal.pipeline})")
     return 0
 
 
@@ -99,6 +106,20 @@ def _cmd_goal_resume(args, settings) -> int:
     return 0
 
 
+def _cmd_apply_promote(args, settings) -> int:
+    from .apply.worktree import promote
+
+    pool = get_pool(settings)
+    issue = repo.get_issue(pool, args.issue_id)
+    if issue is None:
+        print(f"no issue {args.issue_id}")
+        return 1
+    record = promote(pool, issue, settings, note=args.note)
+    print(f"issue {issue.id}: branch {record['branch']} merged "
+          f"({record['merge_commit'][:10]}) — local only, nothing pushed")
+    return 0
+
+
 def _cmd_serve(args, settings) -> int:
     from .mcp_server.server import main as serve_main
 
@@ -154,6 +175,8 @@ def build_parser() -> argparse.ArgumentParser:
     ag = sub.add_parser("add-goal", help="ingest a new goal")
     ag.add_argument("title")
     ag.add_argument("--description", default="")
+    ag.add_argument("--pipeline", default="pipeline-1",
+                    help="pipeline for this goal's issues (see config/pipelines.yaml)")
     ag.set_defaults(func=_cmd_add_goal)
 
     rn = sub.add_parser("run", help="drive the engine until quiescent")
@@ -173,6 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     gr = sub.add_parser("goal-resume", help="restart a paused goal")
     gr.add_argument("goal_id", type=int)
     gr.set_defaults(func=_cmd_goal_resume)
+
+    ap = sub.add_parser("apply-promote",
+                        help="merge an issue's verified worktree branch (human gate)")
+    ap.add_argument("issue_id", type=int)
+    ap.add_argument("--note", default="")
+    ap.set_defaults(func=_cmd_apply_promote)
 
     sub.add_parser("serve", help="start the MCP server (stdio)").set_defaults(func=_cmd_serve)
 

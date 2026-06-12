@@ -130,3 +130,97 @@ orchestrator/
 tests/
 agent-workflow/    spec source (submodule, read-only)
 ```
+
+## Ops UIs (Directus + Metabase)
+
+Directus (admin/inspect) and Metabase (analytics) run under the `ops` compose
+profile so they do not start by default.
+
+### Starting the ops stack
+
+```bash
+# Postgres only (default — unchanged):
+docker compose up -d db
+
+# Postgres + Directus + Metabase:
+docker compose --profile ops up -d
+```
+
+### URLs
+
+| Service   | URL                    | Default credentials                          |
+|-----------|------------------------|----------------------------------------------|
+| Directus  | http://localhost:8055  | `DIRECTUS_ADMIN_EMAIL` / `DIRECTUS_ADMIN_PASSWORD` from `.env` (defaults: `admin@example.com` / `Admin1234!`) |
+| Metabase  | http://localhost:3000  | Set up on first visit via the setup wizard   |
+
+### First-time setup
+
+**Metabase app database** — Metabase stores its own metadata in a separate
+`metabase` Postgres database. Create it once before starting the stack (or after
+the `db` container is running):
+
+```bash
+docker compose exec db createdb -U orchestrator metabase
+```
+
+**Directus first login** — On first startup Directus seeds the admin account
+using `DIRECTUS_ADMIN_EMAIL` and `DIRECTUS_ADMIN_PASSWORD` from your `.env`.
+Change these from the defaults before any internet-facing deployment.
+
+### Connecting Metabase to the orchestrator data
+
+Use the read-only role created by migration `0004_readonly_role.sql` so
+Metabase cannot mutate live data:
+
+1. Open http://localhost:3000 and complete the setup wizard.
+2. Go to **Settings → Databases → Add a database**.
+3. Choose **PostgreSQL** and fill in:
+   - Host: `db` (or `localhost` if Metabase is running outside Docker)
+   - Port: `5432`
+   - Database name: `orchestrator`
+   - Username: `orchestrator_ro`
+   - Password: `orchestrator_ro`
+4. Save — Metabase will sync the schema and you can build questions/dashboards.
+
+The `orchestrator_ro` role has `SELECT` on all existing and future tables in the
+`public` schema (via `ALTER DEFAULT PRIVILEGES`).
+
+### Read-only role (direct psql access)
+
+```bash
+PGPASSWORD=orchestrator_ro psql -h localhost -U orchestrator_ro -d orchestrator
+```
+
+The role can `SELECT` from all tables but any `INSERT`/`UPDATE`/`DELETE` will
+be rejected with a permission error.
+
+### WARNING — Directus write bypass
+
+> **Edits made through the Directus admin UI bypass the `issue_events` audit
+> log.** The orchestrator's off-rails and oscillation-detection logic depends on
+> every state change being recorded in `issue_events` via `repository.py`.
+> Prefer the CLI dashboard directives (`orchestrator.cli`) for all normal state
+> changes. Use Directus only for **read/inspect** and as an **emergency escape
+> hatch** (e.g. manually unsticking an `off_rails` issue when the engine cannot
+> self-recover).
+
+## Command reference (post-roadmap slices)
+
+| Command | Slice | What it does |
+| --- | --- | --- |
+| `run --daemon --interval 5` | A | tick forever; per-tick summaries; Ctrl-C stops |
+| `directive <issue-id> resume --note "..."` | B | un-quarantine an `off_rails` issue (audited) |
+| `goal-resume <goal-id>` | B | restart a `paused` goal |
+| `serve-dashboard --port 8000` | C | FastAPI ops dashboard (fleet, timelines, directives) |
+| `add-goal "..." --pipeline hotfix` | J | route a goal through an alternate pipeline |
+| `apply-promote <issue-id> --note "..."` | F | merge an issue's *verified* worktree branch (human gate; local only) |
+
+Cross-team messages ingest automatically each tick (slice D): a pending request
+to a rostered team is triaged into a local issue; its completion sends a
+response and archives the original. Sub-issue decomposition (slice E) splits
+oversized issues and blocks the parent until children finish. `runtime=cli`
+agents (slice I) run `CLI_AGENT_CMD` per implementation step. Semantic memory
+(slice H) embeds notes when `EMBED_PROVIDER` is set and degrades to ILIKE
+without pgvector. The apply/verify leg (slice F) is **off by default**
+(`APPLY_ENABLED`): artifacts apply only in disposable worktrees, and nothing
+merges without `apply-promote`.

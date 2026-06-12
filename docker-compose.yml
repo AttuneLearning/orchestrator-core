@@ -2,6 +2,10 @@
 # Not required for development or in-session verification — the migrations run
 # against any Postgres 16/17, including the cloud env's in-session instance
 # (`service postgresql start`). See README.md.
+#
+# Profiles:
+#   (default)        docker compose up -d db          — Postgres only
+#   --profile ops    docker compose --profile ops up -d — adds Directus + Metabase
 services:
   db:
     image: pgvector/pgvector:pg17
@@ -13,6 +17,55 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # Directus — headless CMS / admin UI for the orchestrator database.
+  # NOTE: Directus creates its own directus_* system tables in the same
+  # `orchestrator` database — acceptable for an admin/inspect tool.
+  # ---------------------------------------------------------------------------
+  directus:
+    image: directus/directus:11
+    profiles: ["ops"]
+    ports:
+      - "8055:8055"
+    depends_on:
+      - db
+    environment:
+      # Postgres connection (shares the orchestrator database)
+      DB_CLIENT: pg
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_DATABASE: orchestrator
+      DB_USER: orchestrator
+      DB_PASSWORD: orchestrator
+      # Directus app secrets / admin account — override via .env
+      SECRET: ${DIRECTUS_SECRET:-changeme-directus-secret-32chars}
+      ADMIN_EMAIL: ${DIRECTUS_ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${DIRECTUS_ADMIN_PASSWORD:-Admin1234!}
+
+  # ---------------------------------------------------------------------------
+  # Metabase — analytics / dashboards for the orchestrator data.
+  # Metabase stores its own app metadata in a separate `metabase` database
+  # that must be created once:
+  #   docker compose exec db createdb -U orchestrator metabase
+  # Then connect Metabase to the orchestrator data via the orchestrator_ro
+  # read-only role (created by migration 0004_readonly_role.sql) — configure
+  # the data source inside the Metabase UI at http://localhost:3000.
+  # ---------------------------------------------------------------------------
+  metabase:
+    image: metabase/metabase:latest
+    profiles: ["ops"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_HOST: db
+      MB_DB_PORT: "5432"
+      MB_DB_USER: orchestrator
+      MB_DB_PASS: orchestrator
 
 volumes:
   pgdata:

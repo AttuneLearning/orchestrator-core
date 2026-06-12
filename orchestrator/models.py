@@ -60,6 +60,9 @@ class EventType(str, Enum):
     PLAN = "plan"
     DIRECTIVE = "directive"
     COMMS_RESPONSE = "comms_response"
+    DECOMPOSED = "decomposed"
+    VERIFICATION = "verification"
+    PROMOTED = "promoted"
 
 
 @dataclass
@@ -68,6 +71,7 @@ class Goal:
     title: str
     description: str = ""
     state: str = GoalState.BACKLOG.value
+    pipeline: str = "pipeline-1"
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -100,6 +104,7 @@ class Agent:
     function: str = "dev"
     runtime: str = "api"
     status: str = "idle"
+    last_seen: Optional[datetime] = None
     created_at: Optional[datetime] = None
 
 

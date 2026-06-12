@@ -187,14 +187,20 @@ def issue_detail(issue: dict[str, Any], events: list[dict[str, Any]]) -> str:
 
 
 def agents_page(agents: list[dict[str, Any]]) -> str:
+    def _seen(a: dict[str, Any]) -> str:
+        if a.get("stale"):
+            return f"<span class='s-failed'>stale ({escape(str(a.get('last_seen') or '')[:19])})</span>"
+        return escape(str(a.get("last_seen") or "never")[:19])
+
     rows = "".join(
         f"<tr><td>#{a['id']}</td><td>{escape(a['team'])}/{escape(a['function'])}</td>"
         f"<td><span class='pill'>{escape(a['status'])}</span></td>"
-        f"<td>{escape(a['runtime'])}</td></tr>"
+        f"<td>{escape(a['runtime'])}</td><td>{_seen(a)}</td></tr>"
         for a in agents
     )
     return page("Agents", (
         "<h1>Agent registry</h1>"
-        "<table><tr><th>ID</th><th>Team/Function</th><th>Status</th><th>Runtime</th></tr>"
-        f"{rows}</table>" if rows else "<h1>Agent registry</h1><p class='muted'>None registered.</p>"
+        "<table><tr><th>ID</th><th>Team/Function</th><th>Status</th><th>Runtime</th>"
+        f"<th>Last seen</th></tr>{rows}</table>"
+        if rows else "<h1>Agent registry</h1><p class='muted'>None registered.</p>"
     ))

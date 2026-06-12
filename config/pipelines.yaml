@@ -57,3 +57,38 @@ pipelines:
         exit_criteria:
           - "Response message exists in originating team's inbox"
           - "Original inbound message archived"
+
+  hotfix:
+    name: "Hotfix"
+    description: "Minimal path for urgent fixes: implement, validate, ship. No intake/completion ceremony."
+    gates:
+      - type: implementation
+        order: 1
+        owner: dev
+        description: "Fix with a regression test, in a verified state."
+        exit_criteria:
+          - "Fix implemented with regression test"
+      - type: qa_gate
+        order: 2
+        owner: qa
+        description: "Validate the fix against completion criteria."
+        exit_criteria:
+          - "All gate checks pass"
+        on_failure: implementation
+
+  research:
+    name: "Research / Spike"
+    description: "Investigation with a written conclusion; no code gates."
+    gates:
+      - type: intake
+        order: 1
+        owner: dev
+        description: "Frame the question, constraints, and success criteria."
+        exit_criteria:
+          - "Question and scope written"
+      - type: completion
+        order: 2
+        owner: dev
+        description: "Record findings and recommendation."
+        exit_criteria:
+          - "Findings recorded; session file exists"

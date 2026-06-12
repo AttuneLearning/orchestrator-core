@@ -19,20 +19,57 @@ from psycopg_pool import ConnectionPool
 from .models import Agent, Goal, Issue, IssueEvent, IssueState, MemoryNote
 from .state_machine import validate_transition
 
+# Module-level cache for pgvector availability.  None = not yet checked.
+_pgvector_ok: Optional[bool] = None
+
+
+def reset_pgvector_cache() -> None:
+    """Reset the cached pgvector-availability flag.  Intended for tests only."""
+    global _pgvector_ok
+    _pgvector_ok = None
+
+
+def _pgvector_available(pool: ConnectionPool) -> bool:
+    """Return True iff pgvector is installed AND the embedding_v column exists.
+
+    The result is cached for the lifetime of the process (module-level variable).
+    Call reset_pgvector_cache() in tests that need a fresh check.
+    """
+    global _pgvector_ok
+    if _pgvector_ok is not None:
+        return _pgvector_ok
+    try:
+        with pool.connection() as conn:
+            ext_row = conn.execute(
+                "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+            ).fetchone()
+            if ext_row is None:
+                _pgvector_ok = False
+                return False
+            col_row = conn.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'memory_notes' AND column_name = 'embedding_v'"
+            ).fetchone()
+            _pgvector_ok = col_row is not None
+    except Exception:
+        _pgvector_ok = False
+    return _pgvector_ok
+
 
 # --------------------------------------------------------------------------- #
 # Goals
 # --------------------------------------------------------------------------- #
 
-def create_goal(pool: ConnectionPool, title: str, description: str = "") -> Goal:
+def create_goal(pool: ConnectionPool, title: str, description: str = "",
+                pipeline: str = "pipeline-1") -> Goal:
     with pool.connection() as conn:
         row = conn.execute(
             """
-            INSERT INTO goals (title, description, state)
-            VALUES (%s, %s, 'backlog')
-            RETURNING id, title, description, state, created_at, updated_at
+            INSERT INTO goals (title, description, state, pipeline)
+            VALUES (%s, %s, 'backlog', %s)
+            RETURNING id, title, description, state, pipeline, created_at, updated_at
             """,
-            (title, description),
+            (title, description, pipeline),
         ).fetchone()
     return Goal(*row)
 
@@ -42,7 +79,7 @@ def list_open_goals(pool: ConnectionPool) -> list[Goal]:
         cur = conn.cursor(row_factory=class_row(Goal))
         return cur.execute(
             """
-            SELECT id, title, description, state, created_at, updated_at
+            SELECT id, title, description, state, pipeline, created_at, updated_at
             FROM goals
             WHERE state NOT IN ('done', 'paused')
             ORDER BY id
@@ -56,7 +93,7 @@ def list_all_goals(pool: ConnectionPool) -> list[Goal]:
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(Goal))
         return cur.execute(
-            "SELECT id, title, description, state, created_at, updated_at "
+            "SELECT id, title, description, state, pipeline, created_at, updated_at "
             "FROM goals ORDER BY id"
         ).fetchall()
 
@@ -146,6 +183,7 @@ def list_issues(
     pool: ConnectionPool,
     goal_id: Optional[int] = None,
     states: Optional[list[str]] = None,
+    parent_id: Optional[int] = None,
 ) -> list[Issue]:
     clauses, params = [], []
     if goal_id is not None:
@@ -154,6 +192,9 @@ def list_issues(
     if states:
         clauses.append("state = ANY(%s)")
         params.append(states)
+    if parent_id is not None:
+        clauses.append("parent_id = %s")
+        params.append(parent_id)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with pool.connection() as conn:
         rows = conn.execute(_ISSUE_SELECT + where + " ORDER BY id", params).fetchall()
@@ -313,19 +354,30 @@ def count_by_state(pool: ConnectionPool, table: str) -> dict[str, int]:
 # Agents
 # --------------------------------------------------------------------------- #
 
+_AGENT_COLS = "id, team, function, runtime, status, last_seen, created_at"
+
+
 def register_agent(
     pool: ConnectionPool, team: str, function: str = "dev", runtime: str = "api"
 ) -> Agent:
     with pool.connection() as conn:
         row = conn.execute(
-            """
+            f"""
             INSERT INTO agents (team, function, runtime, status)
             VALUES (%s, %s, %s, 'idle')
-            RETURNING id, team, function, runtime, status, created_at
+            RETURNING {_AGENT_COLS}
             """,
             (team, function, runtime),
         ).fetchone()
     return Agent(*row)
+
+
+def get_agent(pool: ConnectionPool, agent_id: int) -> Optional[Agent]:
+    with pool.connection() as conn:
+        cur = conn.cursor(row_factory=class_row(Agent))
+        return cur.execute(
+            f"SELECT {_AGENT_COLS} FROM agents WHERE id = %s", (agent_id,)
+        ).fetchone()
 
 
 def list_agents(pool: ConnectionPool, team: Optional[str] = None) -> list[Agent]:
@@ -333,19 +385,23 @@ def list_agents(pool: ConnectionPool, team: Optional[str] = None) -> list[Agent]
         cur = conn.cursor(row_factory=class_row(Agent))
         if team:
             return cur.execute(
-                "SELECT id, team, function, runtime, status, created_at "
-                "FROM agents WHERE team = %s ORDER BY id",
+                f"SELECT {_AGENT_COLS} FROM agents WHERE team = %s ORDER BY id",
                 (team,),
             ).fetchall()
         return cur.execute(
-            "SELECT id, team, function, runtime, status, created_at "
-            "FROM agents ORDER BY id"
+            f"SELECT {_AGENT_COLS} FROM agents ORDER BY id"
         ).fetchall()
 
 
 def set_agent_status(pool: ConnectionPool, agent_id: int, status: str) -> None:
     with pool.connection() as conn:
         conn.execute("UPDATE agents SET status = %s WHERE id = %s", (status, agent_id))
+
+
+def touch_agent(pool: ConnectionPool, agent_id: int) -> None:
+    """Heartbeat: record that the agent did work just now."""
+    with pool.connection() as conn:
+        conn.execute("UPDATE agents SET last_seen = now() WHERE id = %s", (agent_id,))
 
 
 def find_idle_agent(
@@ -355,13 +411,13 @@ def find_idle_agent(
         cur = conn.cursor(row_factory=class_row(Agent))
         if function:
             return cur.execute(
-                "SELECT id, team, function, runtime, status, created_at FROM agents "
+                f"SELECT {_AGENT_COLS} FROM agents "
                 "WHERE team = %s AND function = %s AND status != 'offline' "
                 "ORDER BY (status = 'idle') DESC, id LIMIT 1",
                 (team, function),
             ).fetchone()
         return cur.execute(
-            "SELECT id, team, function, runtime, status, created_at FROM agents "
+            f"SELECT {_AGENT_COLS} FROM agents "
             "WHERE team = %s AND status != 'offline' "
             "ORDER BY (status = 'idle') DESC, id LIMIT 1",
             (team,),
@@ -372,13 +428,28 @@ def find_idle_agent(
 # Memory
 # --------------------------------------------------------------------------- #
 
-def memory_write(pool: ConnectionPool, body: str, scope: str = "global") -> MemoryNote:
-    with pool.connection() as conn:
-        row = conn.execute(
-            "INSERT INTO memory_notes (scope, body) VALUES (%s, %s) "
-            "RETURNING id, scope, body, created_at",
-            (scope, body),
-        ).fetchone()
+def memory_write(
+    pool: ConnectionPool,
+    body: str,
+    scope: str = "global",
+    embedding: Optional[list[float]] = None,
+) -> MemoryNote:
+    if embedding is not None and _pgvector_available(pool):
+        vec_literal = "[" + ",".join(str(v) for v in embedding) + "]"
+        with pool.connection() as conn:
+            row = conn.execute(
+                "INSERT INTO memory_notes (scope, body, embedding_v) "
+                "VALUES (%s, %s, %s::vector) "
+                "RETURNING id, scope, body, created_at",
+                (scope, body, vec_literal),
+            ).fetchone()
+    else:
+        with pool.connection() as conn:
+            row = conn.execute(
+                "INSERT INTO memory_notes (scope, body) VALUES (%s, %s) "
+                "RETURNING id, scope, body, created_at",
+                (scope, body),
+            ).fetchone()
     return MemoryNote(*row)
 
 
@@ -392,8 +463,50 @@ def memory_recall(pool: ConnectionPool, scope: str = "global", limit: int = 20) 
         ).fetchall()
 
 
-def memory_search(pool: ConnectionPool, query: str, limit: int = 20) -> list[MemoryNote]:
-    """LIKE-based search for this phase; pgvector is a deferred follow-up."""
+def memory_search(
+    pool: ConnectionPool,
+    query: str,
+    limit: int = 20,
+    query_embedding: Optional[list[float]] = None,
+) -> list[MemoryNote]:
+    """Search memory notes.
+
+    If query_embedding is provided AND pgvector is available, uses cosine
+    distance (embedding_v <=> %s::vector) with a WHERE embedding_v IS NOT NULL
+    filter.  Falls back to ILIKE on the query string for rows with no vector,
+    appending any non-duplicate ILIKE hits up to the limit.
+
+    When pgvector is unavailable or query_embedding is None, uses ILIKE only
+    (original behaviour — all existing call sites continue to work).
+    """
+    if query_embedding is not None and _pgvector_available(pool):
+        vec_literal = "[" + ",".join(str(v) for v in query_embedding) + "]"
+        with pool.connection() as conn:
+            cur = conn.cursor(row_factory=class_row(MemoryNote))
+            # Primary: vector-similarity results (rows that have an embedding).
+            vec_rows = cur.execute(
+                "SELECT id, scope, body, created_at FROM memory_notes "
+                "WHERE embedding_v IS NOT NULL "
+                "ORDER BY embedding_v <=> %s::vector "
+                "LIMIT %s",
+                (vec_literal, limit),
+            ).fetchall()
+            seen_ids = {n.id for n in vec_rows}
+            results = list(vec_rows)
+            # Supplement with ILIKE hits if we still have room and the query
+            # text is not empty (degenerate queries fall back entirely to ILIKE).
+            if len(results) < limit and query:
+                remaining = limit - len(results)
+                ilike_rows = cur.execute(
+                    "SELECT id, scope, body, created_at FROM memory_notes "
+                    "WHERE body ILIKE %s ORDER BY id DESC LIMIT %s",
+                    (f"%{query}%", remaining + len(seen_ids)),
+                ).fetchall()
+                for n in ilike_rows:
+                    if n.id not in seen_ids and len(results) < limit:
+                        results.append(n)
+        return results
+    # Fallback: original ILIKE behaviour (unchanged).
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(MemoryNote))
         return cur.execute(
