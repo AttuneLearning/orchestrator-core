@@ -16,8 +16,9 @@ complete. Postgres MVCC keeps a single-threaded loop consistent.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from psycopg_pool import ConnectionPool
 
@@ -126,8 +127,9 @@ class Engine:
     def _assign(self, summary: TickSummary) -> None:
         for issue in repo.list_issues(self.pool, states=[IssueState.BACKLOG.value]):
             try:
-                # plan, then mark ready
-                self.reasoner.plan_issue(issue)
+                # plan (stored on the log for review/re-engagement), then mark ready
+                plan = self.reasoner.plan_issue(issue)
+                repo.append_log(self.pool, issue.id, "plan", {"plan": plan})
                 issue = self._transition(issue, IssueState.READY.value)
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"plan issue {issue.id}: {exc}")
@@ -202,6 +204,12 @@ class Engine:
         for issue in active:
             try:
                 events = repo.recent_events(self.pool, issue.id, limit=200)
+                # A human directive is a fresh start: only judge what happened
+                # after the latest one (events arrive newest-first).
+                cut = next((i for i, e in enumerate(events)
+                            if e.event_type == "directive"), None)
+                if cut is not None:
+                    events = events[:cut]
                 signals = focus.mechanical_signals(issue, events, self.t)
                 if not signals:
                     continue
@@ -258,12 +266,28 @@ class Engine:
         self._reconcile(summary)
         return summary
 
-    def run(self, max_ticks: int = 100) -> list[TickSummary]:
+    def run(self, max_ticks: int = 100,
+            on_tick: Optional[Callable[[TickSummary], None]] = None) -> list[TickSummary]:
         """Tick until quiescent (no work performed) or max_ticks reached."""
         history: list[TickSummary] = []
         for _ in range(max_ticks):
             summary = self.tick()
             history.append(summary)
+            if on_tick is not None:
+                on_tick(summary)
             if not summary.did_work:
                 break
         return history
+
+    def run_daemon(self, interval: float = 5.0,
+                   on_tick: Optional[Callable[[TickSummary], None]] = None) -> None:
+        """Tick forever, sleeping between quiescent ticks. Ctrl-C returns cleanly."""
+        try:
+            while True:
+                summary = self.tick()
+                if on_tick is not None:
+                    on_tick(summary)
+                if not summary.did_work:
+                    time.sleep(interval)
+        except KeyboardInterrupt:
+            return

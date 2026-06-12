@@ -4,7 +4,11 @@ Subcommands:
   migrate                         apply pending SQL migrations
   register-agent --team --function --runtime
   add-goal "<title>" [--description ...]
-  run [--max-ticks N]             drive the engine tick loop until quiescent
+  run [--max-ticks N] [--daemon --interval S]
+                                  drive the engine tick loop
+  directive <issue-id> resume [--note ...]
+                                  un-quarantine an off_rails issue
+  goal-resume <goal-id>           restart a paused goal
   serve                           start the MCP server (stdio)
   status                          print goals / issues / agents snapshot
 """
@@ -44,6 +48,19 @@ def _cmd_run(args, settings) -> int:
 
     pool = get_pool(settings)
     engine = Engine(settings, pool)
+
+    if args.daemon:
+        def _report(summary):
+            if summary.did_work or summary.errors:
+                line = " ".join(f"{k}={v}" for k, v in vars(summary).items()
+                                if k != "errors" and v)
+                print(f"tick: {line or 'idle'}")
+                for e in summary.errors:
+                    print("  error:", e)
+        print(f"daemon: ticking every {args.interval}s when idle (Ctrl-C to stop)")
+        engine.run_daemon(interval=args.interval, on_tick=_report)
+        return 0
+
     history = engine.run(max_ticks=args.max_ticks)
     totals = {
         "ticks": len(history),
@@ -63,6 +80,21 @@ def _cmd_run(args, settings) -> int:
         print("errors:")
         for e in errors:
             print("  -", e)
+    return 0
+
+
+def _cmd_directive(args, settings) -> int:
+    pool = get_pool(settings)
+    issue = repo.apply_directive(pool, args.issue_id, args.action, note=args.note)
+    print(f"issue {issue.id}: directive '{args.action}' applied → {issue.state} "
+          f"(gate={issue.gate_type}, retries/steps reset)")
+    return 0
+
+
+def _cmd_goal_resume(args, settings) -> int:
+    pool = get_pool(settings)
+    repo.resume_goal(pool, args.goal_id)
+    print(f"goal {args.goal_id}: paused → active")
     return 0
 
 
@@ -108,7 +140,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     rn = sub.add_parser("run", help="drive the engine until quiescent")
     rn.add_argument("--max-ticks", type=int, default=100)
+    rn.add_argument("--daemon", action="store_true",
+                    help="tick forever instead of stopping when quiescent")
+    rn.add_argument("--interval", type=float, default=5.0,
+                    help="seconds between ticks when idle (daemon mode)")
     rn.set_defaults(func=_cmd_run)
+
+    dr = sub.add_parser("directive", help="un-quarantine an off_rails issue")
+    dr.add_argument("issue_id", type=int)
+    dr.add_argument("action", choices=["resume"])
+    dr.add_argument("--note", default="")
+    dr.set_defaults(func=_cmd_directive)
+
+    gr = sub.add_parser("goal-resume", help="restart a paused goal")
+    gr.add_argument("goal_id", type=int)
+    gr.set_defaults(func=_cmd_goal_resume)
 
     sub.add_parser("serve", help="start the MCP server (stdio)").set_defaults(func=_cmd_serve)
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)

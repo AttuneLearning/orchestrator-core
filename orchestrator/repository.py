@@ -16,7 +16,8 @@ from psycopg.rows import class_row, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from .models import Agent, Goal, Issue, IssueEvent, MemoryNote
+from .models import Agent, Goal, Issue, IssueEvent, IssueState, MemoryNote
+from .state_machine import validate_transition
 
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +56,18 @@ def set_goal_state(pool: ConnectionPool, goal_id: int, state: str) -> None:
             "UPDATE goals SET state = %s, updated_at = now() WHERE id = %s",
             (state, goal_id),
         )
+
+
+def resume_goal(pool: ConnectionPool, goal_id: int) -> None:
+    """Human directive: restart a paused goal (paused → active)."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE goals SET state = 'active', updated_at = now() "
+            "WHERE id = %s AND state = 'paused' RETURNING id",
+            (goal_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"goal {goal_id} not found or not paused")
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +201,39 @@ def update_state(
         ).fetchone()
         _append_event(conn, issue_id, event_type, from_state, to_state, payload or {})
     return _issue_from_row(row)
+
+
+def apply_directive(
+    pool: ConnectionPool,
+    issue_id: int,
+    directive: str = "resume",
+    note: str = "",
+    actor: str = "human",
+) -> Issue:
+    """Human directive: un-quarantine an off_rails issue (off_rails → in_progress).
+
+    The only path out of the off_rails latch. Resets retry/step counters and
+    keeps the gate, so work resumes where it was quarantined. Recorded as a
+    'directive' event — the focus sweep only considers events after the latest
+    directive, so the issue gets a genuinely fresh start.
+    """
+    issue = get_issue(pool, issue_id)
+    if issue is None:
+        raise ValueError(f"no issue {issue_id}")
+    to_state = IssueState.IN_PROGRESS.value
+    if issue.state != IssueState.OFF_RAILS.value or not validate_transition(
+        issue.state, to_state, directive=True
+    ):
+        raise ValueError(
+            f"directive '{directive}' not applicable: issue {issue_id} is "
+            f"'{issue.state}', expected 'off_rails'"
+        )
+    return update_state(
+        pool, issue_id, to_state, gate_type=issue.gate_type,
+        event_type="directive",
+        payload={"directive": directive, "note": note, "actor": actor},
+        retry_count=0, step_count=0,
+    )
 
 
 def append_log(

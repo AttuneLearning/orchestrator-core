@@ -46,8 +46,15 @@ _ALLOWED: dict[str, set[str]] = {
 }
 
 
-def validate_transition(from_state: str, to_state: str) -> bool:
-    """True if from_state → to_state is legal. off_rails is always reachable from active."""
+def validate_transition(from_state: str, to_state: str, *, directive: bool = False) -> bool:
+    """True if from_state → to_state is legal. off_rails is always reachable from active.
+
+    directive=True unlocks the human-directive-only escape hatch: off_rails →
+    in_progress. The engine never sets it; only repository.apply_directive does,
+    so the quarantine latch stays latched for autonomous flow.
+    """
+    if directive and from_state == IssueState.OFF_RAILS.value:
+        return to_state == IssueState.IN_PROGRESS.value
     if to_state == IssueState.OFF_RAILS.value:
         return from_state in _ACTIVE
     return to_state in _ALLOWED.get(from_state, set())

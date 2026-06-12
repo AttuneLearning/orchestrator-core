@@ -91,3 +91,18 @@ def test_decline_at_retry_cap_fails():
     )
     assert out.state == "failed"
     assert out.retry_count == 3
+
+
+# --- directive escape hatch ------------------------------------------------- #
+
+def test_directive_unlocks_off_rails_to_in_progress():
+    assert not validate_transition("off_rails", "in_progress")
+    assert validate_transition("off_rails", "in_progress", directive=True)
+
+
+def test_directive_does_not_unlock_off_rails_to_other_states():
+    assert not validate_transition("off_rails", "done", directive=True)
+
+
+def test_directive_does_not_break_normal_transition():
+    assert validate_transition("ready", "in_progress", directive=True)

@@ -73,6 +73,13 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         return asdict(repo.create_subissue(pool, parent, title, description))
 
     @mcp.tool()
+    def apply_directive(issue_id: int, note: str = "",
+                        actor: str = "human") -> dict[str, Any]:
+        """Un-quarantine an off_rails issue (human directive; resets counters)."""
+        return asdict(repo.apply_directive(pool, issue_id, "resume",
+                                           note=note, actor=actor))
+
+    @mcp.tool()
     def append_log(issue_id: int, event_type: str,
                    payload: Optional[dict[str, Any]] = None) -> dict[str, str]:
         """Append a non-transition event to an issue's log."""

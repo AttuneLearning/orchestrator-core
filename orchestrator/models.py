@@ -57,6 +57,8 @@ class EventType(str, Enum):
     DRIFT_SCORE = "drift_score"
     REENGAGED = "reengaged"
     CONTEXT_SNAPSHOT = "context_snapshot"
+    PLAN = "plan"
+    DIRECTIVE = "directive"
 
 
 @dataclass
