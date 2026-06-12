@@ -1,0 +1,59 @@
+# =============================================================================
+# Pipeline definitions. Each pipeline is an ordered list of gates that an issue
+# must pass. Seeded faithfully from the agent-workflow spec:
+#   agent-workflow/claude-workflow/teams/protocol.yaml -> issue_lifecycle.phases
+#   agent-workflow/claude-workflow/scaffolds/dev_communication/PROCESS_GUIDE.md
+#
+# The orchestrator state machine maps an issue's current gate onto
+# in_review[gate_type]; a passing gate_review advances to the next gate, a
+# decline increments retry_count. Gates with a `condition` are skipped when the
+# condition does not hold for the issue.
+# =============================================================================
+
+pipelines:
+  pipeline-1:
+    name: "Five-Phase Issue Lifecycle"
+    description: "Universal lifecycle from PROCESS_GUIDE.md — every issue, every team."
+    gates:
+      - type: intake
+        order: 1
+        owner: dev
+        description: "Triage inbound work into actionable issues with contracts and context."
+        exit_criteria:
+          - "Issue file exists in queue/ or active/"
+          - "Contracts sent if endpoint work is involved"
+
+      - type: implementation
+        order: 2
+        owner: dev
+        description: "Build the feature or fix, with tests, in a verified state."
+        exit_criteria:
+          - "Code implemented"
+          - "Tests written and passing"
+          - "TypeScript compiles with 0 errors"
+
+      - type: qa_gate
+        order: 3
+        owner: qa
+        description: "Validate the implementation against completion criteria."
+        exit_criteria:
+          - "All completion gate checks pass"
+          - "Code review criteria satisfied"
+        on_failure: implementation
+
+      - type: completion
+        order: 4
+        owner: dev
+        description: "Record the work and close the issue."
+        exit_criteria:
+          - "Session file exists"
+          - "Issue file in completed/ with commit hash"
+
+      - type: comms_response
+        order: 5
+        owner: dev
+        description: "Send response to originating team — NOT optional when triggered by a message."
+        condition: triggered_by_message   # skipped unless the issue has an originating inbound message
+        exit_criteria:
+          - "Response message exists in originating team's inbox"
+          - "Original inbound message archived"

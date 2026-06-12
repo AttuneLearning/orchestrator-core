@@ -1,0 +1,21 @@
+# =============================================================================
+# Orchestrator settings. Environment variables (see .env.example) override
+# any value here at load time (orchestrator/config.py).
+# =============================================================================
+
+reasoning_model: claude-opus-4-8
+
+code_provider: stub        # stub | openai | anthropic
+code_base_url: ""
+code_model: ""
+
+# Engine thresholds / caps
+thresholds:
+  drift_threshold: 0.5     # off_rails latches only when a signal fires AND drift < this
+  retry_cap: 3             # gate declines before an issue lands in failed
+  step_budget: 25          # max gate-advances per issue before exhaustion
+  max_depth: 3             # sub-issue nesting depth
+  max_subissues: 8         # children per decomposition
+  max_issues_per_goal: 30  # hard cap on issues created for one goal
+
+default_pipeline: pipeline-1

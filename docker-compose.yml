@@ -1,0 +1,18 @@
+# Optional: Postgres with pgvector for parity with the target deployment.
+# Not required for development or in-session verification — the migrations run
+# against any Postgres 16/17, including the cloud env's in-session instance
+# (`service postgresql start`). See README.md.
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

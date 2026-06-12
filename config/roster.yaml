@@ -1,0 +1,74 @@
+# =============================================================================
+# Roster: the generic role catalog plus the project's active teams.
+#
+# Roles + sub_roles are copied from the agent-workflow spec:
+#   agent-workflow/claude-workflow/teams/catalog.yaml
+# active_teams mirrors the registry template (backend + frontend, each with
+# dev/qa sub-teams):
+#   agent-workflow/claude-workflow/scaffolds/dev_communication/shared/registry.yaml
+#
+# Each team runs all six skills (comms, adr, memory, context, reflect, refine)
+# per agent-workflow/codex-workflow/teams/profiles.json. Agent runtime is `api`
+# for this build; the `cli` runtime is a deferred follow-up.
+# =============================================================================
+
+roles:
+  frontend:
+    name: Frontend
+    sub_roles: [ui-development, design-system, accessibility, performance, state-data-layer]
+  backend:
+    name: Backend
+    sub_roles: [api-development, app-data, auth, integrations, background-jobs]
+  mobile:
+    name: Mobile
+    sub_roles: [ios, android, cross-platform, app-distribution]
+  cloud:
+    name: Cloud / Infrastructure
+    sub_roles: [architecture, cicd, observability, security-compliance, cost-optimization]
+  data-warehousing:
+    name: Data Warehousing
+    sub_roles: [etl-pipelines, analytics-bi, data-governance, ml-ai, streaming]
+  qa:
+    name: QA
+    sub_roles: [manual-qa, test-automation, performance-testing, security-testing]
+  platform:
+    name: Platform
+    sub_roles: [developer-experience, sdk-api-design, internal-tools, documentation]
+
+enabled_skills: [comms, adr, memory, context, reflect, refine]
+
+default_runtime: api   # api | cli (cli deferred)
+
+active_teams:
+  - id: backend
+    name: Backend
+    alias: api
+    role: backend
+    issue_prefix: API-ISS
+    sub_teams:
+      - id: backend-dev
+        name: Backend-Dev
+        function: dev
+        issue_prefix: API-ISS
+      - id: backend-qa
+        name: Backend-QA
+        function: qa
+        issue_prefix: BQA
+  - id: frontend
+    name: Frontend
+    alias: ui
+    role: frontend
+    issue_prefix: UI-ISS
+    sub_teams:
+      - id: frontend-dev
+        name: Frontend-Dev
+        function: dev
+        issue_prefix: UI-ISS
+      - id: frontend-qa
+        name: Frontend-QA
+        function: qa
+        issue_prefix: UI-QA
+
+aliases:
+  api: backend
+  ui: frontend
