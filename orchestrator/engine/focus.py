@@ -42,6 +42,23 @@ def mechanical_signals(
     return signals
 
 
+def signals_after_directive(
+    issue: Issue, events: Iterable[IssueEvent], thresholds: Thresholds
+) -> list[str]:
+    """mechanical_signals over only the events *after* the latest human directive.
+
+    A directive is a fresh start, so prior declines/errors must not re-trip the
+    quarantine. `events` is newest-first (repository.recent_events order); the
+    same view feeds the engine sweep and the dashboard so they never disagree on
+    what is flagged.
+    """
+    events = list(events)
+    cut = next((i for i, e in enumerate(events) if e.event_type == "directive"), None)
+    if cut is not None:
+        events = events[:cut]
+    return mechanical_signals(issue, events, thresholds)
+
+
 def fleet_focus(active: int, flagged: int) -> float:
     """Fraction of active issues with no mechanical signal. 1.0 when all clear."""
     if active <= 0:

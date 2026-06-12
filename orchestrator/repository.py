@@ -50,6 +50,17 @@ def list_open_goals(pool: ConnectionPool) -> list[Goal]:
         ).fetchall()
 
 
+def list_all_goals(pool: ConnectionPool) -> list[Goal]:
+    """Every goal regardless of state — for the dashboard, which must show paused
+    and done goals that list_open_goals deliberately hides from the engine."""
+    with pool.connection() as conn:
+        cur = conn.cursor(row_factory=class_row(Goal))
+        return cur.execute(
+            "SELECT id, title, description, state, created_at, updated_at "
+            "FROM goals ORDER BY id"
+        ).fetchall()
+
+
 def set_goal_state(pool: ConnectionPool, goal_id: int, state: str) -> None:
     with pool.connection() as conn:
         conn.execute(
@@ -263,6 +274,39 @@ def recent_events(pool: ConnectionPool, issue_id: int, limit: int = 50) -> list[
             (issue_id, limit),
         ).fetchall()
     return [IssueEvent(**r) for r in rows]
+
+
+def issue_timeline(pool: ConnectionPool, issue_id: int) -> list[IssueEvent]:
+    """All events for an issue in chronological (seq ascending) order — for the
+    dashboard timeline. Distinct from recent_events, which is newest-first."""
+    with pool.connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        rows = cur.execute(
+            "SELECT id, issue_id, seq, event_type, from_state, to_state, payload, created_at "
+            "FROM issue_events WHERE issue_id = %s ORDER BY seq ASC",
+            (issue_id,),
+        ).fetchall()
+    return [IssueEvent(**r) for r in rows]
+
+
+def issue_tree(pool: ConnectionPool, goal_id: int) -> list[Issue]:
+    """Issues for a goal, ordered so parents precede their children (depth, id)."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            _ISSUE_SELECT + " WHERE goal_id = %s ORDER BY depth, id", (goal_id,)
+        ).fetchall()
+    return [_issue_from_row(r) for r in rows]
+
+
+def count_by_state(pool: ConnectionPool, table: str) -> dict[str, int]:
+    """{state: count} for goals or issues. `table` is a fixed literal, not user input."""
+    if table not in ("goals", "issues"):
+        raise ValueError(f"unsupported table {table!r}")
+    with pool.connection() as conn:
+        rows = conn.execute(
+            f"SELECT state, count(*) FROM {table} GROUP BY state"
+        ).fetchall()
+    return {state: n for state, n in rows}
 
 
 # --------------------------------------------------------------------------- #

@@ -265,13 +265,9 @@ class Engine:
         for issue in active:
             try:
                 events = repo.recent_events(self.pool, issue.id, limit=200)
-                # A human directive is a fresh start: only judge what happened
-                # after the latest one (events arrive newest-first).
-                cut = next((i for i, e in enumerate(events)
-                            if e.event_type == "directive"), None)
-                if cut is not None:
-                    events = events[:cut]
-                signals = focus.mechanical_signals(issue, events, self.t)
+                # signals_after_directive ignores events before the latest human
+                # directive, so a resumed issue gets a genuinely fresh start.
+                signals = focus.signals_after_directive(issue, events, self.t)
                 if not signals:
                     continue
                 drift = self.reasoner.score_drift(

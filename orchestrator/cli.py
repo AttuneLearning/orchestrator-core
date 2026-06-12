@@ -10,6 +10,7 @@ Subcommands:
                                   un-quarantine an off_rails issue
   goal-resume <goal-id>           restart a paused goal
   serve                           start the MCP server (stdio)
+  serve-dashboard [--host --port] start the FastAPI ops dashboard
   status                          print goals / issues / agents snapshot
 """
 
@@ -105,6 +106,17 @@ def _cmd_serve(args, settings) -> int:
     return 0
 
 
+def _cmd_serve_dashboard(args, settings) -> int:
+    import uvicorn
+
+    from .dashboard.app import create_app
+
+    app = create_app(get_pool(settings), settings)
+    print(f"dashboard: http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
 def _cmd_status(args, settings) -> int:
     pool = get_pool(settings)
     print("== goals ==")
@@ -163,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
     gr.set_defaults(func=_cmd_goal_resume)
 
     sub.add_parser("serve", help="start the MCP server (stdio)").set_defaults(func=_cmd_serve)
+
+    sd = sub.add_parser("serve-dashboard", help="start the FastAPI ops dashboard")
+    sd.add_argument("--host", default="127.0.0.1")
+    sd.add_argument("--port", type=int, default=8000)
+    sd.set_defaults(func=_cmd_serve_dashboard)
+
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)
     return p
 
