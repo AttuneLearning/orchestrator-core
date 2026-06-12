@@ -1,0 +1,3 @@
+[submodule "agent-workflow"]
+	path = agent-workflow
+	url = git@github.com:AttuneLearning/agent-workflow.git
