@@ -118,6 +118,12 @@ def _cmd_status(args, settings) -> int:
     print("== agents ==")
     for a in repo.list_agents(pool):
         print(f"  [{a.id}] {a.team}/{a.function} {a.status} runtime={a.runtime}")
+    pending = repo.pending_messages(pool)
+    if pending:
+        print("== pending messages ==")
+        for m in pending:
+            print(f"  [{m['id']}] {m['from_team']} → {m['to_team']} "
+                  f"({m['priority']}): {m['subject']}")
     return 0
 
 

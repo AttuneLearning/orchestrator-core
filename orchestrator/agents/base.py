@@ -24,6 +24,16 @@ class GateReview:
 
 
 @dataclass
+class TriageDecision:
+    """Outcome of triaging an inbound cross-team message (accept → local issue)."""
+
+    accept: bool
+    title: str = ""
+    description: str = ""
+    reason: str = ""
+
+
+@dataclass
 class CodeResult:
     """Output of the code-generation leg. Stored, never executed."""
 

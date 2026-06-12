@@ -84,20 +84,22 @@ def create_issue(
     parent_id: Optional[int] = None,
     depth: int = 0,
     triggered_by_message: bool = False,
+    origin_message_id: Optional[int] = None,
 ) -> Issue:
     with pool.connection() as conn, conn.transaction():
         row = conn.execute(
             """
             INSERT INTO issues
                 (goal_id, parent_id, depth, team, title, description, pipeline,
-                 state, triggered_by_message)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'backlog', %s)
+                 state, triggered_by_message, origin_message_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'backlog', %s, %s)
             RETURNING id, goal_id, title, description, parent_id, depth, team,
                       pipeline, state, gate_type, retry_count, step_count,
-                      assigned_agent, triggered_by_message, created_at, updated_at
+                      assigned_agent, triggered_by_message, origin_message_id,
+                      created_at, updated_at
             """,
             (goal_id, parent_id, depth, team, title, description, pipeline,
-             triggered_by_message),
+             triggered_by_message, origin_message_id),
         ).fetchone()
         issue = _issue_from_row(row)
         _append_event(conn, issue.id, "created", None, issue.state, {"title": title})
@@ -196,7 +198,7 @@ def update_state(
             f"UPDATE issues SET {', '.join(sets)} WHERE id = %s RETURNING "
             "id, goal_id, title, description, parent_id, depth, team, pipeline, "
             "state, gate_type, retry_count, step_count, assigned_agent, "
-            "triggered_by_message, created_at, updated_at",
+            "triggered_by_message, origin_message_id, created_at, updated_at",
             params,
         ).fetchone()
         _append_event(conn, issue_id, event_type, from_state, to_state, payload or {})
@@ -379,6 +381,12 @@ def create_adr(
     return dict(zip(cols, row))
 
 
+_MESSAGE_COLS = ["id", "from_team", "to_team", "subject", "body", "priority",
+                 "issue_id", "kind", "status", "created_at"]
+_MESSAGE_SELECT = ("SELECT id, from_team, to_team, subject, body, priority, "
+                   "issue_id, kind, status, created_at FROM messages")
+
+
 def create_message(
     pool: ConnectionPool,
     from_team: str,
@@ -387,16 +395,57 @@ def create_message(
     body: str = "",
     priority: str = "medium",
     issue_id: Optional[int] = None,
+    kind: str = "request",
+    status: str = "pending",
 ) -> dict[str, Any]:
     with pool.connection() as conn:
         row = conn.execute(
-            "INSERT INTO messages (from_team, to_team, subject, body, priority, issue_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s) "
-            "RETURNING id, from_team, to_team, subject, body, priority, issue_id, created_at",
-            (from_team, to_team, subject, body, priority, issue_id),
+            "INSERT INTO messages (from_team, to_team, subject, body, priority, "
+            "issue_id, kind, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "RETURNING id, from_team, to_team, subject, body, priority, issue_id, "
+            "kind, status, created_at",
+            (from_team, to_team, subject, body, priority, issue_id, kind, status),
         ).fetchone()
-    cols = ["id", "from_team", "to_team", "subject", "body", "priority", "issue_id", "created_at"]
-    return dict(zip(cols, row))
+    return dict(zip(_MESSAGE_COLS, row))
+
+
+def get_message(pool: ConnectionPool, message_id: int) -> Optional[dict[str, Any]]:
+    with pool.connection() as conn:
+        row = conn.execute(_MESSAGE_SELECT + " WHERE id = %s", (message_id,)).fetchone()
+    return dict(zip(_MESSAGE_COLS, row)) if row else None
+
+
+def pending_messages(pool: ConnectionPool, to_team: Optional[str] = None) -> list[dict[str, Any]]:
+    """Inbound requests awaiting triage. Responses (kind='response') are never
+    ingested — that's what prevents two teams ping-ponging issues forever."""
+    where = " WHERE status = 'pending' AND kind = 'request'"
+    params: list[Any] = []
+    if to_team is not None:
+        where += " AND to_team = %s"
+        params.append(to_team)
+    with pool.connection() as conn:
+        rows = conn.execute(_MESSAGE_SELECT + where + " ORDER BY id", params).fetchall()
+    return [dict(zip(_MESSAGE_COLS, r)) for r in rows]
+
+
+def triage_message(pool: ConnectionPool, message_id: int, accept: bool,
+                   reason: str = "") -> None:
+    """Record the receiving team's triage decision (PROCESS_GUIDE: always theirs)."""
+    status = "triaged" if accept else "rejected"
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE messages SET status = %s WHERE id = %s AND status = 'pending' "
+            "RETURNING id",
+            (status, message_id),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"message {message_id} not found or not pending")
+
+
+def archive_message(pool: ConnectionPool, message_id: int) -> None:
+    with pool.connection() as conn:
+        conn.execute("UPDATE messages SET status = 'archived' WHERE id = %s",
+                     (message_id,))
 
 
 # --------------------------------------------------------------------------- #
@@ -406,7 +455,7 @@ def create_message(
 _ISSUE_SELECT = (
     "SELECT id, goal_id, title, description, parent_id, depth, team, pipeline, "
     "state, gate_type, retry_count, step_count, assigned_agent, "
-    "triggered_by_message, created_at, updated_at FROM issues"
+    "triggered_by_message, origin_message_id, created_at, updated_at FROM issues"
 )
 
 
@@ -416,7 +465,7 @@ def _issue_from_row(row: tuple) -> Issue:
         parent_id=row[4], depth=row[5], team=row[6], pipeline=row[7],
         state=row[8], gate_type=row[9], retry_count=row[10], step_count=row[11],
         assigned_agent=row[12], triggered_by_message=row[13],
-        created_at=row[14], updated_at=row[15],
+        origin_message_id=row[14], created_at=row[15], updated_at=row[16],
     )
 
 

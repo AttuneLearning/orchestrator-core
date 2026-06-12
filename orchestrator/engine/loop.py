@@ -1,8 +1,8 @@
 """The single-threaded engine tick.
 
 One tick() performs, in order:
-  1. ingest open goals (backlog → planning)
-  2. decompose planning goals into issues (respecting caps)
+  1. ingest pending inbound messages (triage → local issues, per team)
+  2. ingest open goals (backlog → planning) and decompose into issues
   3. assign queued issues to idle agents
   4. advance each active issue exactly one step (work, then gate review)
   5. focus + off-rails sweep
@@ -44,6 +44,8 @@ _TERMINAL = {IssueState.DONE.value, IssueState.FAILED.value, IssueState.OFF_RAIL
 
 @dataclass
 class TickSummary:
+    ingested: int = 0
+    rejected: int = 0
     decomposed: int = 0
     assigned: int = 0
     advanced: int = 0
@@ -57,9 +59,9 @@ class TickSummary:
 
     @property
     def did_work(self) -> bool:
-        return any([self.decomposed, self.assigned, self.advanced, self.completed,
-                    self.failed, self.quarantined, self.reengaged,
-                    self.goals_done, self.goals_paused])
+        return any([self.ingested, self.rejected, self.decomposed, self.assigned,
+                    self.advanced, self.completed, self.failed, self.quarantined,
+                    self.reengaged, self.goals_done, self.goals_paused])
 
 
 class Engine:
@@ -99,7 +101,64 @@ class Engine:
         if issue.assigned_agent is not None:
             repo.set_agent_status(self.pool, issue.assigned_agent, "idle")
 
+    def _comms_respond(self, issue: Issue) -> None:
+        """comms_response gate work: answer the originating team and archive the
+        original (PROCESS_GUIDE phase 5 — NOT optional when message-triggered)."""
+        if issue.origin_message_id is None:
+            return  # message-triggered without a tracked origin; nothing to answer
+        origin = repo.get_message(self.pool, issue.origin_message_id)
+        if origin is None:
+            return
+        repo.create_message(
+            self.pool, from_team=issue.team, to_team=origin["from_team"],
+            subject=f"Re: {origin['subject']}",
+            body=(f"Completed issue #{issue.id}: {issue.title}. "
+                  "See the issue event log for what changed."),
+            priority=origin.get("priority", "medium"),
+            issue_id=issue.id, kind="response", status="sent",
+        )
+        repo.archive_message(self.pool, origin["id"])
+        repo.append_log(self.pool, issue.id, "comms_response",
+                        {"to": origin["from_team"],
+                         "origin_message_id": origin["id"]})
+
     # -- tick phases -------------------------------------------------------- #
+
+    def _ingest(self, summary: TickSummary) -> None:
+        """Triage pending inbound requests into local issues.
+
+        Issues stay local: a message to team X only ever creates an issue owned
+        by team X (protocol.yaml). Each accepted message gets its own goal so
+        goal reconciliation closes the loop when the issue completes. Responses
+        (kind='response') are never ingested, so two teams can't ping-pong."""
+        for msg in repo.pending_messages(self.pool):
+            try:
+                team = self.roster.resolve(msg["to_team"])
+                if team is None:
+                    repo.triage_message(self.pool, msg["id"], accept=False,
+                                        reason=f"unknown team {msg['to_team']!r}")
+                    summary.rejected += 1
+                    continue
+                decision = self.reasoner.triage_message(msg)
+                if decision.accept:
+                    goal = repo.create_goal(
+                        self.pool, f"[comms] {msg['subject']}", msg.get("body", "")
+                    )
+                    repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
+                    repo.create_issue(
+                        self.pool, goal.id,
+                        decision.title or msg["subject"], decision.description,
+                        team=team.id, triggered_by_message=True,
+                        origin_message_id=msg["id"],
+                    )
+                    repo.triage_message(self.pool, msg["id"], accept=True)
+                    summary.ingested += 1
+                else:
+                    repo.triage_message(self.pool, msg["id"], accept=False,
+                                        reason=decision.reason)
+                    summary.rejected += 1
+            except Exception as exc:  # noqa: BLE001 - isolate message failures
+                summary.errors.append(f"ingest message {msg['id']}: {exc}")
 
     def _decompose(self, summary: TickSummary) -> None:
         for goal in repo.list_open_goals(self.pool):
@@ -159,6 +218,8 @@ class Engine:
             try:
                 if issue.gate_type == "implementation":
                     self.worker.implement(self.pool, issue)
+                elif issue.gate_type == "comms_response":
+                    self._comms_respond(issue)
                 self._transition(
                     issue, IssueState.IN_REVIEW.value, gate_type=issue.gate_type,
                     event_type="gate_enter", step_count=issue.step_count + 1,
@@ -258,6 +319,7 @@ class Engine:
 
     def tick(self) -> TickSummary:
         summary = TickSummary()
+        self._ingest(summary)
         self._decompose(summary)
         self._assign(summary)
         self._advance(summary)

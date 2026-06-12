@@ -59,6 +59,7 @@ class EventType(str, Enum):
     CONTEXT_SNAPSHOT = "context_snapshot"
     PLAN = "plan"
     DIRECTIVE = "directive"
+    COMMS_RESPONSE = "comms_response"
 
 
 @dataclass
@@ -87,6 +88,7 @@ class Issue:
     step_count: int = 0
     assigned_agent: Optional[int] = None
     triggered_by_message: bool = False
+    origin_message_id: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

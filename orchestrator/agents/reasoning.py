@@ -18,7 +18,7 @@ from typing import Any, Optional, Protocol
 
 from ..config import Settings
 from ..models import Goal, Issue
-from .base import GateReview, IssueSpec, extract_json
+from .base import GateReview, IssueSpec, TriageDecision, extract_json
 
 
 class Reasoner(Protocol):
@@ -28,6 +28,7 @@ class Reasoner(Protocol):
                     recent: Optional[list[dict[str, Any]]] = None) -> GateReview: ...
     def score_drift(self, issue: Issue,
                     recent: Optional[list[dict[str, Any]]] = None) -> float: ...
+    def triage_message(self, message: dict[str, Any]) -> TriageDecision: ...
 
 
 class StubReasoner:
@@ -49,6 +50,11 @@ class StubReasoner:
 
     def score_drift(self, issue, recent=None) -> float:
         return 1.0
+
+    def triage_message(self, message: dict[str, Any]) -> TriageDecision:
+        # Stub accepts every inbound request; title derives from the subject.
+        return TriageDecision(accept=True, title=message["subject"],
+                              description=message.get("body", ""))
 
 
 class AnthropicReasoner:
@@ -118,6 +124,27 @@ class AnthropicReasoner:
         )
         data = extract_json(self._ask(system, user))
         return float(data.get("drift_score", 1.0))
+
+    def triage_message(self, message: dict[str, Any]) -> TriageDecision:
+        system = (
+            "You triage an inbound cross-team request for the receiving software "
+            "team (PROCESS_GUIDE: the decision to create an issue is always the "
+            "receiving team's). Accept if it is actionable work for this team; "
+            "reject with a reason otherwise. Output JSON: "
+            '{"accept": bool, "title": str, "description": str, "reason": str}.'
+        )
+        user = (
+            f"From: {message['from_team']}\nTo: {message['to_team']}\n"
+            f"Priority: {message.get('priority', 'medium')}\n"
+            f"Subject: {message['subject']}\n\n{message.get('body', '')}"
+        )
+        data = extract_json(self._ask(system, user))
+        return TriageDecision(
+            accept=bool(data.get("accept")),
+            title=str(data.get("title") or message["subject"]),
+            description=str(data.get("description", "")),
+            reason=str(data.get("reason", "")),
+        )
 
 
 def make_reasoner(settings: Settings) -> Reasoner:

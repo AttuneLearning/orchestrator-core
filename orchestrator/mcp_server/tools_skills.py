@@ -33,6 +33,11 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
                                    priority, issue_id)
 
     @mcp.tool()
+    def comms_check(team: Optional[str] = None) -> list[dict[str, Any]]:
+        """List inbound requests awaiting triage. Mirror of /comms check."""
+        return repo.pending_messages(pool, to_team=team)
+
+    @mcp.tool()
     def context_load(scope: str = "global", topic: Optional[str] = None,
                      limit: int = 10) -> dict[str, Any]:
         """Load pre-implementation context: recent scoped memory + topic matches.
