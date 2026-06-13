@@ -1046,6 +1046,16 @@ def mark_message_read(pool: ConnectionPool, message_id: int) -> None:
         conn.execute("UPDATE messages SET read_at = now() WHERE id = %s", (message_id,))
 
 
+def list_messages(pool: ConnectionPool, limit: int = 50) -> list[dict[str, Any]]:
+    """All messages, newest first — the full correspondence log for the dashboard
+    history panel. Every message persists here the moment it's created, so nothing
+    is lost (requests, responses, archived all included)."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            _MESSAGE_SELECT + " ORDER BY id DESC LIMIT %s", (limit,)).fetchall()
+    return [dict(zip(_MESSAGE_COLS, r)) for r in rows]
+
+
 def set_message_draft(pool: ConnectionPool, message_id: int, draft: str) -> None:
     """Cache an agent-suggested reply for human review on the /orch/monitor page."""
     with pool.connection() as conn:

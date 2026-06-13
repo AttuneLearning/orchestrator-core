@@ -63,6 +63,9 @@ def create_app(pool: Optional[ConnectionPool] = None,
                                       repo.list_goals_by_state(pool, "suggested")]
         summary["pipelines"] = _pipeline_names
         summary["default_pipeline"] = settings.default_pipeline
+        # Orchestrator-queue alert badge + recent correspondence for the side panel.
+        summary["open_monitor_msgs"] = len(_monitor_pending())
+        summary["recent_messages"] = repo.list_messages(pool, limit=8)
         return templates.overview(summary, flash=added)
 
     @app.post("/goals")
@@ -193,7 +196,8 @@ def create_app(pool: Optional[ConnectionPool] = None,
                     draft = f"[draft unavailable: {exc}]"
                 repo.set_message_draft(pool, m["id"], draft)
                 m["draft_response"] = draft
-        return templates.orch_monitor(messages)
+        history = repo.list_messages(pool, limit=30)
+        return templates.orch_monitor(messages, history=history)
 
     @app.post("/orch/monitor/{message_id}/respond")
     def orch_respond(message_id: int, suggested: str = Form(""),

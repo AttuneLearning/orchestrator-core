@@ -42,6 +42,17 @@ _CSS = """
            padding:5px 12px; cursor:pointer; } button.alt { background:var(--warn); }
   button.ok { background:var(--ok); }
   form { display:inline; }
+  .cols { display:flex; gap:20px; align-items:flex-start; }
+  .col-main { flex:1; min-width:0; }
+  aside.side { flex:0 0 300px; background:var(--panel); border:1px solid var(--line);
+               border-radius:8px; padding:12px 14px; position:sticky; top:16px; }
+  aside.side h2 { margin-top:0; }
+  .msg { border-bottom:1px solid var(--line); padding:6px 0; font-size:12px; }
+  .msg:last-child { border-bottom:0; }
+  .badge { display:inline-block; min-width:16px; text-align:center; padding:1px 7px;
+           border-radius:10px; background:var(--line); color:var(--ink); font-weight:700; }
+  .badge.alert { background:var(--bad); color:#fff; }
+  .unread { color:var(--warn); } .read { color:var(--muted); }
 """
 
 
@@ -68,14 +79,47 @@ _MON_TA = ("width:100%;max-width:760px;padding:6px;background:var(--panel);"
            "color:var(--ink);border:1px solid var(--line);border-radius:5px")
 
 
-def orch_monitor(messages: list[dict[str, Any]]) -> str:
+def _history_panel(messages: list[dict[str, Any]], open_count: int) -> str:
+    """Side panel: open-queue alert badge + recent correspondence (all messages,
+    each linked to its issue + showing source→dest, kind, status/read, thread)."""
+    badge_cls = "badge alert" if open_count else "badge"
+    head = (f"<a href='/orch/monitor' style='text-decoration:none'>"
+            f"<span class='{badge_cls}'>{open_count}</span> open in queue</a>")
+    rows = []
+    for m in messages:
+        kind = m.get("kind", "request")
+        issue = (f" · <a href='/issues/{m['issue_id']}'>#{m['issue_id']}</a>"
+                 if m.get("issue_id") else "")
+        if kind == "response":
+            tag = ("<span class='read'>✓ read</span>" if m.get("read_at")
+                   else "<span class='unread'>● unread</span>")
+        else:
+            tag = escape(m.get("status", ""))
+        reply = f" ↳#{m['reply_to']}" if m.get("reply_to") else ""
+        rows.append(
+            "<div class='msg'>"
+            f"<span class='muted'>{escape(m['from_team'])}→{escape(m['to_team'])} · "
+            f"{escape(kind)} · {tag}{escape(reply)}{issue}</span><br>"
+            f"{escape((m.get('subject') or '')[:64])}</div>"
+        )
+    body = "".join(rows) or "<p class='muted'>No correspondence yet.</p>"
+    return (f"<aside class='side'><h2>Correspondence</h2>"
+            f"<div style='margin-bottom:10px'>{head}</div>{body}</aside>")
+
+
+def orch_monitor(messages: list[dict[str, Any]],
+                 history: Optional[list[dict[str, Any]]] = None) -> str:
     """Orchestration-monitor inbox: each queued question with an agent-drafted
-    reply (editable) plus an override box; Submit sends one of them to the asker."""
+    reply (editable) plus an override box; Submit sends one of them to the asker.
+    A side panel shows all recent correspondence (history)."""
+    side = _history_panel(history or [], open_count=len(messages))
     if not messages:
-        return page("Monitor", "<h1>Orchestration / Monitor</h1>"
-                    "<p class='muted'>No pending questions. Agents reach this queue "
-                    "by messaging the <code>orchestration</code> team (alias "
-                    "<code>arch</code>/<code>monitor</code>).</p>")
+        main = ("<h1>Orchestration / Monitor</h1>"
+                "<p class='muted'>No pending questions. Agents reach this queue by "
+                "messaging the <code>orchestration</code> team (alias "
+                "<code>orch-monitor</code>/<code>monitor</code>).</p>")
+        return page("Monitor",
+                    f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
     blocks = []
     for m in messages:
         link = (f" · issue <a href='/issues/{m['issue_id']}'>#{m['issue_id']}</a>"
@@ -96,7 +140,9 @@ def orch_monitor(messages: list[dict[str, Any]]) -> str:
             "<button class='ok' style='margin-top:8px'>Submit</button>"
             "</form></div>"
         )
-    return page("Monitor", "<h1>Orchestration / Monitor</h1>" + "".join(blocks))
+    main = "<h1>Orchestration / Monitor</h1>" + "".join(blocks)
+    return page("Monitor",
+                f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
 
 
 def _counts_cards(label: str, counts: dict[str, int]) -> str:
@@ -216,13 +262,23 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
         "</form>"
     )
 
-    return page("Fleet", (
-        f"<h1>Fleet overview · focus {pct}%</h1>{banner}{flash_html}"
+    open_msgs = summary.get("open_monitor_msgs", 0)
+    msg_banner = ""
+    if open_msgs:
+        msg_banner = (
+            f"<div class='banner'>📨 {open_msgs} open message(s) in the orchestrator "
+            "queue — <a href='/orch/monitor'>review</a>.</div>"
+        )
+    side = _history_panel(summary.get("recent_messages", []), open_count=open_msgs)
+    main = (
+        f"<h1>Fleet overview · focus {pct}%</h1>{msg_banner}{banner}{flash_html}"
         f"{add_goal_form}"
         f"<h2>Goals by state</h2>{_counts_cards('goals', summary['goals'])}"
         f"<h2>Issues by state</h2>{_counts_cards('issues', summary['issues'])}"
         f"{suggested_html}{paused_html}{flagged}{goals}"
-    ))
+    )
+    return page("Fleet",
+                f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
 
 
 def goal_detail(goal: dict[str, Any], issues: list[dict[str, Any]]) -> str:

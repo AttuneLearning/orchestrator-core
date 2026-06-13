@@ -126,6 +126,27 @@ def test_monitor_submit_uses_override(settings, pool):
     assert inbox[0]["body"] == "human answer"  # override wins, trimmed
 
 
+def test_monitor_history_panel_shows_correspondence(settings, pool):
+    # a question + its sent response should both appear in the history side panel
+    q = repo.create_message(pool, from_team="backend", to_team="orchestration",
+                            subject="history-q", body="b", issue_id=None)
+    repo.respond_to_message(pool, q["id"], "history-answer")
+    client = _client(pool, settings)
+    html = client.get("/orch/monitor").text
+    assert "Correspondence" in html              # the side panel
+    assert "history-q" in html                   # the question shows in history
+    assert "Re: history-q" in html               # and its response
+
+
+def test_fleet_index_shows_open_message_badge(settings, pool):
+    repo.create_message(pool, from_team="backend", to_team="orch-monitor",
+                        subject="needs review", body="?")
+    client = _client(pool, settings)
+    html = client.get("/").text
+    assert "open message(s) in the orchestrator queue" in html  # alert badge/banner
+    assert "Correspondence" in html                             # fleet side panel
+
+
 def test_monitor_submit_falls_back_to_suggested(settings, pool):
     q = repo.create_message(pool, from_team="backend", to_team="orchestration",
                             subject="q", body="b")
