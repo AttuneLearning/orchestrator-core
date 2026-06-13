@@ -327,30 +327,20 @@ def _cmd_status(args, settings) -> int:
 
 
 def _cmd_import_contracts(args, settings) -> int:
-    """Seed/refresh the contract store from a JSON array of endpoint records
-    (the API repo's contracts/seed/contracts.seed.json). Idempotent on method+path."""
+    """STAGE a contract seed (a JSON array of endpoint records) as proposals diffed
+    against the accepted store — add/modify/remove. Nothing becomes agreed/live until
+    a human accepts it on /contracts. Treats the file as the COMPLETE endpoint set
+    (absent accepted endpoints are staged as removals); --partial disables that."""
     pool = get_pool(settings)
     with open(args.path) as fh:
         rows = json.load(fh)
     if not isinstance(rows, list):
         print("error: expected a JSON array of contract records", file=sys.stderr)
         return 1
-    n = 0
-    for r in rows:
-        repo.upsert_contract(
-            pool,
-            method=r["method"],
-            path=r["path"],
-            request_ref=r.get("request_ref", ""),
-            response_dto=r.get("response_dto", ""),
-            auth=r.get("auth", "none"),
-            owner_team=r.get("owner_team", "backend"),
-            status=r.get("status", "proposed"),
-            version=str(r.get("version", "1.0")),
-            source_ref=r.get("source_ref"),
-        )
-        n += 1
-    print(f"imported {n} contracts from {args.path}")
+    counts = repo.stage_from_seed(pool, rows, full=not args.partial)
+    print(f"staged from {args.path}: {counts['add']} add, {counts['modify']} modify, "
+          f"{counts['remove']} remove ({counts['skip']} unchanged). "
+          "Review & accept on /contracts.")
     return 0
 
 
@@ -533,8 +523,10 @@ def build_parser() -> argparse.ArgumentParser:
     sd.set_defaults(func=_cmd_serve_dashboard)
 
     ic = sub.add_parser("import-contracts",
-                        help="seed the contract store from a JSON array (method+path keyed)")
+                        help="stage a contract seed as proposals (review/accept on /contracts)")
     ic.add_argument("path", help="path to contracts.seed.json")
+    ic.add_argument("--partial", action="store_true",
+                    help="seed is not the full set — don't infer removals")
     ic.set_defaults(func=_cmd_import_contracts)
 
     sub.add_parser("ingest-monitor-kb",

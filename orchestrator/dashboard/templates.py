@@ -67,6 +67,7 @@ def page(title: str, body: str) -> str:
         "<header><nav>"
         "<a href='/'>Fleet</a><a href='/agents'>Agents</a>"
         "<a href='/orch/monitor'>Monitor</a>"
+        "<a href='/contracts'>Contracts</a>"
         "<a href='/adrs'>ADRs</a>"
         "<a href='/api/state'>JSON</a>"
         "</nav></header><main>"
@@ -143,6 +144,80 @@ def orch_monitor(messages: list[dict[str, Any]],
     main = "<h1>Orchestration / Monitor</h1>" + "".join(blocks)
     return page("Monitor",
                 f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
+
+
+_CONTRACT_BADGE = {"up-to-date": "accepted", "awaiting acceptance": "proposed",
+                   "drifted": "drifted", "removal pending": "drifted",
+                   "missing": "proposed", "deprecated": "accepted"}
+
+
+def _contract_fields(d: Optional[dict[str, Any]], status_key: str) -> str:
+    if not d:
+        return "<p class='muted'>— (none)</p>"
+    def kv(label, val):
+        return (f"<div class='muted' style='font-size:12px'>{escape(label)}</div>"
+                f"<div>{escape(str(val if val not in (None, '') else '—'))}</div>")
+    return (kv("request_ref", d.get("request_ref")) + kv("response_dto", d.get("response_dto"))
+            + kv("auth", d.get("auth")) + kv("owner_team", d.get("owner_team"))
+            + kv("status", d.get(status_key)))
+
+
+def _contract_card(row: dict[str, Any]) -> str:
+    c, p, state = row["contract"], row["proposal"], row["state"]
+    ep = f"{escape(row['method'])} {escape(row['path'])}"
+    badge = _CONTRACT_BADGE.get(state, "proposed")
+
+    def form(action, label, cls=""):
+        return (f"<form method='post' action='/contracts/{action}' style='display:inline'>"
+                f"<input type='hidden' name='method' value='{escape(row['method'])}'>"
+                f"<input type='hidden' name='path' value='{escape(row['path'])}'>"
+                f"<button class='{cls}'>{label}</button></form> ")
+
+    if p and p["change_type"] == "remove":
+        btns = form("accept_removal", "Accept removal", "alt") + form("mark_redevelopment", "Mark for redevelopment")
+    elif p:
+        btns = (form("accept", "Accept", "ok")
+                + form("accept_with_issue", "Accept changes &amp; create issue", "ok")
+                + form("mark_redevelopment", "Mark for redevelopment"))
+    elif c and c["status"] == "proposed":
+        btns = form("accept", "Accept", "ok")
+    else:
+        btns = ""
+    right = (_contract_fields(p, "target_status")
+             + f"<div class='muted'>change: {escape(p['change_type'])}</div>") if p \
+        else "<p class='muted'>no proposed change</p>"
+    return (
+        "<div class='card' style='display:block;margin-bottom:14px;max-width:840px'>"
+        f"<div>{ep} · <span class='badge'>{escape(badge)}</span> "
+        f"<span class='muted'>{escape(state)}</span></div>"
+        "<div class='cols' style='margin-top:8px'>"
+        f"<div class='col-main'><h3>Current</h3>{_contract_fields(c, 'status')}</div>"
+        f"<div class='col-main'><h3>Proposed</h3>{right}</div></div>"
+        f"<div style='margin-top:8px'>{btns}</div></div>"
+    )
+
+
+def contracts(overview: list[dict[str, Any]]) -> str:
+    """Contract master-data page: per-endpoint current|proposed diff + accept
+    actions, with a batch 'create work' side panel and a state summary."""
+    from collections import Counter
+    counts = Counter(r["state"] for r in overview)
+    active = [r for r in overview if r["state"] != "up-to-date"]
+    uptodate = [r for r in overview if r["state"] == "up-to-date"]
+    cards = "".join(_contract_card(r) for r in active) \
+        or "<p class='muted'>No pending contract changes — all accepted contracts are up to date.</p>"
+    ut = ""
+    if uptodate:
+        ut = ("<h2>Up to date</h2><ul>" + "".join(
+            f"<li>{escape(r['method'])} {escape(r['path'])}</li>" for r in uptodate) + "</ul>")
+    main = f"<h1>Contracts</h1>{cards}{ut}"
+    summary = "".join(f"<div class='msg'>{escape(s)}: <b>{n}</b></div>"
+                      for s, n in sorted(counts.items())) or "<p class='muted'>No contracts.</p>"
+    side = ("<aside class='side'><h2>Changes</h2>"
+            "<form method='post' action='/contracts/create_work'>"
+            "<button class='ok'>Create goals &amp; issues from changes</button></form>"
+            f"<div style='margin-top:10px'>{summary}</div></aside>")
+    return page("Contracts", f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
 
 
 def _counts_cards(label: str, counts: dict[str, int]) -> str:

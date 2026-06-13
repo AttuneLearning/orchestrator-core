@@ -1214,6 +1214,162 @@ def contract_satisfied(pool: ConnectionPool, method: str, path: str) -> bool:
     return row is not None
 
 
+# --- contract proposals (staging layer, migration 0015) -------------------- #
+
+_PROPOSAL_COLS = ["id", "method", "path", "change_type", "request_ref",
+                  "response_dto", "auth", "owner_team", "version", "target_status",
+                  "content_hash", "source_ref", "status", "created_at", "resolved_at"]
+_PROPOSAL_SELECT = "SELECT " + ", ".join(_PROPOSAL_COLS) + " FROM contract_proposals"
+
+
+def stage_proposal(pool: ConnectionPool, method: str, path: str, change_type: str,
+                   request_ref: str = "", response_dto: str = "", auth: str = "none",
+                   owner_team: str = "backend", version: str = "1.0",
+                   target_status: str = "live",
+                   source_ref: Optional[str] = None) -> dict[str, Any]:
+    """Stage the single pending proposal for an endpoint (replaces any prior
+    pending one). The accepted `contracts` row is untouched until accept_proposal."""
+    method = method.upper()
+    content_hash = _contract_hash(method, path, request_ref, response_dto)
+    with pool.connection() as conn, conn.transaction():
+        conn.execute("DELETE FROM contract_proposals WHERE method=%s AND path=%s "
+                     "AND status='pending'", (method, path))
+        row = conn.execute(
+            "INSERT INTO contract_proposals (method, path, change_type, request_ref, "
+            "response_dto, auth, owner_team, version, target_status, content_hash, "
+            "source_ref) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            f"RETURNING {', '.join(_PROPOSAL_COLS)}",
+            (method, path, change_type, request_ref, response_dto, auth, owner_team,
+             version, target_status, content_hash, source_ref),
+        ).fetchone()
+    return dict(zip(_PROPOSAL_COLS, row))
+
+
+def list_proposals(pool: ConnectionPool, status: str = "pending") -> list[dict[str, Any]]:
+    with pool.connection() as conn:
+        rows = conn.execute(_PROPOSAL_SELECT + " WHERE status = %s ORDER BY path, method",
+                            (status,)).fetchall()
+    return [dict(zip(_PROPOSAL_COLS, r)) for r in rows]
+
+
+def get_proposal(pool: ConnectionPool, method: str, path: str,
+                 status: str = "pending") -> Optional[dict[str, Any]]:
+    with pool.connection() as conn:
+        row = conn.execute(
+            _PROPOSAL_SELECT + " WHERE method=%s AND path=%s AND status=%s "
+            "ORDER BY id DESC LIMIT 1", (method.upper(), path, status)).fetchone()
+    return dict(zip(_PROPOSAL_COLS, row)) if row else None
+
+
+def stage_from_seed(pool: ConnectionPool, rows: list[dict[str, Any]],
+                    full: bool = True) -> dict[str, int]:
+    """Diff a seed against the accepted store and stage proposals. add = no
+    contract; modify = accepted contract whose hash differs (drift); skip = same;
+    remove (full only) = accepted contract absent from the seed. Idempotent."""
+    counts = {"add": 0, "modify": 0, "remove": 0, "skip": 0}
+    if full:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM contract_proposals WHERE status='pending'")
+    seen: set[tuple[str, str]] = set()
+    for r in rows:
+        method, path = r["method"].upper(), r["path"]
+        seen.add((method, path))
+        existing = get_contract(pool, method, path)
+        h = _contract_hash(method, path, r.get("request_ref", ""), r.get("response_dto", ""))
+        if existing and existing["status"] in _SATISFIED:
+            if existing["content_hash"] == h:
+                counts["skip"] += 1
+                continue
+            ctype = "modify"
+        else:
+            ctype = "add"
+        stage_proposal(pool, method, path, ctype,
+                       request_ref=r.get("request_ref", ""),
+                       response_dto=r.get("response_dto", ""),
+                       auth=r.get("auth", "none"),
+                       owner_team=r.get("owner_team", "backend"),
+                       version=str(r.get("version", "1.0")),
+                       target_status=r.get("status", "live"),
+                       source_ref=r.get("source_ref"))
+        counts[ctype] += 1
+    if full:
+        for c in list_contracts(pool):
+            if c["status"] in _SATISFIED and (c["method"], c["path"]) not in seen:
+                stage_proposal(pool, c["method"], c["path"], "remove",
+                               request_ref=c["request_ref"], response_dto=c["response_dto"],
+                               auth=c["auth"], owner_team=c["owner_team"],
+                               version=c["version"], source_ref=c["source_ref"])
+                counts["remove"] += 1
+    return counts
+
+
+def accept_proposal(pool: ConnectionPool, method: str, path: str,
+                    status: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Apply the pending proposal to the accepted store: add/modify upserts the
+    contract (status = `status` override, else the proposal's target_status, e.g.
+    agreed/live) so the gate is satisfied; remove deprecates it. Marks the proposal
+    accepted. Returns the contract."""
+    p = get_proposal(pool, method, path)
+    if p is None:
+        raise ValueError(f"no pending proposal for {method.upper()} {path}")
+    if p["change_type"] == "remove":
+        contract = set_contract_status(pool, method, path, "deprecated")
+    else:
+        contract = upsert_contract(
+            pool, method, path, request_ref=p["request_ref"],
+            response_dto=p["response_dto"], auth=p["auth"], owner_team=p["owner_team"],
+            status=status or p["target_status"], version=p["version"],
+            source_ref=p["source_ref"])
+    with pool.connection() as conn:
+        conn.execute("UPDATE contract_proposals SET status='accepted', resolved_at=now() "
+                     "WHERE id=%s", (p["id"],))
+    return contract
+
+
+def reject_proposal(pool: ConnectionPool, method: str, path: str) -> None:
+    with pool.connection() as conn:
+        conn.execute("UPDATE contract_proposals SET status='rejected', resolved_at=now() "
+                     "WHERE method=%s AND path=%s AND status='pending'",
+                     (method.upper(), path))
+
+
+def consumers_of(pool: ConnectionPool, method: str, path: str) -> list[str]:
+    """Teams whose issues consume this endpoint (from issue_contract_deps) — the
+    affected consumers for change/removal work."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT i.team FROM issue_contract_deps d JOIN issues i "
+            "ON i.id = d.issue_id WHERE d.method=%s AND d.path=%s",
+            (method.upper(), path)).fetchall()
+    return [r[0] for r in rows]
+
+
+def _contract_state(contract: Optional[dict], proposal: Optional[dict]) -> str:
+    if proposal is not None:
+        return {"add": "awaiting acceptance", "modify": "drifted",
+                "remove": "removal pending"}.get(proposal["change_type"], "pending")
+    if contract is None:
+        return "missing"
+    if contract["status"] in _SATISFIED:
+        return "up-to-date"
+    if contract["status"] == "deprecated":
+        return "deprecated"
+    return "awaiting acceptance"
+
+
+def contracts_overview(pool: ConnectionPool) -> list[dict[str, Any]]:
+    """Per-endpoint {contract, proposal, state} for the /contracts page — the union
+    of accepted contracts and pending proposals."""
+    contracts = {(c["method"], c["path"]): c for c in list_contracts(pool)}
+    proposals = {(p["method"], p["path"]): p for p in list_proposals(pool)}
+    out = []
+    for key in sorted(set(contracts) | set(proposals), key=lambda k: (k[1], k[0])):
+        c, p = contracts.get(key), proposals.get(key)
+        out.append({"method": key[0], "path": key[1], "contract": c, "proposal": p,
+                    "state": _contract_state(c, p)})
+    return out
+
+
 def add_issue_contract_deps(pool: ConnectionPool, issue_id: int,
                             deps: list[dict[str, str]]) -> None:
     """Record the endpoints a blocked issue is waiting on (contract_check)."""

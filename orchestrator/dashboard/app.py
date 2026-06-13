@@ -208,6 +208,71 @@ def create_app(pool: Optional[ConnectionPool] = None,
             repo.respond_to_message(pool, message_id, body)
         return RedirectResponse("/orch/monitor", status_code=303)
 
+    @app.get("/contracts", response_class=HTMLResponse)
+    def contracts_page() -> str:
+        return templates.contracts(repo.contracts_overview(pool))
+
+    def _team_pipeline(team: str) -> str:
+        return "pull-fe" if team == "frontend" else "pull-1"
+
+    def _changes_to_work(proposals: list) -> None:
+        # Group affected endpoints by team that must act (owner + consumers),
+        # one goal per team with a sub-issue per endpoint, on the team's pipeline.
+        by_team: dict[str, list] = {}
+        for p in proposals:
+            ep = f"{p['method']} {p['path']}"
+            teams = {p["owner_team"]} | set(repo.consumers_of(pool, p["method"], p["path"]))
+            for t in teams:
+                by_team.setdefault(t, []).append((ep, p["change_type"]))
+        for team, eps in by_team.items():
+            pl = _team_pipeline(team)
+            goal = repo.create_goal(
+                pool, f"[contract] {team}: {len(eps)} contract change(s)",
+                description="; ".join(f"{e} ({ct})" for e, ct in eps), pipeline=pl)
+            for ep, ct in eps:
+                repo.create_issue(pool, goal.id, f"{ct}: {ep}", team=team, pipeline=pl,
+                                  description=f"Contract {ct} for {ep}; update {team}.")
+
+    @app.post("/contracts/accept")
+    def contract_accept(method: str = Form(...), path: str = Form(...)):
+        repo.accept_proposal(pool, method, path)
+        return RedirectResponse("/contracts", status_code=303)
+
+    @app.post("/contracts/accept_with_issue")
+    def contract_accept_with_issue(method: str = Form(...), path: str = Form(...)):
+        p = repo.get_proposal(pool, method, path)
+        repo.accept_proposal(pool, method, path, status="agreed")
+        if p:
+            _changes_to_work([p])
+        return RedirectResponse("/contracts", status_code=303)
+
+    @app.post("/contracts/accept_removal")
+    def contract_accept_removal(method: str = Form(...), path: str = Form(...)):
+        p = repo.get_proposal(pool, method, path)
+        repo.accept_proposal(pool, method, path)  # remove -> deprecate
+        if p:
+            _changes_to_work([p])  # consumer cleanup
+        return RedirectResponse("/contracts", status_code=303)
+
+    @app.post("/contracts/mark_redevelopment")
+    def contract_mark_redev(method: str = Form(...), path: str = Form(...)):
+        p = repo.get_proposal(pool, method, path)
+        repo.reject_proposal(pool, method, path)
+        if p:
+            _changes_to_work([p])
+        return RedirectResponse("/contracts", status_code=303)
+
+    @app.post("/contracts/create_work")
+    def contracts_create_work():
+        pending = repo.list_proposals(pool, "pending")
+        _changes_to_work(pending)
+        # accept add/modify shapes so consumers unblock while work proceeds;
+        # leave removals for explicit Accept removal.
+        for p in pending:
+            if p["change_type"] in ("add", "modify"):
+                repo.accept_proposal(pool, p["method"], p["path"], status="agreed")
+        return RedirectResponse("/contracts", status_code=303)
+
     @app.get("/api/state")
     def api_state() -> JSONResponse:
         summary = fleet_summary(pool, settings)
