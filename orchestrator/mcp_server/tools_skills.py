@@ -101,7 +101,10 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
 
         Mirror of /context — keeps the response compact (token budget)."""
         recent = [n.body for n in repo.memory_recall(pool, scope=scope, limit=limit)]
-        matches = [n.body for n in repo.memory_search(pool, topic, limit=limit)] if topic else []
+        # Keep topic matches within the same scope so context_load stays consistent
+        # (and never leaks the reserved monitor:* namespace into another scope's load).
+        matches = ([n.body for n in repo.memory_search(pool, topic, limit=limit, scope=scope)]
+                   if topic else [])
         return {"scope": scope, "recent": recent, "topic_matches": matches}
 
     @mcp.tool()

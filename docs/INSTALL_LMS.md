@@ -46,8 +46,29 @@ Sanity-check the install:
 
 ```bash
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m orchestrator.cli migrate          # applies 0001–0006
+.venv/bin/python -m orchestrator.cli migrate          # applies all migrations;
+                                                       # also bootstraps the orch-monitor KB
 .venv/bin/python -m pytest -q                          # expect 92 passed, 1 skipped
+```
+
+`migrate` auto-builds the **orchestration-monitor knowledge base** (isolated `monitor:kb`
+memory scope) on a fresh install, so the `/orch/monitor` draft agent is grounded in the
+tool's own schema/docs. To rebuild it manually (e.g. after editing sources):
+
+```bash
+.venv/bin/python -m orchestrator.cli ingest-monitor-kb
+```
+
+**Stay current (optional cron).** A read-only `git-review` checks GitHub for updates and, if
+the repo is ahead, posts an alert into the `/orch/monitor` queue (it never pulls). Wire it to
+cron, then apply updates yourself when you see the alert:
+
+```bash
+# crontab: hourly check
+0 * * * * cd /path/to/python-orchestrator-v1 && .venv/bin/python -m orchestrator.cli git-review
+
+# when alerted, run the human-gated update, then restart the daemon + dashboard:
+.venv/bin/python -m orchestrator.cli self-update    # git pull → migrate → rebuild monitor KB
 ```
 
 ---

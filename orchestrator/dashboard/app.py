@@ -44,6 +44,10 @@ def create_app(pool: Optional[ConnectionPool] = None,
         from ..agents.reasoning import make_reasoner
         reasoner = make_reasoner(settings)
     _reasoner = reasoner
+    # Embedder for retrieving grounding context from the monitor KB.
+    from ..embeddings import make_embedder
+    from ..monitor_kb import MONITOR_KB_SCOPE
+    _embedder = make_embedder(settings)
 
     def _monitor_pending() -> list:
         # Pending questions for any monitor team, resolving aliases (e.g. 'arch')
@@ -178,8 +182,14 @@ def create_app(pool: Optional[ConnectionPool] = None,
         messages = _monitor_pending()
         for m in messages:
             if not m.get("draft_response"):
+                # Ground the draft in the isolated monitor KB (semantic retrieval).
+                q = f"{m['subject']}\n{m.get('body', '')}"
+                qe = _embedder.embed(q) if _embedder is not None else None
+                snippets = repo.memory_search(pool, q, limit=6, query_embedding=qe,
+                                              scope=MONITOR_KB_SCOPE)
+                context = "\n\n".join(n.body for n in snippets)
                 try:
-                    draft = _reasoner.draft_reply(m)
+                    draft = _reasoner.draft_reply(m, context=context)
                 except Exception as exc:  # noqa: BLE001 - draft is best-effort
                     draft = f"[draft unavailable: {exc}]"
                 repo.set_message_draft(pool, m["id"], draft)

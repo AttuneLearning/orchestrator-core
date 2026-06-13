@@ -702,11 +702,24 @@ def memory_recall(pool: ConnectionPool, scope: str = "global", limit: int = 20) 
         ).fetchall()
 
 
+def _scope_filter(scope: Optional[str]) -> tuple[str, str]:
+    """SQL condition + bind param for scoping a memory search.
+
+    scope given  -> restrict to exactly that scope (e.g. an isolated KB).
+    scope None   -> exclude the reserved private 'monitor:%' namespace, so a
+                    general/agent search never surfaces the orch-monitor KB.
+    """
+    if scope is not None:
+        return "scope = %s", scope
+    return "scope NOT LIKE %s", "monitor:%"
+
+
 def memory_search(
     pool: ConnectionPool,
     query: str,
     limit: int = 20,
     query_embedding: Optional[list[float]] = None,
+    scope: Optional[str] = None,
 ) -> list[MemoryNote]:
     """Search memory notes.
 
@@ -717,7 +730,11 @@ def memory_search(
 
     When pgvector is unavailable or query_embedding is None, uses ILIKE only
     (original behaviour — all existing call sites continue to work).
+
+    scope: restrict to one scope (isolated retrieval, e.g. 'monitor:kb'); when
+    omitted, the reserved 'monitor:%' namespace is excluded so it stays private.
     """
+    scope_sql, scope_param = _scope_filter(scope)
     if query_embedding is not None and _pgvector_available(pool):
         vec_literal = "[" + ",".join(str(v) for v in query_embedding) + "]"
         with pool.connection() as conn:
@@ -725,10 +742,10 @@ def memory_search(
             # Primary: vector-similarity results (rows that have an embedding).
             vec_rows = cur.execute(
                 "SELECT id, scope, body, created_at FROM memory_notes "
-                "WHERE embedding_v IS NOT NULL "
+                f"WHERE embedding_v IS NOT NULL AND {scope_sql} "
                 "ORDER BY embedding_v <=> %s::vector "
                 "LIMIT %s",
-                (vec_literal, limit),
+                (scope_param, vec_literal, limit),
             ).fetchall()
             seen_ids = {n.id for n in vec_rows}
             results = list(vec_rows)
@@ -738,21 +755,44 @@ def memory_search(
                 remaining = limit - len(results)
                 ilike_rows = cur.execute(
                     "SELECT id, scope, body, created_at FROM memory_notes "
-                    "WHERE body ILIKE %s ORDER BY id DESC LIMIT %s",
-                    (f"%{query}%", remaining + len(seen_ids)),
+                    f"WHERE body ILIKE %s AND {scope_sql} ORDER BY id DESC LIMIT %s",
+                    (f"%{query}%", scope_param, remaining + len(seen_ids)),
                 ).fetchall()
                 for n in ilike_rows:
                     if n.id not in seen_ids and len(results) < limit:
                         results.append(n)
         return results
-    # Fallback: original ILIKE behaviour (unchanged).
+    # Fallback: ILIKE behaviour (scope-aware).
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(MemoryNote))
         return cur.execute(
             "SELECT id, scope, body, created_at FROM memory_notes "
-            "WHERE body ILIKE %s ORDER BY id DESC LIMIT %s",
-            (f"%{query}%", limit),
+            f"WHERE body ILIKE %s AND {scope_sql} ORDER BY id DESC LIMIT %s",
+            (f"%{query}%", scope_param, limit),
         ).fetchall()
+
+
+def memory_clear_scope(pool: ConnectionPool, scope: str) -> int:
+    """Delete all notes in a scope (for idempotent KB rebuilds). Returns count."""
+    with pool.connection() as conn:
+        cur = conn.execute("DELETE FROM memory_notes WHERE scope = %s", (scope,))
+        return cur.rowcount
+
+
+def get_system_state(pool: ConnectionPool, key: str) -> Optional[str]:
+    with pool.connection() as conn:
+        row = conn.execute("SELECT value FROM system_state WHERE key = %s",
+                           (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_system_state(pool: ConnectionPool, key: str, value: str) -> None:
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO system_state (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+            (key, value),
+        )
 
 
 # --------------------------------------------------------------------------- #

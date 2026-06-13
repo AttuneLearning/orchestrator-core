@@ -37,5 +37,6 @@ def _clean_db(request):
     with p.connection() as conn:
         conn.execute(
             "TRUNCATE goals, issues, issue_events, agents, memory_notes, "
-            "messages, adrs, contracts, issue_contract_deps RESTART IDENTITY CASCADE"
+            "messages, adrs, contracts, issue_contract_deps, system_state "
+            "RESTART IDENTITY CASCADE"
         )

@@ -34,9 +34,11 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings: Optional[Settings] = 
         return [asdict(n) for n in repo.memory_recall(pool, scope=scope, limit=limit)]
 
     @mcp.tool()
-    def memory_search(query: str, limit: int = 20) -> list[dict[str, Any]]:
-        """Semantic + substring search across all memory notes."""
+    def memory_search(query: str, limit: int = 20,
+                      scope: Optional[str] = None) -> list[dict[str, Any]]:
+        """Semantic + substring search. With `scope`, restrict to that scope;
+        without it, the reserved private 'monitor:*' namespace is excluded."""
         query_embedding = embedder.embed(query) if embedder is not None else None
         return [asdict(n) for n in repo.memory_search(
-            pool, query, limit=limit, query_embedding=query_embedding
+            pool, query, limit=limit, query_embedding=query_embedding, scope=scope
         )]

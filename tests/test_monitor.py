@@ -13,7 +13,7 @@ from orchestrator.mcp_server import tools_skills
 
 class _DraftReasoner(StubReasoner):
     """Deterministic suggested reply for dashboard tests."""
-    def draft_reply(self, message):
+    def draft_reply(self, message, context=""):
         return f"DRAFT-ANSWER for {message['subject']}"
 
 

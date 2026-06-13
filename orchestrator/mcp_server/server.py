@@ -28,6 +28,12 @@ def build_server() -> FastMCP:
     tools_skills.register(mcp, pool)
     tools_status.register(mcp, pool, settings)
     tools_contracts.register(mcp, pool)
+    # Zero-touch grounding: build the orch-monitor KB on first connect if empty.
+    try:
+        from ..monitor_kb import bootstrap_monitor_kb
+        bootstrap_monitor_kb(pool, settings)
+    except Exception:  # noqa: BLE001 - KB bootstrap must never block the server
+        pass
     return mcp
 
 

@@ -24,7 +24,7 @@ import json
 import sys
 
 from . import repository as repo
-from .config import load_settings
+from .config import REPO_ROOT, load_settings
 from .db import close_pool, get_pool, migrate
 
 # Issues already terminal (won't be re-cancelled when bulk-cancelling a goal).
@@ -34,6 +34,11 @@ _CANCEL_TERMINAL = {"done", "cancelled"}
 def _cmd_migrate(args, settings) -> int:
     applied = migrate(settings)
     print("applied:", applied or "(up to date)")
+    # Auto-bootstrap the orch-monitor KB on a fresh install (if empty).
+    from .monitor_kb import bootstrap_monitor_kb
+    n = bootstrap_monitor_kb(get_pool(settings), settings)
+    if n:
+        print(f"orch-monitor KB bootstrapped: {n} notes")
     return 0
 
 
@@ -349,6 +354,71 @@ def _cmd_import_contracts(args, settings) -> int:
     return 0
 
 
+def _cmd_ingest_monitor_kb(args, settings) -> int:
+    """Rebuild the orch-monitor knowledge base (scope monitor:kb) from current
+    source — migrations, IMPLEMENTATION_SUMMARY, MCP docstrings, repo API, config,
+    contract spec. Idempotent (wipe + rebuild); run after a code update."""
+    from .monitor_kb import build_monitor_kb
+    n = build_monitor_kb(get_pool(settings), settings)
+    print(f"orch-monitor KB rebuilt: {n} notes (scope monitor:kb)")
+    return 0
+
+
+def _git(*a):
+    import subprocess
+    return subprocess.run(["git", *a], cwd=REPO_ROOT, capture_output=True, text=True)
+
+
+def _cmd_git_review(args, settings) -> int:
+    """Read-only: check if origin is ahead; if so, alert the orch-monitor queue.
+    Records last_reviewed_sha so the same commit isn't re-alerted. The actual
+    update is human-gated (`self-update`)."""
+    pool = get_pool(settings)
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+    _git("fetch", "origin", branch)
+    local = _git("rev-parse", "HEAD").stdout.strip()
+    remote = _git("rev-parse", f"origin/{branch}").stdout.strip()
+    if not remote or local == remote:
+        print(f"up to date ({branch} @ {local[:10] or '?'})")
+        return 0
+    if repo.get_system_state(pool, "last_reviewed_sha") == remote:
+        print(f"update already alerted (origin/{branch} @ {remote[:10]})")
+        return 0
+    log = _git("log", "--oneline", f"{local}..{remote}").stdout.strip()
+    files = _git("diff", "--name-only", local, remote).stdout.strip()
+    count = len(log.splitlines())
+    body = (f"origin/{branch} is {count} commit(s) ahead "
+            f"({local[:10]} -> {remote[:10]}).\n\nCommits:\n{log}\n\n"
+            f"Changed files:\n{files}\n\nHuman-gated update: run "
+            "`python -m orchestrator.cli self-update`, then restart the daemon + "
+            "dashboard to load the new code.")
+    repo.create_message(pool, from_team="system", to_team="arch",
+                        subject=f"Update available: {count} new commit(s) on {branch}",
+                        body=body, priority="high", kind="request")
+    repo.set_system_state(pool, "last_reviewed_sha", remote)
+    print(f"alert posted to /orch/monitor (origin/{branch} @ {remote[:10]})")
+    return 0
+
+
+def _cmd_self_update(args, settings) -> int:
+    """Human-gated full update: git pull -> migrate -> rebuild monitor KB. Prints
+    a reminder to restart the daemon + dashboard (code reload is a manual step)."""
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+    print(f"pulling origin/{branch} ...")
+    r = _git("pull", "origin", branch)
+    print((r.stdout + r.stderr).strip())
+    if r.returncode != 0:
+        print("git pull failed; aborting before migrate.", file=sys.stderr)
+        return 1
+    print("applying migrations ...")
+    print("applied:", migrate(settings) or "(up to date)")
+    from .monitor_kb import build_monitor_kb
+    n = build_monitor_kb(get_pool(settings), settings)
+    print(f"orch-monitor KB rebuilt: {n} notes")
+    print("DONE — restart the engine daemon + dashboard to load the new code.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestrator")
     sub = p.add_subparsers(dest="command", required=True)
@@ -466,6 +536,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="seed the contract store from a JSON array (method+path keyed)")
     ic.add_argument("path", help="path to contracts.seed.json")
     ic.set_defaults(func=_cmd_import_contracts)
+
+    sub.add_parser("ingest-monitor-kb",
+                   help="rebuild the orch-monitor knowledge base from current source"
+                   ).set_defaults(func=_cmd_ingest_monitor_kb)
+
+    sub.add_parser("git-review",
+                   help="check origin for updates; alert the orch-monitor queue if ahead"
+                   ).set_defaults(func=_cmd_git_review)
+
+    sub.add_parser("self-update",
+                   help="human-gated: git pull + migrate + rebuild monitor KB"
+                   ).set_defaults(func=_cmd_self_update)
 
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)
     return p

@@ -103,9 +103,11 @@ class StubReasoner:
         # Deterministic: pull "METHOD /path" tokens out of the issue text.
         return _parse_endpoints(f"{issue.title}\n{issue.description}")
 
-    def draft_reply(self, message: dict[str, Any]) -> str:
+    def draft_reply(self, message: dict[str, Any], context: str = "") -> str:
         # Deterministic placeholder; the dashboard human reviews/overrides it.
-        return (f"[draft] Re: {message.get('subject', '')} — "
+        # Echoes whether grounding context was supplied (used by tests).
+        tag = "[draft+ctx]" if context else "[draft]"
+        return (f"{tag} Re: {message.get('subject', '')} — "
                 f"acknowledged from {message.get('from_team', '?')}.")
 
 
@@ -253,14 +255,18 @@ class _LLMReasoner:
                     out.append(dep)
         return out
 
-    def draft_reply(self, message: dict[str, Any]) -> str:
+    def draft_reply(self, message: dict[str, Any], context: str = "") -> str:
         system = (
             "You are the orchestration monitor drafting a reply to an inbound "
             "cross-team question about how the orchestration process / system works. "
-            "A human will review and may override your draft before it is sent. "
-            "Answer concisely and concretely, with clear next steps. Plain text."
+            "Ground your answer ONLY in the supplied orchestration reference; if the "
+            "reference does not cover it, say so rather than guessing. A human will "
+            "review and may override your draft. Be concise and concrete. Plain text."
         )
+        ref = (f"Orchestration reference (authoritative):\n{context}\n\n"
+               if context else "")
         user = (
+            f"{ref}"
             f"From: {message.get('from_team')}\nTo: {message.get('to_team')}\n"
             f"Priority: {message.get('priority', 'medium')}\n"
             f"Subject: {message.get('subject', '')}\n\n{message.get('body', '')}"
