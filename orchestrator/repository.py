@@ -952,9 +952,11 @@ def update_adr(pool: ConnectionPool, adr_key: str, *, title: Optional[str] = Non
 
 
 _MESSAGE_COLS = ["id", "from_team", "to_team", "subject", "body", "priority",
-                 "issue_id", "kind", "status", "draft_response", "created_at"]
+                 "issue_id", "kind", "status", "draft_response", "reply_to",
+                 "read_at", "created_at"]
 _MESSAGE_SELECT = ("SELECT id, from_team, to_team, subject, body, priority, "
-                   "issue_id, kind, status, draft_response, created_at FROM messages")
+                   "issue_id, kind, status, draft_response, reply_to, read_at, "
+                   "created_at FROM messages")
 
 
 def create_message(
@@ -967,13 +969,16 @@ def create_message(
     issue_id: Optional[int] = None,
     kind: str = "request",
     status: str = "pending",
+    reply_to: Optional[int] = None,
 ) -> dict[str, Any]:
     with pool.connection() as conn:
         row = conn.execute(
             "INSERT INTO messages (from_team, to_team, subject, body, priority, "
-            "issue_id, kind, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "issue_id, kind, status, reply_to) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
             f"RETURNING {', '.join(_MESSAGE_COLS)}",
-            (from_team, to_team, subject, body, priority, issue_id, kind, status),
+            (from_team, to_team, subject, body, priority, issue_id, kind, status,
+             reply_to),
         ).fetchone()
     return dict(zip(_MESSAGE_COLS, row))
 
@@ -1017,18 +1022,28 @@ def archive_message(pool: ConnectionPool, message_id: int) -> None:
                      (message_id,))
 
 
-def list_responses(pool: ConnectionPool, to_team: Optional[str] = None) -> list[dict[str, Any]]:
+def list_responses(pool: ConnectionPool, to_team: Optional[str] = None,
+                   unread_only: bool = False) -> list[dict[str, Any]]:
     """Inbound responses (kind='response') addressed to a team — the read side a
-    worker needs to consume an answer (comms_read). Newest first."""
+    worker needs to consume an answer (comms_read). Newest first. unread_only
+    restricts to messages not yet marked read (read_at IS NULL)."""
     where = " WHERE kind = 'response' AND status = 'sent'"
     params: list[Any] = []
     if to_team is not None:
         where += " AND to_team = %s"
         params.append(to_team)
+    if unread_only:
+        where += " AND read_at IS NULL"
     with pool.connection() as conn:
         rows = conn.execute(
             _MESSAGE_SELECT + where + " ORDER BY id DESC", params).fetchall()
     return [dict(zip(_MESSAGE_COLS, r)) for r in rows]
+
+
+def mark_message_read(pool: ConnectionPool, message_id: int) -> None:
+    """Mark a message consumed so it drops out of my_queue (read_at = now())."""
+    with pool.connection() as conn:
+        conn.execute("UPDATE messages SET read_at = now() WHERE id = %s", (message_id,))
 
 
 def set_message_draft(pool: ConnectionPool, message_id: int, draft: str) -> None:
@@ -1052,6 +1067,7 @@ def respond_to_message(pool: ConnectionPool, message_id: int, body: str,
         subject=f"Re: {origin['subject']}", body=body,
         priority=origin.get("priority", "medium"),
         issue_id=origin.get("issue_id"), kind="response", status="sent",
+        reply_to=message_id,  # thread link: response -> the request it answers
     )
     archive_message(pool, message_id)
     if origin.get("issue_id") is not None:

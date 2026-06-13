@@ -30,9 +30,17 @@ heartbeat(agent_id) -> { status, loop_enabled, next_poll_seconds }
 LOOP:
   hb = heartbeat(agent_id)                      # liveness + cadence in one call
   adrs = adr_list(status="accepted")            # honor live protocol every cycle
-  work = list_my_work(agent_id)
-  impl = [i for i in work if i.gate_type == "implementation"]
+  q = my_queue(agent_id)                        # MASTER queue: work + inbound messages
 
+  for msg in q.messages:                        # read answers/requests FIRST — they unblock work
+    # msg.type is "answer" (a reply to a question this team asked) or "request".
+    # msg.issue_id links it to the issue it concerns; msg.reply_to is the original
+    # request (full thread); msg.source is who sent it.
+    read msg.body (esp. answers whose issue_id matches your assigned/blocked work)
+    mark_read(msg.id)                           # consume it so it drops off next poll
+    # if it's a request you must action, handle it (e.g. comms_send a response)
+
+  impl = [i for i in q.work if i.gate_type == "implementation"]
   if impl is non-empty:
     for issue in impl:
       context_load(topic=issue.title)           # pre-implementation context
@@ -44,10 +52,14 @@ LOOP:
     continue LOOP immediately                    # keep clearing until queue empty
 
   else:                                          # queue empty
-    # QA/verification rejections return as gate_type=implementation in list_my_work and are
+    # QA/verification rejections return as gate_type=implementation in q.work and are
     # picked up by the impl branch above on a later cycle — fixing them IS the loop's job.
     sleep(hb.next_poll_seconds)                  # see "Self-pacing" below
     continue LOOP
+
+# my_queue replaces polling list_my_work alone — it surfaces work AND the answers
+# to questions you raised (which list_my_work/comms_check never showed). list_my_work
+# remains available as the work-only view.
 ```
 
 ### Halt-vs-continue (per ADR-ORCH-002)

@@ -110,11 +110,49 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
     @mcp.tool()
     def list_my_work(agent_id: int) -> list[dict[str, Any]]:
         """Issues currently assigned to this pull worker and awaiting its action
-        (in_progress). One call for a poll loop to find what to do next."""
+        (in_progress). One call for a poll loop to find what to do next. For the
+        full picture (work + inbound messages) use my_queue."""
         return [
             asdict(i) for i in repo.list_issues(
                 pool, states=["in_progress"], assigned_agent=agent_id)
         ]
+
+    def _msg_item(m: dict[str, Any], kind_label: str) -> dict[str, Any]:
+        # Every message carries its originating issue + source + thread link so
+        # history is always discoverable from the queue.
+        return {
+            "id": m["id"], "type": kind_label,
+            "subject": m["subject"], "body": m["body"],
+            "source": m["from_team"], "issue_id": m.get("issue_id"),
+            "reply_to": m.get("reply_to"), "priority": m.get("priority"),
+            "read_at": m.get("read_at"), "created_at": m.get("created_at"),
+        }
+
+    @mcp.tool()
+    def my_queue(agent_id: int) -> dict[str, Any]:
+        """The master queue: everything on this agent's plate in one call.
+        `work` = its assigned in-progress issues (same as list_my_work). `messages`
+        = UNREAD inbound for its team — answers to questions it asked (type
+        'answer') and any pending requests (type 'request'), each linked to its
+        originating issue (issue_id), source (from_team) and thread (reply_to).
+        Call mark_read(message_id) after consuming a message so it drops off."""
+        agent = repo.get_agent(pool, agent_id)
+        work = [asdict(i) for i in repo.list_issues(
+            pool, states=["in_progress"], assigned_agent=agent_id)]
+        messages: list[dict[str, Any]] = []
+        if agent is not None:
+            messages += [_msg_item(m, "answer")
+                         for m in repo.list_responses(pool, to_team=agent.team,
+                                                      unread_only=True)]
+            messages += [_msg_item(m, "request")
+                         for m in repo.pending_messages(pool, to_team=agent.team)]
+        return {"work": work, "messages": messages}
+
+    @mcp.tool()
+    def mark_read(message_id: int) -> dict[str, str]:
+        """Mark an inbox message consumed so it drops out of the next my_queue."""
+        repo.mark_message_read(pool, message_id)
+        return {"status": "ok"}
 
     @mcp.tool()
     def report_work(issue_id: int, sha: str = "", branch: str = "",
