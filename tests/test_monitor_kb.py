@@ -57,7 +57,7 @@ def test_bootstrap_only_when_empty(settings, pool):
 
 def test_dashboard_draft_is_grounded_in_kb(settings, pool):
     monitor_kb.build_monitor_kb(pool, settings)
-    repo.create_message(pool, from_team="backend", to_team="arch",
+    repo.create_message(pool, from_team="backend", to_team="orch-monitor",
                         subject="contract store ingestion schema?",
                         body="what shape does import-contracts expect")
     # StubReasoner.draft_reply tags the output [draft+ctx] when context is supplied,
@@ -93,10 +93,10 @@ def test_git_review_alerts_then_dedupes(settings, pool, monkeypatch):
     s = copy.deepcopy(settings)
 
     assert cli._cmd_git_review(None, s) == 0
-    pend = repo.pending_messages(pool, to_team="arch")
+    pend = repo.pending_messages(pool, to_team="orch-monitor")
     assert len(pend) == 1 and "Update available" in pend[0]["subject"]
     assert repo.get_system_state(pool, "last_reviewed_sha") == "bbbb"
 
     # second run, same remote SHA -> no duplicate alert
     assert cli._cmd_git_review(None, s) == 0
-    assert len(repo.pending_messages(pool, to_team="arch")) == 1
+    assert len(repo.pending_messages(pool, to_team="orch-monitor")) == 1

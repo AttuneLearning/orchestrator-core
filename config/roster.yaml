@@ -123,12 +123,12 @@ active_teams:
         runtime: api
         issue_prefix: ULEAD
   # Orchestration-monitor: a human-drained inbox for process/architecture
-  # questions agents raise (alias 'arch'/'monitor'). The engine never decomposes
+  # questions agents raise (alias 'orch-monitor'/'monitor'). The engine never decomposes
   # its messages into worker issues (loop.MONITOR_TEAMS); they queue pending for
   # the /orch/monitor dashboard, where a human reviews an agent-drafted reply.
   - id: orchestration
     name: Orchestration / Monitor
-    alias: arch
+    alias: orch-monitor
     role: orchestration
     issue_prefix: ORCH-ISS
     repos: []
@@ -145,5 +145,5 @@ aliases:
   ui: frontend
   quality: qa
   plat: platform
-  arch: orchestration
+  orch-monitor: orchestration
   monitor: orchestration

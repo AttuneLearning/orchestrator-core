@@ -392,7 +392,7 @@ def _cmd_git_review(args, settings) -> int:
             f"Changed files:\n{files}\n\nHuman-gated update: run "
             "`python -m orchestrator.cli self-update`, then restart the daemon + "
             "dashboard to load the new code.")
-    repo.create_message(pool, from_team="system", to_team="arch",
+    repo.create_message(pool, from_team="system", to_team="orch-monitor",
                         subject=f"Update available: {count} new commit(s) on {branch}",
                         body=body, priority="high", kind="request")
     repo.set_system_state(pool, "last_reviewed_sha", remote)

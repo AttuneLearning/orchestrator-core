@@ -41,10 +41,10 @@ def test_orchestration_message_stays_pending(settings, pool):
 
 def test_alias_arch_also_stays_pending(settings, pool):
     eng = Engine(settings, pool, reasoner=StubReasoner())
-    repo.create_message(pool, from_team="backend", to_team="arch", subject="Q", body="?")
+    repo.create_message(pool, from_team="backend", to_team="orch-monitor", subject="Q", body="?")
     eng.tick()
     # resolved to the orchestration team -> not rejected, still pending
-    assert repo.pending_messages(pool, to_team="arch")[0]["status"] == "pending"
+    assert repo.pending_messages(pool, to_team="orch-monitor")[0]["status"] == "pending"
 
 
 def test_real_team_message_still_ingests(settings, pool):
@@ -103,7 +103,7 @@ def _client(pool, settings):
 
 
 def test_monitor_page_lists_and_caches_draft(settings, pool):
-    q = repo.create_message(pool, from_team="backend", to_team="arch",
+    q = repo.create_message(pool, from_team="backend", to_team="orch-monitor",
                             subject="ingestion shape?", body="need it")
     client = _client(pool, settings)
     html = client.get("/orch/monitor").text

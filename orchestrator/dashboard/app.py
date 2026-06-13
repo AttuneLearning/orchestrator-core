@@ -50,7 +50,7 @@ def create_app(pool: Optional[ConnectionPool] = None,
     _embedder = make_embedder(settings)
 
     def _monitor_pending() -> list:
-        # Pending questions for any monitor team, resolving aliases (e.g. 'arch')
+        # Pending questions for any monitor team, resolving aliases (e.g. 'orch-monitor')
         # to the canonical team id so alias-addressed messages still surface.
         out = []
         for m in repo.pending_messages(pool):
