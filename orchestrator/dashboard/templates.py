@@ -53,6 +53,18 @@ _CSS = """
            border-radius:10px; background:var(--line); color:var(--ink); font-weight:700; }
   .badge.alert { background:var(--bad); color:#fff; }
   .unread { color:var(--warn); } .read { color:var(--muted); }
+  details.contract { background:var(--panel); border:1px solid var(--line);
+                     border-radius:8px; margin-bottom:10px; padding:6px 12px; max-width:860px; }
+  details.contract > summary { cursor:pointer; list-style:none; font-weight:600; padding:2px 0; }
+  details.contract > summary::-webkit-details-marker { display:none; }
+  details.contract > summary::before { content:'▸'; display:inline-block; width:1.1em;
+                                       color:var(--muted); }
+  details.contract[open] > summary::before { content:'▾'; }
+  details.members { margin-top:8px; }
+  details.members > summary { cursor:pointer; color:var(--link); font-size:13px; list-style:none; }
+  details.members > summary::-webkit-details-marker { display:none; }
+  details.members > summary::before { content:'▸ '; color:var(--muted); }
+  details.members[open] > summary::before { content:'▾ '; }
 """
 
 
@@ -157,9 +169,13 @@ def _contract_fields(d: Optional[dict[str, Any]], status_key: str) -> str:
     def kv(label, val):
         return (f"<div class='muted' style='font-size:12px'>{escape(label)}</div>"
                 f"<div>{escape(str(val if val not in (None, '') else '—'))}</div>")
-    return (kv("request_ref", d.get("request_ref")) + kv("response_dto", d.get("response_dto"))
+    # Full field set so the contract can actually be reviewed for accuracy.
+    return (kv("method", d.get("method")) + kv("path", d.get("path"))
+            + kv("request_ref", d.get("request_ref")) + kv("response_dto", d.get("response_dto"))
             + kv("auth", d.get("auth")) + kv("owner_team", d.get("owner_team"))
-            + kv("status", d.get(status_key)))
+            + kv("version", d.get("version")) + kv("status", d.get(status_key))
+            + kv("source_ref", d.get("source_ref"))
+            + kv("content_hash", (d.get("content_hash") or "")[:16] or None))
 
 
 def _contract_card(row: dict[str, Any]) -> str:
@@ -186,14 +202,17 @@ def _contract_card(row: dict[str, Any]) -> str:
     right = (_contract_fields(p, "target_status")
              + f"<div class='muted'>change: {escape(p['change_type'])}</div>") if p \
         else "<p class='muted'>no proposed change</p>"
+    # Collapsible card: summary = endpoint + badge/state; expanding shows ALL member
+    # fields directly (current|proposed) plus the action buttons — no second click.
     return (
-        "<div class='card' style='display:block;margin-bottom:14px;max-width:840px'>"
-        f"<div>{ep} · <span class='badge'>{escape(badge)}</span> "
-        f"<span class='muted'>{escape(state)}</span></div>"
+        "<details class='contract'>"
+        f"<summary>{ep} · <span class='badge'>{escape(badge)}</span> "
+        f"<span class='muted'>{escape(state)}</span></summary>"
         "<div class='cols' style='margin-top:8px'>"
         f"<div class='col-main'><h3>Current</h3>{_contract_fields(c, 'status')}</div>"
         f"<div class='col-main'><h3>Proposed</h3>{right}</div></div>"
-        f"<div style='margin-top:8px'>{btns}</div></div>"
+        f"<div style='margin-top:8px'>{btns}</div>"
+        "</details>"
     )
 
 
@@ -210,7 +229,16 @@ def contracts(overview: list[dict[str, Any]]) -> str:
     if uptodate:
         ut = ("<h2>Up to date</h2><ul>" + "".join(
             f"<li>{escape(r['method'])} {escape(r['path'])}</li>" for r in uptodate) + "</ul>")
-    main = f"<h1>Contracts</h1>{cards}{ut}"
+    # Global single toggle — opens every card + its Details if any are closed, else
+    # collapses all; the label flips to match.
+    _toggle_js = (
+        "var ds=document.querySelectorAll('details.contract');"
+        "var o=Array.prototype.some.call(ds,function(d){return !d.open});"
+        "ds.forEach(function(d){d.open=o});this.textContent=o?'Collapse all':'Expand all'"
+    )
+    controls = (f"<div style='margin:8px 0'><button class='alt' "
+                f"onclick=\"{_toggle_js}\">Expand all</button></div>")
+    main = f"<h1>Contracts</h1>{controls}{cards}{ut}"
     summary = "".join(f"<div class='msg'>{escape(s)}: <b>{n}</b></div>"
                       for s, n in sorted(counts.items())) or "<p class='muted'>No contracts.</p>"
     side = ("<aside class='side'><h2>Changes</h2>"

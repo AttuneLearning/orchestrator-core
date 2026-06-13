@@ -92,6 +92,10 @@ class Settings:
     # Raw parsed YAML for the pipeline/roster modules to consume.
     pipelines: dict[str, Any] = field(default_factory=dict)
     roster: dict[str, Any] = field(default_factory=dict)
+    # Which roster file is active (relative to repo root). Lets us keep the
+    # independent-repos roster and a monorepo roster side by side and switch via
+    # .env (ROSTER_FILE). Default = config/roster.yaml.
+    roster_file: str = "config/roster.yaml"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -135,6 +139,8 @@ def load_settings() -> Settings:
             return val.lower() in ("1", "true", "yes")
         return bool(s_yaml.get(yaml_key, default))
 
+    roster_file = pick("ROSTER_FILE", "roster_file", "config/roster.yaml")
+
     return Settings(
         database_url=os.getenv("DATABASE_URL", Settings.database_url),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
@@ -156,7 +162,8 @@ def load_settings() -> Settings:
         default_pipeline=str(s_yaml.get("default_pipeline", "pipeline-1")),
         thresholds=thresholds,
         pipelines=_yaml(CONFIG_DIR / "pipelines.yaml"),
-        roster=_yaml(CONFIG_DIR / "roster.yaml"),
+        roster=_yaml(REPO_ROOT / roster_file),
+        roster_file=roster_file,
         embed_provider=pick("EMBED_PROVIDER", "embed_provider", "stub"),
         embed_base_url=pick("EMBED_BASE_URL", "embed_base_url", ""),
         embed_model=pick("EMBED_MODEL", "embed_model", ""),

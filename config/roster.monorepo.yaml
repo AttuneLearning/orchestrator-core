@@ -1,20 +1,12 @@
 # =============================================================================
-# Roster (INDEPENDENT-REPOS variant) — the current/active roster: each team maps
-# to its own repo (api-repo, web-repo). The monorepo variant lives in
-# config/roster.monorepo.yaml; switch the active roster via .env ROSTER_FILE
-# (e.g. ROSTER_FILE=config/roster.monorepo.yaml) once the monorepo is live.
+# Roster (MONOREPO variant) — for AttuneLearning/cadencelms (apps/api, apps/web,
+# packages/contracts in ONE repo). Identical to the independent-repos roster
+# except `repos:` are now PACKAGE PATHS within the monorepo (these strings only
+# scope ADR rules — adr_rules._repos_match). Pull workers clone the single
+# monorepo and work in a git worktree scoped to their team's package path.
 #
-# Roster: the generic role catalog plus the project's active teams.
-#
-# Roles + sub_roles are copied from the upstream agent-workflow spec
-# (github.com/AttuneLearning/agent-workflow @ 555ff00):
-#   claude-workflow/teams/catalog.yaml
-#
-# backend + frontend are configured for the PULL model (live agentic coders):
-# dev/qa sub-teams are mode:pull runtime:external (a registered Claude Code /
-# Codex worker owns the repo work), plus a lead sub-team (mode:verdict) for the
-# reviewer gates. qa + platform stay verdict/api. See config/pipelines.yaml
-# (pull-1 / pull-fe) and docs/PULL_AGENTS.md.
+# NOT active by default. Activate after the monorepo is live:
+#   ROSTER_FILE=config/roster.monorepo.yaml   (in .env)
 # =============================================================================
 
 roles:
@@ -53,7 +45,7 @@ active_teams:
     alias: api
     role: backend
     issue_prefix: API-ISS
-    repos: [api-repo]
+    repos: [apps/api]            # monorepo package path (was api-repo)
     sub_teams:
       - id: backend-dev
         name: Backend-Dev
@@ -78,7 +70,7 @@ active_teams:
     alias: quality
     role: qa
     issue_prefix: QA-ISS
-    repos: []          # spans all repos -> receives project-wide rules only
+    repos: []          # spans all packages -> project-wide rules only
     sub_teams:
       - id: qa-dev
         name: QA-Dev
@@ -107,7 +99,7 @@ active_teams:
     alias: ui
     role: frontend
     issue_prefix: UI-ISS
-    repos: [web-repo]
+    repos: [apps/web]            # monorepo package path (was web-repo)
     sub_teams:
       - id: frontend-dev
         name: Frontend-Dev
@@ -127,10 +119,23 @@ active_teams:
         mode: verdict
         runtime: api
         issue_prefix: ULEAD
-  # Orchestration-monitor: a human-drained inbox for process/architecture
-  # questions agents raise (alias 'orch-monitor'/'monitor'). The engine never decomposes
-  # its messages into worker issues (loop.MONITOR_TEAMS); they queue pending for
-  # the /orch/monitor dashboard, where a human reviews an agent-drafted reply.
+  # Shared API contracts package — owns packages/contracts (the @cadencelms/contracts
+  # SSOT). Backend typically owns it; listed so ADR rules can scope to it.
+  - id: contracts
+    name: Contracts
+    alias: contract
+    role: platform
+    issue_prefix: CON-ISS
+    repos: [packages/contracts]
+    sub_teams:
+      - id: contracts-lead
+        name: Contracts-Lead
+        function: lead
+        mode: verdict
+        runtime: api
+        issue_prefix: CON-ISS
+  # Orchestration-monitor: human-drained inbox for process/architecture questions
+  # (alias 'orch-monitor'/'monitor'); engine never decomposes its messages.
   - id: orchestration
     name: Orchestration / Monitor
     alias: orch-monitor
@@ -150,5 +155,6 @@ aliases:
   ui: frontend
   quality: qa
   plat: platform
+  contract: contracts
   orch-monitor: orchestration
   monitor: orchestration
