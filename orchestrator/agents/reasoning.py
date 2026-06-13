@@ -63,6 +63,7 @@ class Reasoner(Protocol):
     def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]: ...
     def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]: ...
     def draft_reply(self, message: dict[str, Any]) -> str: ...
+    def review_reply(self, message: dict[str, Any], context: str, draft: str) -> str: ...
 
 
 class StubReasoner:
@@ -109,6 +110,11 @@ class StubReasoner:
         tag = "[draft+ctx]" if context else "[draft]"
         return (f"{tag} Re: {message.get('subject', '')} — "
                 f"acknowledged from {message.get('from_team', '?')}.")
+
+    def review_reply(self, message: dict[str, Any], context: str = "",
+                     draft: str = "") -> str:
+        # Deterministic QA pass; tags the draft so tests can see 2-pass ran.
+        return f"[qa] {draft}"
 
 
 class _LLMReasoner:
@@ -272,6 +278,24 @@ class _LLMReasoner:
             f"Subject: {message.get('subject', '')}\n\n{message.get('body', '')}"
         )
         return self._ask(system, user, max_tokens=700)
+
+    def review_reply(self, message: dict[str, Any], context: str = "",
+                     draft: str = "") -> str:
+        system = (
+            "You are QA-reviewing a draft reply to a cross-team question, checking it "
+            "against the authoritative orchestration reference. Verify EACH factual "
+            "claim against the reference. Correct anything inaccurate; remove or flag "
+            "claims the reference does not support (do not invent). Pay attention to "
+            "exact field names, which fields are required vs optional/defaulted, "
+            "allowed enum values, and precise computations. Output ONLY the corrected "
+            "final reply (plain text) — no commentary about the review."
+        )
+        user = (
+            f"Reference (authoritative):\n{context}\n\n"
+            f"Question:\n{message.get('subject', '')}\n{message.get('body', '')}\n\n"
+            f"Draft reply to review and correct:\n{draft}"
+        )
+        return self._ask(system, user, max_tokens=900)
 
 
 class AnthropicReasoner(_LLMReasoner):

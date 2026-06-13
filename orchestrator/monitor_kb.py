@@ -15,6 +15,7 @@ a code update refreshes the KB to the current source. Used by the
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -27,15 +28,17 @@ MONITOR_KB_SCOPE = "monitor:kb"
 # Authored ground truth for the question that exposed the gap: the contract-store
 # ingestion format the `import-contracts` CLI / repository.upsert_contract expect.
 _CONTRACT_SPEC_NOTE = (
-    "[contract-store] Seed format for the API contract store (CLI `import-contracts "
-    "<file>`): a FLAT JSON ARRAY (no envelope, no _meta), one object per endpoint, "
-    "idempotent/keyed on (method, path). Each object: {method, path, request_ref "
-    "(zod validator export name), response_dto (DTO type name), auth, owner_team, "
-    "status ('live' if wired in routes else 'proposed'), version, source_ref}. "
-    "Validators and DTOs are referenced BY NAME, not inlined. content_hash is "
-    "computed by the importer. Contract is 'satisfied' when status is agreed or live; "
-    "the pull-fe contract_check gate blocks frontend new-endpoint issues until the "
-    "endpoints they consume are satisfied (see migration 0011)."
+    "[contract-store] Seed format for `import-contracts <file>` / repository.upsert_contract: "
+    "a FLAT JSON ARRAY (no envelope, no _meta), one object per endpoint, idempotent UPSERT "
+    "keyed on (method, path). REQUIRED fields: method, path. OPTIONAL fields (with defaults): "
+    "request_ref='' (zod validator export name), response_dto='' (DTO type name), auth='none', "
+    "owner_team='backend', status='proposed', version='1.0', source_ref=null. status lifecycle "
+    "is one of: proposed | agreed | live | deprecated (seed data uses 'live' if the route is "
+    "wired, else 'proposed'; a contract is 'satisfied' when status is agreed OR live). Validators "
+    "and DTOs are referenced BY NAME, never inlined. content_hash is computed by the importer as "
+    "sha256 of method|path|request_ref|response_dto ONLY (NOT the whole record — auth/owner_team/"
+    "status/version do not change the hash). The pull-fe contract_check gate blocks frontend "
+    "new-endpoint issues until the endpoints they consume are satisfied (see migration 0011)."
 )
 
 
@@ -46,8 +49,12 @@ def _migration_notes() -> list[str]:
         # The leading `-- ...` comment block is the human-written intent.
         header = [ln[2:].strip() for ln in text.splitlines()
                   if ln.strip().startswith("--") and "===" not in ln]
-        desc = " ".join(h for h in header if h) or text[:400]
-        notes.append(f"[schema:{path.name}] {desc}")
+        desc = " ".join(h for h in header if h)
+        # Include the actual DDL (column defs with NOT NULL/DEFAULT clauses + inline
+        # comments) — that's the ground truth for required-vs-optional and enums.
+        ddl = " ".join(ln.strip() for ln in text.splitlines()
+                       if ln.strip() and not ln.strip().startswith("--"))
+        notes.append(f"[schema:{path.name}] {desc} || DDL: {ddl}")
     return notes
 
 
@@ -103,16 +110,19 @@ def _mcp_tool_notes(pool, settings: Settings) -> list[str]:
     return notes
 
 
-def _repository_api_note() -> str:
-    members = inspect.getmembers(repo, inspect.isfunction)
-    lines = []
-    for fname, fn in members:
+def _signature_notes() -> list[str]:
+    """One note per public repository function — its EXACT signature (defaults make
+    required-vs-optional explicit) + first docstring line. Individually retrievable
+    so the relevant function (e.g. upsert_contract) surfaces for a specific question.
+    ALL DB writes go through these."""
+    notes = []
+    for fname, fn in inspect.getmembers(repo, inspect.isfunction):
         if fname.startswith("_") or fn.__module__ != repo.__name__:
             continue
         doc = (inspect.getdoc(fn) or "").split("\n")[0]
-        lines.append(f"{fname}{inspect.signature(fn)}" + (f" — {doc}" if doc else ""))
-    return ("[repository-api] ALL DB writes go through orchestrator.repository. "
-            "Public functions: " + " | ".join(sorted(lines)))
+        notes.append(f"[repo:{fname}] {fname}{inspect.signature(fn)}"
+                     + (f" — {doc}" if doc else ""))
+    return notes
 
 
 def _config_notes() -> list[str]:
@@ -133,7 +143,7 @@ def collect_notes(pool, settings: Settings) -> list[str]:
     notes += _migration_notes()
     notes += _impl_summary_notes()
     notes += _mcp_tool_notes(pool, settings)
-    notes.append(_repository_api_note())
+    notes += _signature_notes()
     notes += _config_notes()
     return [n for n in notes if n and n.strip()]
 
@@ -148,6 +158,25 @@ def build_monitor_kb(pool, settings: Settings) -> int:
         repo.memory_write(pool, body, scope=MONITOR_KB_SCOPE, embedding=embedding)
         n += 1
     return n
+
+
+def retrieve_context(pool, query: str, limit: int = 8) -> list[str]:
+    """Retrieve grounding notes for a question via keyword-overlap ranking over the
+    monitor KB. Deterministic and robust for a small curated KB — the stub embedder's
+    vector ranking is unreliable at this size, while term overlap reliably surfaces
+    the right notes (e.g. a contract question pulls the [contract-store] note, the
+    0011 DDL, and the upsert_contract signature). Returns note bodies, best first."""
+    terms = set(re.findall(r"[a-z][a-z0-9_]{3,}", query.lower()))
+    if not terms:
+        return []
+    scored = []
+    for n in repo.memory_recall(pool, scope=MONITOR_KB_SCOPE, limit=1000):
+        body_l = n.body.lower()
+        score = sum(1 for t in terms if t in body_l)
+        if score:
+            scored.append((score, n.id, n.body))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [b for _, _, b in scored[:limit]]
 
 
 def monitor_kb_empty(pool) -> bool:

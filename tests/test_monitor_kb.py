@@ -21,8 +21,23 @@ def test_build_monitor_kb_populates_isolated_scope(settings, pool):
     assert len(notes) == n
     bodies = "\n".join(x.body for x in notes)
     assert "[contract-store]" in bodies            # the authored contract spec
-    assert "[repository-api]" in bodies            # repo API surface
+    assert any(x.body.startswith("[repo:") for x in notes)  # per-fn repo signatures
     assert any("[schema:" in x.body for x in notes)  # migration DDL summaries
+
+
+def test_kb_carries_precise_contract_facts(settings, pool):
+    monitor_kb.build_monitor_kb(pool, settings)
+    notes = {n.body for n in repo.memory_recall(pool, "monitor:kb", limit=500)}
+    blob = "\n".join(notes)
+    # exact upsert_contract signature (defaults -> required vs optional)
+    assert any(b.startswith("[repo:upsert_contract]") and "request_ref" in b for b in notes)
+    # real DDL with NOT NULL/DEFAULT clauses ingested (not just the comment block)
+    assert any("[schema:0011" in b and "DEFAULT" in b for b in notes)
+    # the authored contract note is now precise on the 3 previously-wrong points
+    spec = next(b for b in notes if b.startswith("[contract-store]"))
+    assert "REQUIRED fields: method, path" in spec
+    assert "proposed | agreed | live | deprecated" in spec
+    assert "sha256 of method|path|request_ref|response_dto" in spec
 
 
 def test_build_is_idempotent(settings, pool):
@@ -46,6 +61,19 @@ def test_monitor_scope_is_private_from_default_search(settings, pool):
     assert kb_hits and all(n.scope == "monitor:kb" for n in kb_hits)
 
 
+def test_retrieve_context_surfaces_the_right_notes(settings, pool):
+    monitor_kb.build_monitor_kb(pool, settings)
+    ctx = monitor_kb.retrieve_context(
+        pool, "MCP contract store ingestion schema for contracts.seed.json", limit=8)
+    assert ctx, "expected keyword-overlap hits"
+    # the authoritative contract spec surfaces at the top (it has the precise
+    # required/optional + status-enum + hash facts the draft needs)
+    assert ctx[0].startswith("[contract-store]")
+    # an unrelated query doesn't pull the contract spec to the top
+    other = monitor_kb.retrieve_context(pool, "agent heartbeat liveness reclaim", limit=3)
+    assert not other or not other[0].startswith("[contract-store]")
+
+
 def test_bootstrap_only_when_empty(settings, pool):
     assert monitor_kb.monitor_kb_empty(pool) is True
     first = monitor_kb.bootstrap_monitor_kb(pool, settings)
@@ -64,7 +92,9 @@ def test_dashboard_draft_is_grounded_in_kb(settings, pool):
     # proving the dashboard retrieved KB snippets and passed them in.
     client = TestClient(create_app(pool, settings, reasoner=StubReasoner()))
     html = client.get("/orch/monitor").text
-    assert "[draft+ctx]" in html
+    # [draft+ctx] = grounded (pass 1); [qa] = cross-checked (pass 2). Both present
+    # proves the draft was grounded AND ran through the QA cross-check.
+    assert "[draft+ctx]" in html and "[qa]" in html
 
 
 # --- git-review alert ------------------------------------------------------- #

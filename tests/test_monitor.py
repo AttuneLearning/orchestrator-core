@@ -109,9 +109,9 @@ def test_monitor_page_lists_and_caches_draft(settings, pool):
     html = client.get("/orch/monitor").text
     assert "ingestion shape?" in html
     assert "DRAFT-ANSWER for ingestion shape?" in html
-    # draft cached on the row so a reload won't re-call the model
-    assert repo.get_message(pool, q["id"])["draft_response"] == \
-        "DRAFT-ANSWER for ingestion shape?"
+    # draft is the QA'd (2-pass) output and is cached so a reload won't re-call.
+    cached = repo.get_message(pool, q["id"])["draft_response"]
+    assert "DRAFT-ANSWER for ingestion shape?" in cached and cached.startswith("[qa]")
 
 
 def test_monitor_submit_uses_override(settings, pool):
