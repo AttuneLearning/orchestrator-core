@@ -14,8 +14,16 @@ thresholds:
   drift_threshold: 0.5     # off_rails latches only when a signal fires AND drift < this
   retry_cap: 3             # gate declines before an issue lands in failed
   step_budget: 25          # max gate-advances per issue before exhaustion
-  max_depth: 3             # sub-issue nesting depth
-  max_subissues: 8         # children per decomposition
-  max_issues_per_goal: 30  # hard cap on issues created for one goal
+  # Decomposition guardrails (spec: prevent the 24-issue blowout). Backstops, not
+  # the primary fix — breaching one alerts + holds the goal (never silent truncation).
+  max_depth: 2                 # sub-issue nesting depth
+  max_subissues: 5             # children per decomposition
+  max_issues_per_goal: 8       # hard cap on issues created for one goal
+  max_children_per_parent: 5   # refuse to fan one parent wider than this
+
+# Contract-first gate. OFF by default. When true, pull-fe's contract_check gate
+# blocks new-endpoint frontend issues until their consumed endpoints have an
+# agreed/live contract (see migration 0011). Override live via .env CONTRACT_GATE_ENABLED.
+contract_gate_enabled: false
 
 default_pipeline: pipeline-1

@@ -3,8 +3,9 @@
 A plain-Python orchestrator that drives software work goals through an
 autonomous multi-agent pipeline. Canonical state lives in **Postgres**; agents
 act only through an **MCP tool layer**; a single-threaded **engine loop**
-advances each issue through the five-phase pipeline defined by the
-[`agent-workflow`](./agent-workflow) spec (included as a submodule).
+advances each issue through the five-phase pipeline defined by the upstream
+[`agent-workflow`](https://github.com/AttuneLearning/agent-workflow) spec
+(ported from @ 555ff00; not vendored in this repo).
 
 This is the **phases 1–4 orchestration core**. Deferred to follow-ups: the
 FastAPI ops dashboard, Directus admin, pgvector semantic search, the `cli`
@@ -102,8 +103,20 @@ prefer a containerized database.
 
 Tools: issue (`list_issues`, `get_issue`, `claim_issue`, `update_state`,
 `gate_decision`, `create_subissue`, `append_log`), memory (`memory_write`,
-`memory_recall`, `memory_search`), and skill tools ported from `agent-workflow`
-(`adr_create`, `comms_send`, `context_load`, `reflect`, `refine`).
+`memory_recall`, `memory_search`), skill tools ported from `agent-workflow`
+(`adr_create`, `comms_send`, `context_load`, `reflect`, `refine`), and status
+tools for external monitors (`get_status`, `get_alerts`, `tail_events`,
+`propose_goal`).
+
+### Plugin for external looping agents
+
+The MCP server doubles as a plugin surface for looping agents (Hermes, OpenClaw,
+Open Interpreter, …): they **monitor** progress (`get_status` / `tail_events`),
+**alert** on the attention set (`get_alerts`), and **suggest** goals
+(`propose_goal`) that land gated in a `suggested` state until a human promotes
+them (`goal-promote`). See [`docs/PLUGIN_INTEGRATION.md`](docs/PLUGIN_INTEGRATION.md)
+and the sample [`examples/mcp-client-config.json`](examples/mcp-client-config.json).
+(`serve --transport http` is scaffolded but stubbed; stdio works today.)
 
 ## Tests
 
@@ -128,8 +141,12 @@ orchestrator/
   mcp_server/ server.py tools_issues.py tools_memory.py tools_skills.py
   cli.py main.py
 tests/
-agent-workflow/    spec source (submodule, read-only)
 ```
+
+> Spec source: the upstream `agent-workflow` repo
+> (github.com/AttuneLearning/agent-workflow @ 555ff00). It was ported into the
+> files above and is **not** vendored here — clone it separately if you need the
+> original PROCESS_GUIDE/protocol/registry or the skill-pack installer (§ ops).
 
 ## Ops UIs (Directus + Metabase)
 

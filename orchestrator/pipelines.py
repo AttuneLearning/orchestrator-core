@@ -21,6 +21,14 @@ class Gate:
     condition: Optional[str] = None
     on_failure: Optional[str] = None
     exit_criteria: tuple[str, ...] = field(default_factory=tuple)
+    # How the gate's work is performed:
+    #   "verdict" (default) — the gate owner renders a decision over state the
+    #     orchestrator already holds (reasoner gate_review, a human, or a
+    #     delegated reviewer). The engine drives it in-process.
+    #   "pull" — a registered external worker of `owner` claims the issue and
+    #     does the work in its own repo, reporting back via MCP. The engine
+    #     assigns + observes but never runs a worker on it.
+    mode: str = "verdict"
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,11 @@ class Pipeline:
     name: str
     description: str
     gates: tuple[Gate, ...]
+    # The team that owns every issue decomposed under this pipeline. When set,
+    # decomposition inherits it (children never re-derive team from issue text —
+    # that text inference is what misroutes pull-fe work to backend). None = fall
+    # back to the reasoner's per-issue team.
+    team: Optional[str] = None
 
     def gate(self, gate_type: str) -> Optional[Gate]:
         for g in self.gates:
@@ -50,6 +63,7 @@ def load_pipelines(config: dict[str, Any]) -> dict[str, Pipeline]:
                 condition=g.get("condition"),
                 on_failure=g.get("on_failure"),
                 exit_criteria=tuple(g.get("exit_criteria", []) or []),
+                mode=g.get("mode", "verdict"),
             )
             for g in sorted(spec.get("gates", []), key=lambda x: x["order"])
         )
@@ -58,6 +72,7 @@ def load_pipelines(config: dict[str, Any]) -> dict[str, Pipeline]:
             name=spec.get("name", pid),
             description=spec.get("description", ""),
             gates=gates,
+            team=spec.get("team"),
         )
     return out
 

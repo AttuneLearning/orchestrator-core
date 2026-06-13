@@ -18,7 +18,8 @@ There are two integration paths. They are complementary; most people start with
 | Maturity | Solid — this is the core, fully tested. | Real but young. The artifact is whatever the code model returns as one blob; treat output as a draft, not a PR. |
 | Start here if | You want to see how the system plans and coordinates work on your LMS, and inspect it. | You have a throwaway branch and a fast verify command and want to experiment with the closed loop. |
 
-There is also a **third, separate thing** — the `agent-workflow/` submodule — which
+There is also a **third, separate thing** — the upstream `agent-workflow` repo
+(github.com/AttuneLearning/agent-workflow; clone it separately) — which
 installs the file-based `dev_communication/` protocol + skills into a repo for
 **human/Claude-Code sessions** (not the autonomous engine). That's the most
 battle-tested way to bring this methodology to a live LMS repo today; see §6.
@@ -213,7 +214,8 @@ review the merge and push yourself if you want it.
 
 ## 6. The complementary path: install the workflow into the LMS repo
 
-Independent of the autonomous engine, the `agent-workflow/` submodule installs the
+Independent of the autonomous engine, the upstream `agent-workflow` repo
+(github.com/AttuneLearning/agent-workflow — clone it separately) installs the
 file-based `dev_communication/` protocol, the six skills (`/comms /adr /memory
 /context /reflect /refine`), and ADR/pattern/session scaffolding **into a real
 repo**, for use by human + Claude Code / Codex sessions. For a live LMS codebase

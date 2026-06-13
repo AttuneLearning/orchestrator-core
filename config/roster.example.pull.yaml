@@ -1,0 +1,81 @@
+# =============================================================================
+# Example roster for the PULL model (live agentic coders: Claude Code / Codex /
+# Aider). Copy over config/roster.yaml (or merge the sub_team mode/runtime keys)
+# when you want registered external workers to do the repo work and the engine
+# to assign + observe + render verdicts. See docs/PULL_AGENTS.md and the `pull-1`
+# pipeline in config/pipelines.yaml.
+#
+# Structure is pod -> role, role -> gate:
+#   * a POD is a team (here: backend).
+#   * each ROLE is a sub_team. Pull roles (coder, QA runner) own a repo and do
+#     the work; the verdict role (reviewer/lead) renders pass/decline.
+#   * the pull-1 pipeline's gates route work to these roles by `owner` + `mode`:
+#       implementation (mode: pull, owner: dev)   -> coder
+#       verification   (mode: pull, owner: qa)    -> QA runner
+#       intake/qa_gate/completion (mode: verdict, owner: lead) -> reviewer
+#
+# A `mode: pull` gate REQUIRES a registered `external` worker of the gate's owner
+# function; with none registered the issue parks unworked. `mode: verdict` gates
+# are rendered by the reasoner (default), a human, or a delegated reviewer.
+# =============================================================================
+
+enabled_skills: [comms, adr, memory, context, reflect, refine]
+
+default_runtime: external      # live CLI coders claim via MCP, not in-process
+
+active_teams:
+  - id: backend
+    name: Backend
+    alias: api
+    role: backend
+    issue_prefix: API-ISS
+    repos: [api-repo]          # a routing / ADR-scoping LABEL, not a path —
+    sub_teams:                 # each agent's repo is its own launch cwd
+      - id: backend-dev        # ROLE: coder — pull worker; edits + writes tests (TDD)
+        name: Backend-Dev
+        function: dev
+        mode: pull
+        runtime: external
+        issue_prefix: API-ISS
+      - id: backend-qa         # ROLE: QA runner — pull worker; runs the suite, reports results
+        name: Backend-QA
+        function: qa
+        mode: pull
+        runtime: external
+        issue_prefix: BQA
+      - id: backend-lead       # ROLE: reviewer/lead — verdict; renders pass/decline
+        name: Backend-Lead
+        function: lead
+        mode: verdict
+        runtime: api           # reasoner verdict by default; or human / delegated reviewer
+        issue_prefix: BLEAD
+
+  - id: frontend
+    name: Frontend
+    alias: ui
+    role: frontend
+    issue_prefix: UI-ISS
+    repos: [web-repo]          # routing / ADR label, not a path
+    sub_teams:
+      - id: frontend-dev       # ROLE: coder — pull worker; edits + writes tests (TDD)
+        name: Frontend-Dev
+        function: dev
+        mode: pull
+        runtime: external
+        issue_prefix: UI-ISS
+      - id: frontend-qa        # ROLE: QA runner — pull worker; unit (Vitest) + Playwright E2E
+        name: Frontend-QA
+        function: qa
+        mode: pull
+        runtime: external
+        issue_prefix: UQA
+      - id: frontend-lead      # ROLE: reviewer/lead — verdict; renders pass/decline
+        name: Frontend-Lead
+        function: lead
+        mode: verdict
+        runtime: api
+        issue_prefix: ULEAD
+
+aliases:
+  api: backend
+  ui: frontend

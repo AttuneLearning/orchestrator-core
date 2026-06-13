@@ -1,0 +1,16 @@
+{
+  "//": "Drop this entry into an MCP client's server config (Claude Desktop, Open",
+  "//2": "Interpreter, Hermes, OpenClaw, etc.). It launches the orchestrator MCP",
+  "//3": "server over stdio. Set command to your venv python and DATABASE_URL to",
+  "//4": "your Postgres. cwd must be the orchestrator project root.",
+  "mcpServers": {
+    "orchestrator": {
+      "command": "/abs/path/to/python-orchestrator-v1/.venv/bin/python",
+      "args": ["-m", "orchestrator.cli", "serve"],
+      "cwd": "/abs/path/to/python-orchestrator-v1",
+      "env": {
+        "DATABASE_URL": "postgresql://localhost/orchestrator"
+      }
+    }
+  }
+}

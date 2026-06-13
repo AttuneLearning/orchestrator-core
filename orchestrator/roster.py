@@ -10,8 +10,13 @@ from typing import Any, Optional
 class SubTeam:
     id: str
     name: str
-    function: str       # dev | qa
+    function: str       # dev | qa | lead
     issue_prefix: str
+    # mode: "pull" (a live external worker owns a repo and does the work) or
+    # "verdict" (the role renders a decision; reasoner/human/delegated). runtime:
+    # api | cli | external (external = a long-lived agent that claims via MCP).
+    mode: str = "verdict"
+    runtime: str = "api"
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,8 @@ def load_roster(config: dict[str, Any]) -> Roster:
                 name=s.get("name", s["id"]),
                 function=s.get("function", "dev"),
                 issue_prefix=s.get("issue_prefix", ""),
+                mode=s.get("mode", "verdict"),
+                runtime=s.get("runtime", config.get("default_runtime", "api")),
             )
             for s in spec.get("sub_teams", []) or []
         )

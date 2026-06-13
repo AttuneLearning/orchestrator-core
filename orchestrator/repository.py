@@ -10,6 +10,7 @@ issue_events row in the same transaction as the issues update.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional
 
 from psycopg.rows import class_row, dict_row
@@ -60,18 +61,76 @@ def _pgvector_available(pool: ConnectionPool) -> bool:
 # Goals
 # --------------------------------------------------------------------------- #
 
+_GOAL_COLS = (
+    "id, title, description, state, pipeline, created_at, updated_at, "
+    "suggested_by, source, decompose"
+)
+
+
 def create_goal(pool: ConnectionPool, title: str, description: str = "",
-                pipeline: str = "pipeline-1") -> Goal:
+                pipeline: str = "pipeline-1", *, state: str = "backlog",
+                suggested_by: str = "", source: str = "",
+                decompose: Optional[str] = None) -> Goal:
     with pool.connection() as conn:
         row = conn.execute(
-            """
-            INSERT INTO goals (title, description, state, pipeline)
-            VALUES (%s, %s, 'backlog', %s)
-            RETURNING id, title, description, state, pipeline, created_at, updated_at
+            f"""
+            INSERT INTO goals (title, description, state, pipeline,
+                               suggested_by, source, decompose)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING {_GOAL_COLS}
             """,
-            (title, description, pipeline),
+            (title, description, state, pipeline, suggested_by, source, decompose),
         ).fetchone()
     return Goal(*row)
+
+
+def propose_goal(pool: ConnectionPool, title: str, description: str = "",
+                 pipeline: str = "pipeline-1", suggested_by: str = "agent",
+                 source: str = "", decompose: Optional[str] = None) -> Goal:
+    """Create a goal in the gated 'suggested' state (the MCP propose_goal path).
+
+    The engine's _decompose only acts on 'backlog' goals, so a suggested goal is
+    inert until a human promotes it (promote_goal). This is the human-in-the-loop
+    gate for work proposed by external looping agents.
+    """
+    return create_goal(pool, title, description, pipeline,
+                        state="suggested", suggested_by=suggested_by, source=source,
+                        decompose=decompose)
+
+
+def promote_goal(pool: ConnectionPool, goal_id: int) -> None:
+    """Human review: accept a suggested goal into the work queue (suggested → backlog)."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE goals SET state = 'backlog', updated_at = now() "
+            "WHERE id = %s AND state = 'suggested' RETURNING id",
+            (goal_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"goal {goal_id} not found or not in 'suggested' state")
+
+
+def reject_goal(pool: ConnectionPool, goal_id: int) -> None:
+    """Human review: decline a suggested goal (suggested → rejected)."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE goals SET state = 'rejected', updated_at = now() "
+            "WHERE id = %s AND state = 'suggested' RETURNING id",
+            (goal_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"goal {goal_id} not found or not in 'suggested' state")
+
+
+def list_goals_by_state(pool: ConnectionPool, state: str) -> list[Goal]:
+    """Goals in a single state, oldest first — used for the dashboard suggestions
+    review section."""
+    with pool.connection() as conn:
+        cur = conn.cursor(row_factory=class_row(Goal))
+        return cur.execute(
+            f"SELECT {_GOAL_COLS} FROM goals WHERE state = %s ORDER BY id",
+            (state,),
+        ).fetchall()
 
 
 def list_open_goals(pool: ConnectionPool) -> list[Goal]:
@@ -79,9 +138,10 @@ def list_open_goals(pool: ConnectionPool) -> list[Goal]:
         cur = conn.cursor(row_factory=class_row(Goal))
         return cur.execute(
             """
-            SELECT id, title, description, state, pipeline, created_at, updated_at
+            SELECT id, title, description, state, pipeline, created_at, updated_at,
+                   suggested_by, source, decompose
             FROM goals
-            WHERE state NOT IN ('done', 'paused')
+            WHERE state NOT IN ('done', 'paused', 'suggested', 'rejected')
             ORDER BY id
             """
         ).fetchall()
@@ -93,8 +153,8 @@ def list_all_goals(pool: ConnectionPool) -> list[Goal]:
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(Goal))
         return cur.execute(
-            "SELECT id, title, description, state, pipeline, created_at, updated_at "
-            "FROM goals ORDER BY id"
+            "SELECT id, title, description, state, pipeline, created_at, updated_at, "
+            "suggested_by, source, decompose FROM goals ORDER BY id"
         ).fetchall()
 
 
@@ -104,6 +164,14 @@ def set_goal_state(pool: ConnectionPool, goal_id: int, state: str) -> None:
             "UPDATE goals SET state = %s, updated_at = now() WHERE id = %s",
             (state, goal_id),
         )
+
+
+def get_goal(pool: ConnectionPool, goal_id: int) -> Optional[Goal]:
+    with pool.connection() as conn:
+        row = conn.execute(
+            f"SELECT {_GOAL_COLS} FROM goals WHERE id = %s", (goal_id,)
+        ).fetchone()
+    return Goal(*row) if row else None
 
 
 def resume_goal(pool: ConnectionPool, goal_id: int) -> None:
@@ -184,6 +252,7 @@ def list_issues(
     goal_id: Optional[int] = None,
     states: Optional[list[str]] = None,
     parent_id: Optional[int] = None,
+    assigned_agent: Optional[int] = None,
 ) -> list[Issue]:
     clauses, params = [], []
     if goal_id is not None:
@@ -195,6 +264,9 @@ def list_issues(
     if parent_id is not None:
         clauses.append("parent_id = %s")
         params.append(parent_id)
+    if assigned_agent is not None:
+        clauses.append("assigned_agent = %s")
+        params.append(assigned_agent)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with pool.connection() as conn:
         rows = conn.execute(_ISSUE_SELECT + where + " ORDER BY id", params).fetchall()
@@ -223,11 +295,38 @@ def claim_issue(pool: ConnectionPool, issue_id: int, agent_id: int) -> None:
             "UPDATE issues SET assigned_agent = %s, updated_at = now() WHERE id = %s",
             (agent_id, issue_id),
         )
+        # status=busy; last_seen=now() gives a freshly-claimed pull worker a full
+        # stale-window grace period before liveness reclaim (see _reclaim).
         conn.execute(
-            "UPDATE agents SET status = 'busy' WHERE id = %s", (agent_id,)
+            "UPDATE agents SET status = 'busy', last_seen = now() WHERE id = %s",
+            (agent_id,),
         )
         _append_event(conn, issue_id, "state_change", None, None,
                       {"claimed_by": agent_id})
+
+
+def agent_seconds_since_seen(pool: ConnectionPool, agent_id: int) -> Optional[float]:
+    """Seconds since the agent's last_seen, measured on the DB clock. None if the
+    agent is unknown or has never been seen (treated as stale by callers)."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT EXTRACT(EPOCH FROM (now() - last_seen)) FROM agents WHERE id = %s",
+            (agent_id,),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def unassign_issue(pool: ConnectionPool, issue_id: int) -> None:
+    """Clear an issue's assigned agent (does not touch agent status). Used when a
+    pull gate has no eligible external worker, so the gate isn't falsely 'owned'
+    by a carried-over agent from the previous gate."""
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE issues SET assigned_agent = NULL, updated_at = now() WHERE id = %s",
+            (issue_id,),
+        )
 
 
 def update_state(
@@ -299,6 +398,30 @@ def apply_directive(
     )
 
 
+def cancel_issue(
+    pool: ConnectionPool,
+    issue_id: int,
+    reason: str = "",
+    actor: str = "human",
+) -> Issue:
+    """Terminate an issue without completing it (operator/auto triage of garbage,
+    misrouted, or superseded work). Cancellable from any non-done state; releases
+    the assigned agent. No-op-raises if the issue is already done/cancelled."""
+    issue = get_issue(pool, issue_id)
+    if issue is None:
+        raise ValueError(f"no issue {issue_id}")
+    to_state = IssueState.CANCELLED.value
+    if not validate_transition(issue.state, to_state):
+        raise ValueError(
+            f"cannot cancel issue {issue_id}: state '{issue.state}' is terminal")
+    if issue.assigned_agent is not None:
+        set_agent_status(pool, issue.assigned_agent, "idle")
+    return update_state(
+        pool, issue_id, to_state, gate_type=issue.gate_type,
+        event_type="cancelled", payload={"reason": reason, "actor": actor},
+    )
+
+
 def append_log(
     pool: ConnectionPool,
     issue_id: int,
@@ -339,6 +462,82 @@ def issue_timeline(pool: ConnectionPool, issue_id: int) -> list[IssueEvent]:
     return [IssueEvent(**r) for r in rows]
 
 
+def events_since(pool: ConnectionPool, after_id: int = 0,
+                 limit: int = 200) -> list[IssueEvent]:
+    """Cross-issue event feed for polling clients, oldest-first by global id.
+
+    issue_events.id is GENERATED ALWAYS AS IDENTITY, so it is a globally
+    monotonic cursor: pass the highest id you have seen as after_id to get only
+    newer events. Distinct from recent_events (single issue, newest-first)."""
+    with pool.connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        rows = cur.execute(
+            """
+            SELECT id, issue_id, seq, event_type, from_state, to_state, payload, created_at
+            FROM issue_events
+            WHERE id > %s
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (after_id, limit),
+        ).fetchall()
+    return [IssueEvent(**r) for r in rows]
+
+
+# Event types that represent a "major action" assigned to / taken by an agent.
+_AGENT_ACTIVITY_TYPES = (
+    "state_change", "gate_enter", "gate_pass", "gate_decline", "code_committed",
+    "tests_run", "reclaimed", "directive", "code_generated", "comms_response",
+)
+
+
+def _activity_label(row: dict[str, Any]) -> str:
+    et = row["event_type"]
+    p = row.get("payload") or {}
+    if et == "state_change":
+        return "assigned (claimed)"  # only claim state_changes reach here
+    if et == "gate_enter":
+        return "reassigned" if "reassigned_to" in p else "entered gate"
+    return {
+        "gate_pass": "gate passed", "gate_decline": "gate declined",
+        "code_committed": "committed code", "tests_run": "ran tests",
+        "reclaimed": "reclaimed (went stale)", "directive": "resumed (directive)",
+        "code_generated": "generated code", "comms_response": "sent response",
+    }.get(et, et)
+
+
+def recent_agent_activity(pool: ConnectionPool, limit: int = 10) -> list[dict[str, Any]]:
+    """The latest 'major actions' assigned to or taken by agents, newest-first.
+
+    Agent attribution comes from the event payload (claimed_by / reassigned_to /
+    agent) when present, else the issue's current assigned_agent. Read-only over
+    issue_events — no schema change."""
+    sql = """
+        SELECT e.id, e.created_at, e.event_type, e.issue_id, e.payload,
+               i.title AS issue_title,
+               COALESCE((e.payload->>'claimed_by')::int,
+                        (e.payload->>'reassigned_to')::int,
+                        (e.payload->>'agent')::int,
+                        i.assigned_agent) AS agent_id,
+               a.team, a.function
+        FROM issue_events e
+        JOIN issues i ON i.id = e.issue_id
+        LEFT JOIN agents a ON a.id = COALESCE((e.payload->>'claimed_by')::int,
+                  (e.payload->>'reassigned_to')::int, (e.payload->>'agent')::int,
+                  i.assigned_agent)
+        WHERE e.event_type = ANY(%s)
+          AND (e.event_type <> 'state_change' OR e.payload->>'claimed_by' IS NOT NULL)
+        ORDER BY e.id DESC
+        LIMIT %s
+    """
+    with pool.connection() as conn:
+        cur = conn.cursor(row_factory=dict_row)
+        rows = cur.execute(sql, (list(_AGENT_ACTIVITY_TYPES), limit)).fetchall()
+    for r in rows:
+        r["action"] = _activity_label(r)
+    return rows
+
+
 def issue_tree(pool: ConnectionPool, goal_id: int) -> list[Issue]:
     """Issues for a goal, ordered so parents precede their children (depth, id)."""
     with pool.connection() as conn:
@@ -363,7 +562,8 @@ def count_by_state(pool: ConnectionPool, table: str) -> dict[str, int]:
 # Agents
 # --------------------------------------------------------------------------- #
 
-_AGENT_COLS = "id, team, function, runtime, status, last_seen, created_at"
+_AGENT_COLS = ("id, team, function, runtime, status, last_seen, created_at, "
+               "loop_enabled, poll_interval_seconds")
 
 
 def register_agent(
@@ -413,23 +613,53 @@ def touch_agent(pool: ConnectionPool, agent_id: int) -> None:
         conn.execute("UPDATE agents SET last_seen = now() WHERE id = %s", (agent_id,))
 
 
+def agent_next_poll_seconds(agent: Agent) -> int:
+    """Idle cadence the worker should obey: the poll interval when looping is
+    enabled, else 0 — meaning 'stop after the queue drains' (disabled = stop)."""
+    return agent.poll_interval_seconds if agent.loop_enabled else 0
+
+
+def set_agent_loop(pool: ConnectionPool, agent_id: int, *,
+                   loop_enabled: Optional[bool] = None,
+                   poll_interval_seconds: Optional[int] = None) -> Optional[Agent]:
+    """Set a pull worker's loop policy. Only provided fields change. Interval is
+    bounded to 60..7200s (reject out-of-range)."""
+    sets: list[str] = []
+    params: list[Any] = []
+    if loop_enabled is not None:
+        sets.append("loop_enabled = %s"); params.append(loop_enabled)
+    if poll_interval_seconds is not None:
+        if not (60 <= poll_interval_seconds <= 7200):
+            raise ValueError("poll_interval_seconds must be between 60 and 7200")
+        sets.append("poll_interval_seconds = %s"); params.append(poll_interval_seconds)
+    if sets:
+        params.append(agent_id)
+        with pool.connection() as conn:
+            conn.execute(f"UPDATE agents SET {', '.join(sets)} WHERE id = %s", params)
+    return get_agent(pool, agent_id)
+
+
 def find_idle_agent(
-    pool: ConnectionPool, team: str, function: Optional[str] = None
+    pool: ConnectionPool, team: str, function: Optional[str] = None,
+    runtime: Optional[str] = None,
 ) -> Optional[Agent]:
+    """Pick an available agent for a team. `function` (dev/qa/lead) and `runtime`
+    (api/cli/external) narrow the search; idle agents rank ahead of busy ones.
+    Pull gates pass runtime='external' to require a live worker."""
+    clauses = ["team = %s", "status != 'offline'"]
+    params: list[Any] = [team]
+    if function:
+        clauses.append("function = %s")
+        params.append(function)
+    if runtime:
+        clauses.append("runtime = %s")
+        params.append(runtime)
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(Agent))
-        if function:
-            return cur.execute(
-                f"SELECT {_AGENT_COLS} FROM agents "
-                "WHERE team = %s AND function = %s AND status != 'offline' "
-                "ORDER BY (status = 'idle') DESC, id LIMIT 1",
-                (team, function),
-            ).fetchone()
         return cur.execute(
-            f"SELECT {_AGENT_COLS} FROM agents "
-            "WHERE team = %s AND status != 'offline' "
+            f"SELECT {_AGENT_COLS} FROM agents WHERE {' AND '.join(clauses)} "
             "ORDER BY (status = 'idle') DESC, id LIMIT 1",
-            (team,),
+            params,
         ).fetchone()
 
 
@@ -555,8 +785,12 @@ def create_adr(
     context = rationale (humans only). status='proposed' rules are inert until
     approve_adr promotes them."""
     with pool.connection() as conn, conn.transaction():
+        # Next number = max existing suffix in this domain + 1, NOT count(*).
+        # Count-based numbering collides after a delete/supersede (the trailing
+        # number can already be in use); adr_key is UNIQUE so that would error.
         n = conn.execute(
-            "SELECT count(*) FROM adrs WHERE domain = %s", (domain,)
+            "SELECT COALESCE(MAX(substring(adr_key from '[0-9]+$')::int), 0) "
+            "FROM adrs WHERE domain = %s", (domain,)
         ).fetchone()[0]
         adr_key = f"ADR-{domain.upper()}-{n + 1:03d}"
         row = conn.execute(
@@ -615,10 +849,72 @@ def approve_adr(pool: ConnectionPool, adr_key: str, actor: str = "human") -> dic
     return adr
 
 
+def deactivate_adr(pool: ConnectionPool, adr_key: str, actor: str = "human") -> dict[str, Any]:
+    """Reverse of approve: send an accepted rule back to 'proposed' (it stops
+    reaching agents immediately, but is kept for re-review)."""
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "UPDATE adrs SET status = 'proposed' "
+            "WHERE adr_key = %s AND status = 'accepted' "
+            f"RETURNING {', '.join(_ADR_COLS)}",
+            (adr_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"ADR {adr_key} not found or not in 'accepted' status")
+        return dict(zip(_ADR_COLS, row))
+
+
+def delete_adr(pool: ConnectionPool, adr_key: str) -> None:
+    """Permanently delete a 'proposed' ADR. Accepted/superseded rules cannot be
+    deleted (deactivate first) — keeps live governance from vanishing silently."""
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "DELETE FROM adrs WHERE adr_key = %s AND status = 'proposed' "
+            "RETURNING adr_key",
+            (adr_key,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"ADR {adr_key} not found or not in 'proposed' status")
+
+
+def update_adr(pool: ConnectionPool, adr_key: str, *, title: Optional[str] = None,
+               decision: Optional[str] = None, context: Optional[str] = None,
+               applies_to: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Edit an ADR's content (the SoT edit path). Only the provided fields change;
+    status is untouched, so an accepted rule stays live with corrected text. The
+    single source of truth lives here — render-agent-docs regenerates CLAUDE.md/
+    AGENTS.md from it."""
+    sets: list[str] = []
+    params: list[Any] = []
+    if title is not None:
+        sets.append("title = %s"); params.append(title)
+    if decision is not None:
+        sets.append("decision = %s"); params.append(decision)
+    if context is not None:
+        sets.append("context = %s"); params.append(context)
+    if applies_to is not None:
+        sets.append("applies_to = %s"); params.append(Jsonb(applies_to))
+    if not sets:
+        adr = get_adr(pool, adr_key)
+        if adr is None:
+            raise ValueError(f"ADR {adr_key} not found")
+        return adr
+    params.append(adr_key)
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            f"UPDATE adrs SET {', '.join(sets)} WHERE adr_key = %s "
+            f"RETURNING {', '.join(_ADR_COLS)}",
+            params,
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"ADR {adr_key} not found")
+        return dict(zip(_ADR_COLS, row))
+
+
 _MESSAGE_COLS = ["id", "from_team", "to_team", "subject", "body", "priority",
-                 "issue_id", "kind", "status", "created_at"]
+                 "issue_id", "kind", "status", "draft_response", "created_at"]
 _MESSAGE_SELECT = ("SELECT id, from_team, to_team, subject, body, priority, "
-                   "issue_id, kind, status, created_at FROM messages")
+                   "issue_id, kind, status, draft_response, created_at FROM messages")
 
 
 def create_message(
@@ -636,8 +932,7 @@ def create_message(
         row = conn.execute(
             "INSERT INTO messages (from_team, to_team, subject, body, priority, "
             "issue_id, kind, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-            "RETURNING id, from_team, to_team, subject, body, priority, issue_id, "
-            "kind, status, created_at",
+            f"RETURNING {', '.join(_MESSAGE_COLS)}",
             (from_team, to_team, subject, body, priority, issue_id, kind, status),
         ).fetchone()
     return dict(zip(_MESSAGE_COLS, row))
@@ -680,6 +975,209 @@ def archive_message(pool: ConnectionPool, message_id: int) -> None:
     with pool.connection() as conn:
         conn.execute("UPDATE messages SET status = 'archived' WHERE id = %s",
                      (message_id,))
+
+
+def list_responses(pool: ConnectionPool, to_team: Optional[str] = None) -> list[dict[str, Any]]:
+    """Inbound responses (kind='response') addressed to a team — the read side a
+    worker needs to consume an answer (comms_read). Newest first."""
+    where = " WHERE kind = 'response' AND status = 'sent'"
+    params: list[Any] = []
+    if to_team is not None:
+        where += " AND to_team = %s"
+        params.append(to_team)
+    with pool.connection() as conn:
+        rows = conn.execute(
+            _MESSAGE_SELECT + where + " ORDER BY id DESC", params).fetchall()
+    return [dict(zip(_MESSAGE_COLS, r)) for r in rows]
+
+
+def set_message_draft(pool: ConnectionPool, message_id: int, draft: str) -> None:
+    """Cache an agent-suggested reply for human review on the /orch/monitor page."""
+    with pool.connection() as conn:
+        conn.execute("UPDATE messages SET draft_response = %s WHERE id = %s",
+                     (draft, message_id))
+
+
+def respond_to_message(pool: ConnectionPool, message_id: int, body: str,
+                       from_team: str = "orchestration") -> dict[str, Any]:
+    """Human-reviewed answer to a queued question: send a response to the asker,
+    archive the original out of the queue, and (if the question was linked to an
+    issue) drop the answer into that issue's timeline so a resuming worker sees it.
+    Mirror of the engine's _comms_respond. Returns the created response message."""
+    origin = get_message(pool, message_id)
+    if origin is None:
+        raise ValueError(f"message {message_id} not found")
+    response = create_message(
+        pool, from_team=from_team, to_team=origin["from_team"],
+        subject=f"Re: {origin['subject']}", body=body,
+        priority=origin.get("priority", "medium"),
+        issue_id=origin.get("issue_id"), kind="response", status="sent",
+    )
+    archive_message(pool, message_id)
+    if origin.get("issue_id") is not None:
+        append_log(pool, origin["issue_id"], "comms_response_received",
+                   {"answer": body, "from_team": from_team,
+                    "origin_message_id": message_id})
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Contracts (migration 0011) — one row per endpoint, keyed (method, path).
+# The engine gates frontend work on these; backend agrees/registers them via MCP.
+# --------------------------------------------------------------------------- #
+
+_CONTRACT_COLS = ["id", "method", "path", "request_ref", "response_dto", "auth",
+                  "owner_team", "status", "version", "content_hash", "source_ref",
+                  "created_at", "updated_at"]
+_CONTRACT_SELECT = "SELECT " + ", ".join(_CONTRACT_COLS) + " FROM contracts"
+_SATISFIED = ("agreed", "live")
+
+
+def _contract_hash(method: str, path: str, request_ref: str, response_dto: str) -> str:
+    raw = f"{method.upper()}|{path}|{request_ref}|{response_dto}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def upsert_contract(
+    pool: ConnectionPool,
+    method: str,
+    path: str,
+    request_ref: str = "",
+    response_dto: str = "",
+    auth: str = "none",
+    owner_team: str = "backend",
+    status: str = "proposed",
+    version: str = "1.0",
+    source_ref: Optional[str] = None,
+) -> dict[str, Any]:
+    """Insert or fully update a contract (idempotent on method+path). Used by the
+    seed import and the contract_upsert MCP tool; recomputes content_hash."""
+    method = method.upper()
+    content_hash = _contract_hash(method, path, request_ref, response_dto)
+    with pool.connection() as conn:
+        row = conn.execute(
+            "INSERT INTO contracts (method, path, request_ref, response_dto, auth, "
+            "owner_team, status, version, content_hash, source_ref) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (method, path) DO UPDATE SET "
+            "request_ref = EXCLUDED.request_ref, response_dto = EXCLUDED.response_dto, "
+            "auth = EXCLUDED.auth, owner_team = EXCLUDED.owner_team, "
+            "status = EXCLUDED.status, version = EXCLUDED.version, "
+            "content_hash = EXCLUDED.content_hash, source_ref = EXCLUDED.source_ref, "
+            "updated_at = now() "
+            f"RETURNING {', '.join(_CONTRACT_COLS)}",
+            (method, path, request_ref, response_dto, auth, owner_team, status,
+             version, content_hash, source_ref),
+        ).fetchone()
+    return dict(zip(_CONTRACT_COLS, row))
+
+
+def propose_contract(
+    pool: ConnectionPool,
+    method: str,
+    path: str,
+    request_ref: str = "",
+    response_dto: str = "",
+    owner_team: str = "backend",
+    auth: str = "none",
+    source_ref: Optional[str] = None,
+) -> dict[str, Any]:
+    """Record a 'proposed' contract a consumer needs. If one already exists it is
+    left untouched (never downgrades an agreed/live contract) and returned as-is."""
+    method = method.upper()
+    content_hash = _contract_hash(method, path, request_ref, response_dto)
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO contracts (method, path, request_ref, response_dto, auth, "
+            "owner_team, status, content_hash, source_ref) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'proposed', %s, %s) "
+            "ON CONFLICT (method, path) DO NOTHING",
+            (method, path, request_ref, response_dto, auth, owner_team,
+             content_hash, source_ref),
+        )
+    return get_contract(pool, method, path)  # type: ignore[return-value]
+
+
+def set_contract_status(pool: ConnectionPool, method: str, path: str,
+                        status: str) -> dict[str, Any]:
+    """Move a contract to a new lifecycle status (e.g. agree_contract -> 'agreed')."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE contracts SET status = %s, updated_at = now() "
+            "WHERE method = %s AND path = %s "
+            f"RETURNING {', '.join(_CONTRACT_COLS)}",
+            (status, method.upper(), path),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"no contract {method.upper()} {path}")
+    return dict(zip(_CONTRACT_COLS, row))
+
+
+def get_contract(pool: ConnectionPool, method: str, path: str) -> Optional[dict[str, Any]]:
+    with pool.connection() as conn:
+        row = conn.execute(
+            _CONTRACT_SELECT + " WHERE method = %s AND path = %s",
+            (method.upper(), path),
+        ).fetchone()
+    return dict(zip(_CONTRACT_COLS, row)) if row else None
+
+
+def list_contracts(pool: ConnectionPool, status: Optional[str] = None,
+                   owner_team: Optional[str] = None) -> list[dict[str, Any]]:
+    clauses, params = [], []
+    if status:
+        clauses.append("status = %s")
+        params.append(status)
+    if owner_team:
+        clauses.append("owner_team = %s")
+        params.append(owner_team)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            _CONTRACT_SELECT + where + " ORDER BY path, method", params).fetchall()
+    return [dict(zip(_CONTRACT_COLS, r)) for r in rows]
+
+
+def contract_satisfied(pool: ConnectionPool, method: str, path: str) -> bool:
+    """True if an agreed or live contract exists for this endpoint."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM contracts WHERE method = %s AND path = %s AND status = ANY(%s)",
+            (method.upper(), path, list(_SATISFIED)),
+        ).fetchone()
+    return row is not None
+
+
+def add_issue_contract_deps(pool: ConnectionPool, issue_id: int,
+                            deps: list[dict[str, str]]) -> None:
+    """Record the endpoints a blocked issue is waiting on (contract_check)."""
+    if not deps:
+        return
+    with pool.connection() as conn, conn.transaction():
+        for d in deps:
+            conn.execute(
+                "INSERT INTO issue_contract_deps (issue_id, method, path) "
+                "VALUES (%s, %s, %s)",
+                (issue_id, d["method"].upper(), d["path"]),
+            )
+
+
+def list_issue_contract_deps(pool: ConnectionPool, issue_id: int) -> list[dict[str, Any]]:
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, issue_id, method, path, satisfied, created_at "
+            "FROM issue_contract_deps WHERE issue_id = %s ORDER BY id",
+            (issue_id,),
+        ).fetchall()
+    cols = ["id", "issue_id", "method", "path", "satisfied", "created_at"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def mark_contract_deps_satisfied(pool: ConnectionPool, issue_id: int) -> None:
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE issue_contract_deps SET satisfied = TRUE WHERE issue_id = %s",
+            (issue_id,))
 
 
 # --------------------------------------------------------------------------- #

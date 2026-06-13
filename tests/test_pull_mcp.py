@@ -1,0 +1,119 @@
+"""Pull-model MCP surface: report_work / list_my_work / heartbeat, and the
+verdict reviewer seeing pull-worker evidence (code_committed / tests_run)."""
+
+from __future__ import annotations
+
+from orchestrator import repository as repo
+from orchestrator.agents.reasoning import StubReasoner
+from orchestrator.engine.loop import Engine, TickSummary
+from orchestrator.mcp_server import tools_issues
+
+
+class _Recorder:
+    """Captures @mcp.tool()-decorated functions so we can call them directly."""
+
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self):
+        def deco(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+        return deco
+
+
+def _tools(pool):
+    rec = _Recorder()
+    tools_issues.register(rec, pool)
+    return rec.tools
+
+
+def test_report_work_logs_pointer_and_list_my_work_finds_it(pool):
+    tools = _tools(pool)
+    goal = repo.create_goal(pool, "g", pipeline="pull-1")
+    issue = repo.create_issue(pool, goal.id, "i", pipeline="pull-1", team="backend")
+    agent = repo.register_agent(pool, "backend", "dev", "external")
+    repo.claim_issue(pool, issue.id, agent.id)
+    repo.update_state(pool, issue.id, "in_progress", gate_type="implementation")
+
+    # the worker reports a pointer to work in its OWN repo
+    out = tools["report_work"](issue.id, sha="abc123", branch="issue-1",
+                               tests_passed=True, summary="added /health")
+    assert out["status"] == "ok"
+    committed = [e for e in repo.recent_events(pool, issue.id, limit=50)
+                 if e.event_type == "code_committed"]
+    assert len(committed) == 1
+    assert committed[0].payload["sha"] == "abc123"
+    assert committed[0].payload["tests_passed"] is True
+
+    # a poll loop finds its claimed work in one call
+    mine = tools["list_my_work"](agent.id)
+    assert [i["id"] for i in mine] == [issue.id]
+
+    # heartbeat refreshes liveness
+    assert tools["heartbeat"](agent.id)["status"] == "ok"
+    assert repo.agent_seconds_since_seen(pool, agent.id) is not None
+
+
+class _CapturingReasoner(StubReasoner):
+    def __init__(self):
+        self.captured = None
+
+    def gate_review(self, issue, gate_type, recent, *args, **kwargs):
+        self.captured = recent
+        return super().gate_review(issue, gate_type, recent, *args, **kwargs)
+
+
+def test_verdict_reviewer_sees_pull_worker_evidence(settings, pool):
+    goal = repo.create_goal(pool, "g", pipeline="pull-1")
+    issue = repo.create_issue(pool, goal.id, "i", pipeline="pull-1", team="backend")
+    # worker evidence, then the issue arrives at the qa_gate verdict (in_review)
+    repo.append_log(pool, issue.id, "code_committed",
+                    {"sha": "deadbeef", "tests_passed": True})
+    repo.append_log(pool, issue.id, "tests_run", {"passed": 7, "failures": 0})
+    repo.update_state(pool, issue.id, "in_review", gate_type="qa_gate")
+
+    reasoner = _CapturingReasoner()
+    eng = Engine(settings, pool, reasoner=reasoner)
+    eng._tick_rules = repo.list_adrs(pool, status="accepted")
+    eng._advance(TickSummary())
+
+    types = [r["event_type"] for r in reasoner.captured]
+    assert "code_committed" in types and "tests_run" in types
+    # evidence events carry their payload to the verdict; plain events do not
+    committed = next(r for r in reasoner.captured if r["event_type"] == "code_committed")
+    assert committed["payload"]["sha"] == "deadbeef"
+
+
+def test_heartbeat_reactivates_reclaimed_worker(pool):
+    tools = _tools(pool)
+    a = repo.register_agent(pool, "frontend", "dev", "external")
+    repo.set_agent_status(pool, a.id, "offline")            # simulate a reclaim
+    out = tools["heartbeat"](a.id)
+    assert out["reactivated"] is True
+    assert repo.get_agent(pool, a.id).status == "idle"      # back in the pool
+    # a healthy (idle/busy) agent is left as-is
+    repo.set_agent_status(pool, a.id, "busy")
+    assert tools["heartbeat"](a.id)["reactivated"] is False
+    assert repo.get_agent(pool, a.id).status == "busy"
+
+
+def test_heartbeat_returns_loop_cadence(pool):
+    tools = _tools(pool)
+    a = repo.register_agent(pool, "frontend", "dev", "external")
+    # default: loop off -> next_poll_seconds 0 (stop after queue drains)
+    hb = tools["heartbeat"](a.id)
+    assert hb["loop_enabled"] is False and hb["next_poll_seconds"] == 0
+    # enable looping with a custom cadence
+    repo.set_agent_loop(pool, a.id, loop_enabled=True, poll_interval_seconds=600)
+    hb = tools["heartbeat"](a.id)
+    assert hb["loop_enabled"] is True and hb["next_poll_seconds"] == 600
+
+
+def test_set_agent_loop_rejects_out_of_range(pool):
+    import pytest
+    a = repo.register_agent(pool, "backend", "dev", "external")
+    with pytest.raises(ValueError):
+        repo.set_agent_loop(pool, a.id, poll_interval_seconds=30)   # < 60
+    with pytest.raises(ValueError):
+        repo.set_agent_loop(pool, a.id, poll_interval_seconds=9999)  # > 7200

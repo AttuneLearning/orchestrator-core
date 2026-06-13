@@ -85,3 +85,53 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         """Append a non-transition event to an issue's log."""
         repo.append_log(pool, issue_id, event_type, payload or {})
         return {"status": "ok"}
+
+    @mcp.tool()
+    def heartbeat(agent_id: int) -> dict[str, Any]:
+        """Pull workers call this every poll: refreshes last_seen (so the engine's
+        liveness reclaim doesn't treat them as dead), reactivates a reclaimed
+        worker (offline -> idle), and returns the live loop policy so the worker
+        self-paces. `next_poll_seconds` is 0 when looping is disabled, meaning
+        'stop after the queue drains'; otherwise it's the idle poll cadence."""
+        repo.touch_agent(pool, agent_id)
+        agent = repo.get_agent(pool, agent_id)
+        reactivated = False
+        if agent is not None and agent.status == "offline":
+            repo.set_agent_status(pool, agent_id, "idle")
+            reactivated = True
+        loop_enabled = bool(agent.loop_enabled) if agent else False
+        return {
+            "status": "ok",
+            "reactivated": reactivated,
+            "loop_enabled": loop_enabled,
+            "next_poll_seconds": repo.agent_next_poll_seconds(agent) if agent else 0,
+        }
+
+    @mcp.tool()
+    def list_my_work(agent_id: int) -> list[dict[str, Any]]:
+        """Issues currently assigned to this pull worker and awaiting its action
+        (in_progress). One call for a poll loop to find what to do next."""
+        return [
+            asdict(i) for i in repo.list_issues(
+                pool, states=["in_progress"], assigned_agent=agent_id)
+        ]
+
+    @mcp.tool()
+    def report_work(issue_id: int, sha: str = "", branch: str = "",
+                    pr_url: str = "", tests_passed: Optional[bool] = None,
+                    summary: str = "") -> dict[str, str]:
+        """Record the code a pull worker produced (a `code_committed` event).
+        Reports a pointer to the work in the worker's OWN repo — the orchestrator
+        never holds or applies the code. The verdict gate consumes this as
+        evidence. Call before gate_decision to advance the gate."""
+        payload: dict[str, Any] = {"sha": sha}
+        if branch:
+            payload["branch"] = branch
+        if pr_url:
+            payload["pr_url"] = pr_url
+        if tests_passed is not None:
+            payload["tests_passed"] = tests_passed
+        if summary:
+            payload["summary"] = summary
+        repo.append_log(pool, issue_id, "code_committed", payload)
+        return {"status": "ok"}

@@ -1,17 +1,20 @@
 """FastAPI app for the ops dashboard.
 
 create_app(pool, settings) builds the app so tests can inject a pool. All data
-access goes through repository.py; the two POST routes call the slice-B directive
-functions (repository.apply_directive / resume_goal), which are the only audited
-way out of the off_rails latch and the paused-goal state.
+access goes through repository.py. The POST routes cover the human review
+actions: the slice-B directive functions (repository.apply_directive /
+resume_goal) — the only audited way out of the off_rails latch and the
+paused-goal state — plus promote/reject for goals externally suggested via MCP.
+Read rollups (fleet_summary / agents_with_staleness) are shared with the MCP
+status tools via orchestrator.monitoring.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from psycopg_pool import ConnectionPool
@@ -19,82 +22,59 @@ from psycopg_pool import ConnectionPool
 from .. import repository as repo
 from ..config import Settings, load_settings
 from ..db import get_pool
-from ..engine import focus
+from ..monitoring import agents_with_staleness, fleet_summary
 from . import templates
-
-_ACTIVE_STATES = ["backlog", "ready", "in_progress", "in_review", "blocked"]
-_STALE_AFTER_S = 600  # busy agent silent this long → flagged stale
-
-
-def _agents_with_staleness(pool: ConnectionPool) -> list[dict[str, Any]]:
-    from datetime import datetime, timezone
-
-    out = []
-    now = datetime.now(timezone.utc)
-    for a in repo.list_agents(pool):
-        d = asdict(a)
-        d["stale"] = bool(
-            a.status == "busy" and a.last_seen is not None
-            and (now - a.last_seen).total_seconds() > _STALE_AFTER_S
-        )
-        out.append(d)
-    return out
-
-
-def _fleet_summary(pool: ConnectionPool, settings: Settings) -> dict[str, Any]:
-    """Compose the fleet overview: state counts, the attention set, and focus %.
-
-    The attention set is what a human must act on:
-      - active issues tripping a mechanical signal (drifting, not yet quarantined)
-      - off_rails issues (already quarantined — awaiting a directive)
-      - paused goals (awaiting a resume)
-    Drift detection reuses focus.signals_after_directive — the exact predicate the
-    engine sweep uses to quarantine — so the dashboard and the engine never
-    disagree about which active issues are a concern. fleet_focus counts both
-    active and quarantined issues, so a quarantine visibly drops the score.
-    """
-    goals_list = [
-        {**asdict(g), "issue_count": repo.count_issues_for_goal(pool, g.id)}
-        for g in repo.list_all_goals(pool)
-    ]
-    active = repo.list_issues(pool, states=_ACTIVE_STATES)
-    flagged: list[dict[str, Any]] = []
-    for issue in active:
-        events = repo.recent_events(pool, issue.id, limit=200)
-        signals = focus.signals_after_directive(issue, events, settings.thresholds)
-        if signals:
-            flagged.append({"id": issue.id, "title": issue.title,
-                            "state": issue.state, "signals": signals})
-    quarantined = [
-        {"id": i.id, "title": i.title, "state": i.state, "signals": ["off_rails"]}
-        for i in repo.list_issues(pool, states=["off_rails"])
-    ]
-    paused_goals = [g for g in goals_list if g["state"] == "paused"]
-
-    attention = flagged + quarantined
-    denom = len(active) + len(quarantined)
-    return {
-        "goals": repo.count_by_state(pool, "goals"),
-        "issues": repo.count_by_state(pool, "issues"),
-        "active_issues": denom,
-        "flagged": len(attention),
-        "fleet_focus": focus.fleet_focus(denom, len(attention)),
-        "below_threshold": bool(attention or paused_goals),
-        "flagged_issues": attention,
-        "paused_goals": paused_goals,
-        "goals_list": goals_list,
-    }
 
 
 def create_app(pool: Optional[ConnectionPool] = None,
-               settings: Optional[Settings] = None) -> FastAPI:
+               settings: Optional[Settings] = None,
+               reasoner=None) -> FastAPI:
     settings = settings or load_settings()
     pool = pool or get_pool(settings)
     app = FastAPI(title="orchestrator-dashboard")
 
+    from ..pipelines import load_pipelines
+    from ..roster import load_roster
+    from ..engine.loop import MONITOR_TEAMS
+    _pipeline_names = sorted(load_pipelines(settings.pipelines))
+    _roster = load_roster(settings.roster)
+    # Drafts the suggested reply on the /orch/monitor page. Built once; tests
+    # inject a stub. make_reasoner picks the configured backend (e.g. Qwen).
+    if reasoner is None:
+        from ..agents.reasoning import make_reasoner
+        reasoner = make_reasoner(settings)
+    _reasoner = reasoner
+
+    def _monitor_pending() -> list:
+        # Pending questions for any monitor team, resolving aliases (e.g. 'arch')
+        # to the canonical team id so alias-addressed messages still surface.
+        out = []
+        for m in repo.pending_messages(pool):
+            team = _roster.resolve(m["to_team"])
+            if team is not None and team.id in MONITOR_TEAMS:
+                out.append(m)
+        return out
+
     @app.get("/", response_class=HTMLResponse)
-    def overview() -> str:
-        return templates.overview(_fleet_summary(pool, settings))
+    def overview(added: str = "") -> str:
+        summary = fleet_summary(pool, settings)
+        summary["suggested_goals"] = [asdict(g) for g in
+                                      repo.list_goals_by_state(pool, "suggested")]
+        summary["pipelines"] = _pipeline_names
+        summary["default_pipeline"] = settings.default_pipeline
+        return templates.overview(summary, flash=added)
+
+    @app.post("/goals")
+    def add_goal(title: str = Form(...), pipeline: str = Form(""),
+                 description: str = Form(""), decompose: str = Form("")):
+        from urllib.parse import quote
+        title = title.strip()
+        if not title:
+            return RedirectResponse("/", status_code=303)
+        pl = pipeline if pipeline in _pipeline_names else settings.default_pipeline
+        mode = decompose if decompose in ("single", "full") else None
+        repo.create_goal(pool, title, description.strip(), pipeline=pl, decompose=mode)
+        return RedirectResponse(f"/?added={quote(title)}", status_code=303)
 
     @app.get("/goals/{goal_id}", response_class=HTMLResponse)
     def goal_detail(goal_id: int):
@@ -123,9 +103,18 @@ def create_app(pool: Optional[ConnectionPool] = None,
         events = [asdict(e) for e in repo.issue_timeline(pool, issue_id)]
         return templates.issue_detail(asdict(issue), events)
 
+    @app.post("/issues/{issue_id}/cancel")
+    def cancel_issue(issue_id: int, reason: str = Form("")):
+        try:
+            repo.cancel_issue(pool, issue_id, reason=reason.strip(), actor="dashboard")
+        except ValueError:
+            pass  # already terminal — fall through to the detail page
+        return RedirectResponse(f"/issues/{issue_id}", status_code=303)
+
     @app.get("/agents", response_class=HTMLResponse)
     def agents() -> str:
-        return templates.agents_page(_agents_with_staleness(pool))
+        return templates.agents_page(agents_with_staleness(pool),
+                                     repo.recent_agent_activity(pool, 10))
 
     @app.get("/adrs", response_class=HTMLResponse)
     def adrs() -> str:
@@ -146,6 +135,21 @@ def create_app(pool: Optional[ConnectionPool] = None,
         repo.approve_adr(pool, adr_key, actor="dashboard")
         return RedirectResponse(f"/adrs/{adr_key}", status_code=303)
 
+    @app.post("/adrs/{adr_key}/update")
+    def adr_update(adr_key: str, decision: str = Form(...), context: str = Form("")):
+        repo.update_adr(pool, adr_key, decision=decision, context=context)
+        return RedirectResponse(f"/adrs/{adr_key}", status_code=303)
+
+    @app.post("/adrs/{adr_key}/deactivate")
+    def adr_deactivate(adr_key: str):
+        repo.deactivate_adr(pool, adr_key, actor="dashboard")
+        return RedirectResponse(f"/adrs/{adr_key}", status_code=303)
+
+    @app.post("/adrs/{adr_key}/delete")
+    def adr_delete(adr_key: str):
+        repo.delete_adr(pool, adr_key)
+        return RedirectResponse("/adrs", status_code=303)
+
     @app.post("/issues/{issue_id}/directive")
     def directive(issue_id: int):
         repo.apply_directive(pool, issue_id, "resume", note="dashboard", actor="dashboard")
@@ -156,10 +160,47 @@ def create_app(pool: Optional[ConnectionPool] = None,
         repo.resume_goal(pool, goal_id)
         return RedirectResponse(f"/goals/{goal_id}", status_code=303)
 
+    @app.post("/goals/{goal_id}/promote")
+    def promote_goal(goal_id: int):
+        # Human gate: accept an externally suggested goal into the work queue.
+        repo.promote_goal(pool, goal_id)
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/goals/{goal_id}/reject")
+    def reject_goal(goal_id: int):
+        repo.reject_goal(pool, goal_id)
+        return RedirectResponse("/", status_code=303)
+
+    @app.get("/orch/monitor", response_class=HTMLResponse)
+    def orch_monitor() -> str:
+        # Pending process/architecture questions for the orchestration team. For
+        # each, lazily draft a suggested reply (and cache it) for human review.
+        messages = _monitor_pending()
+        for m in messages:
+            if not m.get("draft_response"):
+                try:
+                    draft = _reasoner.draft_reply(m)
+                except Exception as exc:  # noqa: BLE001 - draft is best-effort
+                    draft = f"[draft unavailable: {exc}]"
+                repo.set_message_draft(pool, m["id"], draft)
+                m["draft_response"] = draft
+        return templates.orch_monitor(messages)
+
+    @app.post("/orch/monitor/{message_id}/respond")
+    def orch_respond(message_id: int, suggested: str = Form(""),
+                     override: str = Form("")):
+        # Human gate: send the override if provided, else the suggested draft.
+        body = override.strip() or suggested.strip()
+        if body:
+            repo.respond_to_message(pool, message_id, body)
+        return RedirectResponse("/orch/monitor", status_code=303)
+
     @app.get("/api/state")
     def api_state() -> JSONResponse:
-        summary = _fleet_summary(pool, settings)
-        summary["agents"] = _agents_with_staleness(pool)
+        summary = fleet_summary(pool, settings)
+        summary["agents"] = agents_with_staleness(pool)
+        summary["suggested_goals"] = [asdict(g) for g in
+                                      repo.list_goals_by_state(pool, "suggested")]
         # jsonable_encoder handles datetimes the stdlib json encoder can't.
         return JSONResponse(jsonable_encoder(summary))
 

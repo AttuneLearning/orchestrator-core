@@ -107,14 +107,14 @@ def test_happy_overview(settings, pool):
     assert resp.status_code == 200
     data = resp.json()
 
-    assert data["issues"].get("done", 0) == 2
+    assert data["issues"].get("done", 0) == 1
     assert data["fleet_focus"] == pytest.approx(1.0)
     assert data["flagged"] == 0
     assert data["below_threshold"] is False
 
     goals_list = data["goals_list"]
     assert len(goals_list) == 1
-    assert goals_list[0]["issue_count"] == 2
+    assert goals_list[0]["issue_count"] == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -295,3 +295,147 @@ def test_full_recovery_cycle(settings, pool):
         updated = repo.get_issue(pool, issue.id)
         assert updated.state == "done", \
             f"issue {updated.id} expected 'done', got {updated.state!r}"
+
+
+# --------------------------------------------------------------------------- #
+# 9. suggested-goal review surface
+# --------------------------------------------------------------------------- #
+
+def test_suggested_goals_surface_and_promote(settings, pool):
+    goal = repo.propose_goal(pool, "Agent idea", suggested_by="hermes",
+                             source="spotted a gap")
+    client = TestClient(create_app(pool, settings))
+
+    # appears in the overview HTML and the JSON state
+    html = client.get("/").text
+    assert "Suggested goals" in html and "Agent idea" in html
+    state = client.get("/api/state").json()
+    assert [g["title"] for g in state["suggested_goals"]] == ["Agent idea"]
+
+    resp = client.post(f"/goals/{goal.id}/promote", follow_redirects=False)
+    assert resp.status_code == 303
+    promoted = next(g for g in repo.list_all_goals(pool) if g.id == goal.id)
+    assert promoted.state == "backlog"
+
+
+def test_suggested_goal_reject_route(settings, pool):
+    goal = repo.propose_goal(pool, "Decline me")
+    client = TestClient(create_app(pool, settings))
+    resp = client.post(f"/goals/{goal.id}/reject", follow_redirects=False)
+    assert resp.status_code == 303
+    rejected = next(g for g in repo.list_all_goals(pool) if g.id == goal.id)
+    assert rejected.state == "rejected"
+
+
+# --------------------------------------------------------------------------- #
+# ADR lifecycle: deactivate (accepted -> proposed) + delete (proposed only)
+# --------------------------------------------------------------------------- #
+
+def test_adr_deactivate_and_delete_routes(settings, pool):
+    acc = repo.create_adr(pool, "UI", "FSD layering", "follow FSD", status="accepted")
+    prop = repo.create_adr(pool, "DEV", "Lint clean", "no lint errors", status="proposed")
+    client = TestClient(create_app(pool, settings))
+
+    # list page renders the right lifecycle buttons
+    body = client.get("/adrs").text
+    assert "/deactivate" in body and "Deactivate" in body   # accepted row
+    assert "/delete" in body and "Trash" in body            # proposed row
+
+    # deactivate the accepted ADR -> returns to proposed
+    r = client.post(f"/adrs/{acc['adr_key']}/deactivate", follow_redirects=False)
+    assert r.status_code == 303
+    assert repo.get_adr(pool, acc["adr_key"])["status"] == "proposed"
+
+    # delete the proposed ADR -> gone entirely
+    r = client.post(f"/adrs/{prop['adr_key']}/delete", follow_redirects=False)
+    assert r.status_code == 303
+    assert repo.get_adr(pool, prop["adr_key"]) is None
+
+    # guard: deleting a non-proposed (accepted) ADR is rejected
+    acc2 = repo.create_adr(pool, "API", "REST", "rest conventions", status="accepted")
+    with pytest.raises(Exception):
+        client.post(f"/adrs/{acc2['adr_key']}/delete", follow_redirects=False)
+
+
+# --------------------------------------------------------------------------- #
+# Agent activity feed on /agents
+# --------------------------------------------------------------------------- #
+
+def test_agents_page_shows_recent_activity(settings, pool):
+    agent = repo.register_agent(pool, "frontend", "dev", "external")
+    goal = repo.create_goal(pool, "G", pipeline="pull-fe")
+    issue = repo.create_issue(pool, goal.id, "Spinner", team="frontend", pipeline="pull-fe")
+    repo.claim_issue(pool, issue.id, agent.id)                      # -> assigned (claimed)
+    repo.append_log(pool, issue.id, "code_committed", {"sha": "abc123"})  # -> committed code
+    repo.append_log(pool, issue.id, "reclaimed", {"agent": agent.id})     # -> reclaimed
+
+    rows = repo.recent_agent_activity(pool, 10)
+    actions = {r["action"] for r in rows}
+    assert {"assigned (claimed)", "committed code", "reclaimed (went stale)"} <= actions
+    # attribution resolved to the agent (team/function joined)
+    committed = next(r for r in rows if r["action"] == "committed code")
+    assert committed["agent_id"] == agent.id and committed["team"] == "frontend"
+
+    body = TestClient(create_app(pool, settings)).get("/agents").text
+    assert "Recent agent activity" in body
+    assert "committed code" in body and "frontend/dev" in body
+
+
+# --------------------------------------------------------------------------- #
+# Add-a-goal form on the Fleet page
+# --------------------------------------------------------------------------- #
+
+def test_fleet_page_has_add_goal_form(settings, pool):
+    body = TestClient(create_app(pool, settings)).get("/").text
+    assert "Add a goal" in body
+    assert "action='/goals'" in body and "name='title'" in body
+
+
+def test_add_goal_route_creates_goal(settings, pool):
+    client = TestClient(create_app(pool, settings))
+    before = len(repo.list_all_goals(pool))
+    resp = client.post("/goals", data={"title": "Ship the health endpoint",
+                                        "pipeline": "pull-1"},
+                       follow_redirects=False)
+    assert resp.status_code == 303
+    goals = repo.list_all_goals(pool)
+    assert len(goals) == before + 1
+    g = [x for x in goals if x.title == "Ship the health endpoint"][0]
+    assert g.pipeline == "pull-1" and g.state == "backlog"
+
+    # unknown pipeline falls back to the default; blank title is ignored
+    client.post("/goals", data={"title": "x", "pipeline": "nope"}, follow_redirects=False)
+    assert [x for x in repo.list_all_goals(pool) if x.title == "x"][0].pipeline \
+        == settings.default_pipeline
+    n = len(repo.list_all_goals(pool))
+    client.post("/goals", data={"title": "   "}, follow_redirects=False)
+    assert len(repo.list_all_goals(pool)) == n   # blank title -> no goal
+
+
+def test_add_goal_with_description_and_flash(settings, pool):
+    client = TestClient(create_app(pool, settings))
+    assert "name='description'" in client.get("/").text          # description field present
+
+    resp = client.post("/goals", data={"title": "Goal with desc", "pipeline": "pull-1",
+                                        "description": "do the thing"},
+                       follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"].startswith("/?added=")        # redirect carries the flash
+    g = [x for x in repo.list_all_goals(pool) if x.title == "Goal with desc"][0]
+    assert g.description == "do the thing"
+
+    body = client.get("/", params={"added": "Goal with desc"}).text
+    assert "Added goal" in body and "Goal with desc" in body      # confirmation flash renders
+
+
+def test_adr_update_route_edits_decision(settings, pool):
+    a = repo.create_adr(pool, "ORCH", "loop", "old decision", status="accepted")
+    client = TestClient(create_app(pool, settings))
+    body = client.get(f"/adrs/{a['adr_key']}").text
+    assert "/update" in body and "name='decision'" in body     # edit form present
+    r = client.post(f"/adrs/{a['adr_key']}/update",
+                    data={"decision": "new rule", "context": "why"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    updated = repo.get_adr(pool, a["adr_key"])
+    assert updated["decision"] == "new rule" and updated["status"] == "accepted"

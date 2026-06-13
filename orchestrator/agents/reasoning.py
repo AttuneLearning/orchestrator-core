@@ -1,20 +1,48 @@
 """Reasoning agent.
 
-Uses the Anthropic SDK for structured decisions when ANTHROPIC_API_KEY is set;
-otherwise falls back to a deterministic StubReasoner so the engine runs and is
-testable in-session without a key or network. Both implement the same four
-operations the engine depends on:
+Makes the engine's structured decisions:
 
     decompose_goal(goal)        -> list[IssueSpec]
     plan_issue(issue)           -> str
     gate_review(issue, gate)    -> GateReview
     score_drift(issue, events)  -> float   (1.0 = perfectly on-track, 0.0 = adrift)
+    triage_message / assess_complexity / suggest_adr  (optional capabilities)
+
+Backends (select via REASONER, else auto):
+  * stub      — deterministic, network-free (default when no key/provider).
+  * anthropic — Anthropic API (ANTHROPIC_API_KEY; metered, NOT the subscription).
+  * openai    — any OpenAI-compatible endpoint (REASONER_BASE_URL/MODEL/API_KEY),
+                e.g. a locally hosted model.
+  * cli       — shells out to a local coder CLI (`claude -p ...`), so it runs on
+                your Claude subscription with no API key. Mirrors CliSessionWorker.
+
+The model backends share all prompts/parsing in _LLMReasoner; each only implements
+_ask(system, user) -> str. Capabilities stay duck-typed (engine uses getattr), so
+older reasoners keep working.
 """
 
 from __future__ import annotations
 
 import json
+import re
+import shlex
+import subprocess
+import tempfile
 from typing import Any, Optional, Protocol
+
+# METHOD /path tokens in free text, e.g. "GET /system/status". Used by the
+# deterministic stub's extract_endpoint_deps and as a fallback shape.
+_ENDPOINT_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/\S+)", re.IGNORECASE)
+
+
+def _parse_endpoints(text: str) -> list[dict[str, str]]:
+    """Extract unique {method, path} endpoint references from free text."""
+    seen: list[dict[str, str]] = []
+    for method, path in _ENDPOINT_RE.findall(text or ""):
+        dep = {"method": method.upper(), "path": path.rstrip(".,;)")}
+        if dep not in seen:
+            seen.append(dep)
+    return seen
 
 from ..config import Settings
 from ..models import Goal, Issue
@@ -33,17 +61,19 @@ class Reasoner(Protocol):
     def triage_message(self, message: dict[str, Any]) -> TriageDecision: ...
     def assess_complexity(self, issue: Issue) -> ComplexityAssessment: ...
     def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]: ...
+    def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]: ...
+    def draft_reply(self, message: dict[str, Any]) -> str: ...
 
 
 class StubReasoner:
     """Deterministic, network-free reasoner for hermetic runs and tests."""
 
     def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
-        specs = [
-            IssueSpec(title=f"Implement: {goal.title}", description=goal.description),
-            IssueSpec(title=f"Test: {goal.title}", description="Add tests and verify."),
-        ]
-        return specs[:max_subissues]
+        # One implementation issue. Verification (tests / typecheck / e2e) is an
+        # acceptance criterion the QA runner clears at its gates — never its own
+        # sub-issue (a separate "Test: …" issue just duplicates the QA gate).
+        return [IssueSpec(title=f"Implement: {goal.title}",
+                          description=goal.description)][:max_subissues]
 
     def plan_issue(self, issue: Issue, rules: str = "") -> str:
         return f"Plan for '{issue.title}': implement, add tests, verify, complete."
@@ -69,31 +99,31 @@ class StubReasoner:
         # Stub never proposes rules; gap-detection paths are test-injected.
         return None
 
+    def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]:
+        # Deterministic: pull "METHOD /path" tokens out of the issue text.
+        return _parse_endpoints(f"{issue.title}\n{issue.description}")
 
-class AnthropicReasoner:
-    """Structured decisions via the Anthropic SDK."""
+    def draft_reply(self, message: dict[str, Any]) -> str:
+        # Deterministic placeholder; the dashboard human reviews/overrides it.
+        return (f"[draft] Re: {message.get('subject', '')} — "
+                f"acknowledged from {message.get('from_team', '?')}.")
 
-    def __init__(self, settings: Settings):
-        from anthropic import Anthropic
 
-        self._model = settings.reasoning_model
-        self._client = Anthropic(api_key=settings.anthropic_api_key)
+class _LLMReasoner:
+    """Shared prompts + JSON parsing for every model-backed reasoner. Subclasses
+    implement _ask(system, user, max_tokens) -> str."""
 
-    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
-        resp = self._client.messages.create(
-            model=self._model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:  # pragma: no cover
+        raise NotImplementedError
 
     def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
         system = (
             "You decompose a software goal into independent, well-scoped issues. "
             f"Return at most {max_subissues} issues as a JSON array of objects with "
             'keys "title", "description", "team". Teams: backend, frontend, qa, '
-            "mobile, cloud, data-warehousing, platform. Output JSON only."
+            "mobile, cloud, data-warehousing, platform. Choose the team that owns "
+            "the work (a UI/frontend goal -> frontend, an API goal -> backend). "
+            "Output JSON only."
         )
         user = f"Goal: {goal.title}\n\nDetails: {goal.description}"
         data = extract_json(self._ask(system, user))
@@ -116,8 +146,7 @@ class AnthropicReasoner:
 
     def gate_review(self, issue, gate_type, recent=None, rules: str = "") -> GateReview:
         system = (
-            f"You are the reviewer for the '{gate_type}' gate of a 5-phase issue "
-            "pipeline (intake, implementation, qa_gate, completion, comms_response). "
+            f"You are the reviewer for the '{gate_type}' gate of an issue pipeline. "
             "Decide if the gate passes. If applicable rules are listed, verify "
             "each one; a violated rule fails the gate and its id goes in "
             '"violated_rules". Output JSON: {"passed": bool, "reasons": [str], '
@@ -202,8 +231,118 @@ class AnthropicReasoner:
             return None
         return data
 
+    def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]:
+        system = (
+            "List the backend API endpoints this frontend issue must CONSUME "
+            "(call) to be implemented — not endpoints it defines. Output JSON: "
+            '{"endpoints": [{"method": str, "path": str}]} with HTTP method '
+            "uppercase and path like /system/status. Empty list if none."
+        )
+        user = f"Issue: {issue.title}\nTeam: {issue.team}\n\n{issue.description}"
+        try:
+            data = extract_json(self._ask(system, user))
+        except Exception:  # noqa: BLE001 - degrade to text parsing on bad JSON
+            return _parse_endpoints(f"{issue.title}\n{issue.description}")
+        out: list[dict[str, str]] = []
+        for d in (data.get("endpoints", []) if isinstance(data, dict) else []):
+            method = str(d.get("method", "")).upper().strip()
+            path = str(d.get("path", "")).strip()
+            if method and path:
+                dep = {"method": method, "path": path}
+                if dep not in out:
+                    out.append(dep)
+        return out
+
+    def draft_reply(self, message: dict[str, Any]) -> str:
+        system = (
+            "You are the orchestration monitor drafting a reply to an inbound "
+            "cross-team question about how the orchestration process / system works. "
+            "A human will review and may override your draft before it is sent. "
+            "Answer concisely and concretely, with clear next steps. Plain text."
+        )
+        user = (
+            f"From: {message.get('from_team')}\nTo: {message.get('to_team')}\n"
+            f"Priority: {message.get('priority', 'medium')}\n"
+            f"Subject: {message.get('subject', '')}\n\n{message.get('body', '')}"
+        )
+        return self._ask(system, user, max_tokens=700)
+
+
+class AnthropicReasoner(_LLMReasoner):
+    """Structured decisions via the Anthropic API (metered; ANTHROPIC_API_KEY)."""
+
+    def __init__(self, settings: Settings):
+        from anthropic import Anthropic
+
+        self._model = settings.reasoning_model
+        self._client = Anthropic(api_key=settings.anthropic_api_key)
+
+    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        resp = self._client.messages.create(
+            model=self._model, max_tokens=max_tokens, system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+
+
+class OpenAIReasoner(_LLMReasoner):
+    """Structured decisions via any OpenAI-compatible endpoint (e.g. a locally
+    hosted model). Configure REASONER_BASE_URL / REASONER_MODEL / REASONER_API_KEY."""
+
+    def __init__(self, settings: Settings):
+        from openai import OpenAI
+
+        self._model = settings.reasoner_model or settings.reasoning_model
+        self._client = OpenAI(
+            base_url=settings.reasoner_base_url or None,
+            api_key=settings.reasoner_api_key or "not-needed",
+        )
+
+    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        resp = self._client.chat.completions.create(
+            model=self._model, max_tokens=max_tokens,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+        )
+        return resp.choices[0].message.content or ""
+
+
+class CliReasoner(_LLMReasoner):
+    """Structured decisions via a local coder CLI (default `claude -p "{prompt}"`),
+    running on your Claude subscription — no API key. The command template's
+    {prompt} placeholder receives the combined system+user prompt; stdout is parsed
+    as the model's response. Runs in a scratch cwd so it doesn't load a project
+    CLAUDE.md."""
+
+    _TIMEOUT_S = 180
+
+    def __init__(self, settings: Settings):
+        self._cmd = settings.reasoner_cli_cmd or 'claude -p "{prompt}"'
+        self._cwd = tempfile.mkdtemp(prefix="orch-reasoner-")
+
+    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        prompt = f"{system}\n\n{user}\n\nReturn only the requested output."
+        argv = [part.format(prompt=prompt) for part in shlex.split(self._cmd)]
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=self._TIMEOUT_S, cwd=self._cwd, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"cli reasoner exited {proc.returncode}: {proc.stderr[:300]}")
+        return proc.stdout.strip()
+
 
 def make_reasoner(settings: Settings) -> Reasoner:
-    if settings.anthropic_api_key:
+    """Select the reasoner backend. REASONER overrides; otherwise auto: anthropic
+    when a key is present, else the deterministic stub."""
+    provider = (settings.reasoner or "").lower().strip()
+    if not provider:
+        provider = "anthropic" if settings.anthropic_api_key else "stub"
+    if provider == "stub":
+        return StubReasoner()
+    if provider == "anthropic":
         return AnthropicReasoner(settings)
-    return StubReasoner()
+    if provider == "openai":
+        return OpenAIReasoner(settings)
+    if provider == "cli":
+        return CliReasoner(settings)
+    raise ValueError(f"unknown REASONER provider {provider!r} "
+                     "(expected stub|anthropic|openai|cli)")

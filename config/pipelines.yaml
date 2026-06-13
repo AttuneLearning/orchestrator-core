@@ -1,8 +1,9 @@
 # =============================================================================
 # Pipeline definitions. Each pipeline is an ordered list of gates that an issue
-# must pass. Seeded faithfully from the agent-workflow spec:
-#   agent-workflow/claude-workflow/teams/protocol.yaml -> issue_lifecycle.phases
-#   agent-workflow/claude-workflow/scaffolds/dev_communication/PROCESS_GUIDE.md
+# must pass. Seeded faithfully from the upstream agent-workflow spec
+# (github.com/AttuneLearning/agent-workflow @ 555ff00):
+#   claude-workflow/teams/protocol.yaml -> issue_lifecycle.phases
+#   claude-workflow/scaffolds/dev_communication/PROCESS_GUIDE.md
 #
 # The orchestrator state machine maps an issue's current gate onto
 # in_review[gate_type]; a passing gate_review advances to the next gate, a
@@ -92,3 +93,104 @@ pipelines:
         description: "Record findings and recommendation."
         exit_criteria:
           - "Findings recorded; session file exists"
+
+  # Pull lifecycle for live agentic coders (Claude Code / Codex / Aider). Pull
+  # gates (mode: pull) are claimed by a registered `external` worker of the
+  # gate's owner function, which edits/tests in its OWN repo and reports back via
+  # MCP; the engine assigns + observes but never runs a worker. Verdict gates
+  # (mode: verdict) are rendered by the reasoner / a human / a delegated reviewer.
+  # See docs/PULL_AGENTS.md and config/roster.example.pull.yaml.
+  pull-1:
+    name: "Pull lifecycle (live agentic coders)"
+    description: "Pull workers own repos; the lead/reviewer renders verdicts."
+    team: backend   # children inherit this; never re-derived from issue text
+    gates:
+      - type: intake
+        order: 1
+        owner: lead
+        mode: verdict
+        description: "Triage inbound work into actionable issues."
+      - type: implementation
+        order: 2
+        owner: dev
+        mode: pull
+        description: "Dev coder edits code and writes tests (TDD) in its repo."
+      - type: verification
+        order: 3
+        owner: qa
+        mode: pull
+        description: "QA runner executes the suite at depth, reports tests_run."
+      - type: qa_gate
+        order: 4
+        owner: lead
+        mode: verdict
+        description: "Reviewer/lead judges the diff + results: pass or decline."
+        on_failure: implementation
+      - type: completion
+        order: 5
+        owner: lead
+        mode: verdict
+        description: "Record the outcome and close the issue."
+      - type: comms_response
+        order: 6
+        owner: dev
+        mode: verdict
+        condition: triggered_by_message
+        description: "Send response to the originating team (when triggered)."
+
+  # Frontend pull lifecycle: same as pull-1 plus a dedicated E2E gate (Playwright)
+  # between unit verification and the reviewer verdict. The e2e gate is pull/owner
+  # qa — the QA runner executes `npm run e2e` and reports tests_run; the verdict
+  # reviewer then judges code + unit + e2e evidence. Needs the backend serving on
+  # :5160 (Playwright auto-starts the frontend dev server). See docs/PULL_AGENTS.md.
+  pull-fe:
+    name: "Pull lifecycle — frontend (with E2E)"
+    description: "Pull workers own the repo; unit + Playwright E2E gates; lead verdict."
+    team: frontend   # children inherit this; never re-derived from issue text
+    gates:
+      - type: intake
+        order: 1
+        owner: lead
+        mode: verdict
+        description: "Triage inbound work into actionable issues."
+      - type: contract_check
+        order: 2
+        owner: lead
+        mode: verdict
+        on_failure: intake
+        description: "Contract-first triage: every consumed API endpoint must have
+          an agreed/live contract, else request it from backend and block. Mechanical
+          + opt-in (contract_gate_enabled); inert for non new-endpoint work."
+      - type: implementation
+        order: 3
+        owner: dev
+        mode: pull
+        description: "Dev coder edits code and writes tests (TDD) in its repo."
+      - type: verification
+        order: 4
+        owner: qa
+        mode: pull
+        description: "QA runner runs unit tests (Vitest), reports tests_run."
+      - type: e2e
+        order: 5
+        owner: qa
+        mode: pull
+        description: "QA runner runs Playwright E2E, reports tests_run."
+        on_failure: implementation
+      - type: qa_gate
+        order: 6
+        owner: lead
+        mode: verdict
+        description: "Reviewer/lead judges code + unit + e2e: pass or decline."
+        on_failure: implementation
+      - type: completion
+        order: 7
+        owner: lead
+        mode: verdict
+        description: "Record the outcome and close the issue."
+      - type: comms_response
+        order: 8
+        owner: dev
+        mode: verdict
+        condition: triggered_by_message
+        description: "Send response to the originating team (when triggered)."

@@ -23,7 +23,9 @@ from typing import Callable, Optional
 from psycopg_pool import ConnectionPool
 
 from .. import adr_rules
+from .. import decomposition
 from .. import repository as repo
+from ..agents.base import GateReview, IssueSpec
 from ..config import Settings
 from ..models import GoalState, Issue, IssueState
 from ..pipelines import Pipeline, first_gate, load_pipelines
@@ -41,7 +43,20 @@ _ACTIVE_STATES = [
     IssueState.IN_REVIEW.value,
     IssueState.BLOCKED.value,
 ]
-_TERMINAL = {IssueState.DONE.value, IssueState.FAILED.value, IssueState.OFF_RAILS.value}
+_TERMINAL = {IssueState.DONE.value, IssueState.FAILED.value, IssueState.OFF_RAILS.value,
+             IssueState.CANCELLED.value}
+# States whose issues are still "live" work (a goal with any of these is not yet
+# settled, so its redundant siblings are not auto-cancelled).
+_LIVE = set(_ACTIVE_STATES)
+
+# work_types whose issues consume API endpoints and therefore go through the
+# contract_check gate (when contract_gate_enabled). Other kinds pass straight
+# through. detect_work_type tags 'new-endpoint' for api/route/endpoint work.
+CONTRACT_WORK_TYPES = {"new-endpoint"}
+
+# Teams whose inbound messages are NOT auto-decomposed into worker issues — they
+# queue pending for the human-reviewed /orch/monitor dashboard instead.
+MONITOR_TEAMS = {"orchestration"}
 
 
 @dataclass
@@ -51,6 +66,9 @@ class TickSummary:
     decomposed: int = 0
     subissues: int = 0
     unblocked: int = 0
+    contract_blocked: int = 0
+    alerts: int = 0
+    cancelled: int = 0
     adr_proposals: int = 0
     assigned: int = 0
     advanced: int = 0
@@ -58,6 +76,7 @@ class TickSummary:
     failed: int = 0
     quarantined: int = 0
     reengaged: int = 0
+    reclaimed: int = 0
     goals_done: int = 0
     goals_paused: int = 0
     errors: list[str] = field(default_factory=list)
@@ -65,8 +84,10 @@ class TickSummary:
     @property
     def did_work(self) -> bool:
         return any([self.ingested, self.rejected, self.decomposed, self.subissues,
-                    self.unblocked, self.adr_proposals, self.assigned, self.advanced,
-                    self.completed, self.failed, self.quarantined, self.reengaged,
+                    self.unblocked, self.contract_blocked, self.alerts,
+                    self.cancelled, self.adr_proposals,
+                    self.assigned, self.advanced, self.completed, self.failed,
+                    self.quarantined, self.reengaged, self.reclaimed,
                     self.goals_done, self.goals_paused])
 
 
@@ -108,6 +129,24 @@ class Engine:
         if issue.assigned_agent is not None:
             repo.set_agent_status(self.pool, issue.assigned_agent, "idle")
 
+    def _alert(self, summary: TickSummary, *, goal_id: int,
+               issue_id: Optional[int] = None, hold: bool = False, **detail) -> None:
+        """Raise an operator alert (decomposition cap / routing-invariant breach).
+
+        Logged as an 'alert' event so it surfaces in the timeline; when hold=True
+        the goal is paused so it lands in get_alerts' paused_goals attention set
+        (no silent truncation — the operator decides). Anchors to a representative
+        issue when one exists, else the goal's first issue (events are per-issue)."""
+        anchor = issue_id
+        if anchor is None:
+            siblings = repo.list_issues(self.pool, goal_id=goal_id)
+            anchor = siblings[0].id if siblings else None
+        if anchor is not None:
+            repo.append_log(self.pool, anchor, "alert", dict(detail, goal_id=goal_id))
+        if hold:
+            repo.set_goal_state(self.pool, goal_id, GoalState.PAUSED.value)
+        summary.alerts += 1
+
     def _implementation_worker(self, issue: Issue):
         """Pick the worker by the assigned agent's runtime (api default)."""
         if issue.assigned_agent is not None:
@@ -115,6 +154,17 @@ class Engine:
             if agent is not None and agent.runtime == "cli":
                 return self.cli_worker
         return self.worker
+
+    def _idle_worker_for(self, issue: Issue, gate):
+        """Find an agent to own `gate`. A pull gate requires an idle EXTERNAL
+        worker of the gate's owner function (the engine never works it). A verdict
+        gate takes an owner-function agent, else any team agent — a capacity token
+        for the reasoner/human verdict."""
+        if gate.mode == "pull":
+            return repo.find_idle_agent(self.pool, issue.team, gate.owner,
+                                        runtime="external")
+        return (repo.find_idle_agent(self.pool, issue.team, gate.owner)
+                or repo.find_idle_agent(self.pool, issue.team))
 
     def _applicable_rules(self, issue: Issue) -> list[dict]:
         """Accepted ADR rules matching this issue (work-type ∩ team ∩ repos).
@@ -175,6 +225,11 @@ class Engine:
                                         reason=f"unknown team {msg['to_team']!r}")
                     summary.rejected += 1
                     continue
+                if team.id in MONITOR_TEAMS:
+                    # Orchestration-monitor inbox: process/architecture questions
+                    # are never auto-decomposed into worker issues. They stay
+                    # pending for the human-reviewed /orch/monitor dashboard.
+                    continue
                 triage = getattr(self.reasoner, "triage_message", None)
                 if triage is None:
                     continue  # optional capability: leave message pending
@@ -210,16 +265,48 @@ class Engine:
                 repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
                 continue
             try:
-                specs = self.reasoner.decompose_goal(goal, self.t.max_subissues)
-                room = self.t.max_issues_per_goal
-                pipeline = goal.pipeline if goal.pipeline in self.pipelines \
+                pid = goal.pipeline if goal.pipeline in self.pipelines \
                     else self.settings.default_pipeline
-                for spec in specs[:room]:
-                    team = self.roster.resolve(spec.team)
-                    team_id = team.id if team else spec.team
-                    repo.create_issue(self.pool, goal.id, spec.title, spec.description,
-                                      team=team_id, pipeline=pipeline)
+                pipeline = self.pipelines[pid]
+                mode = decomposition.decompose_mode(
+                    goal.decompose, goal.title, goal.description)
+                specs = self.reasoner.decompose_goal(goal, self.t.max_subissues)
+                # Drop candidates that merely duplicate a QA gate — the runner owns
+                # verification; it is acceptance criteria on the impl issue, not its
+                # own issue (no standalone test/typecheck/e2e/bundle-output issues).
+                specs = decomposition.drop_qa_duplicates(specs)
+                if mode == decomposition.SINGLE:
+                    # Simple goal / explicit override: exactly one implementation
+                    # issue. Synthesize one if the filter emptied the list.
+                    specs = specs[:1] or [IssueSpec(
+                        title=f"Implement: {goal.title}", description=goal.description)]
+                if len(specs) > self.t.max_issues_per_goal:
+                    # Over-decomposition blowout: alert + hold rather than mint a
+                    # pile of unpullable issues (spec §3.1 — no silent truncation).
+                    self._alert(summary, goal_id=goal.id, hold=True,
+                                cap="max_issues_per_goal",
+                                wanted=len(specs), limit=self.t.max_issues_per_goal)
+                    continue
+                # Pipeline team wins: children inherit it and never re-derive team
+                # from issue text (the text inference misroutes pull-fe → backend).
+                created: list[tuple[int, str]] = []
+                for spec in specs:
+                    team_name = pipeline.team or spec.team
+                    team = self.roster.resolve(team_name)
+                    team_id = team.id if team else team_name
+                    issue = repo.create_issue(self.pool, goal.id, spec.title,
+                                              spec.description, team=team_id, pipeline=pid)
+                    created.append((issue.id, team_id))
                     summary.decomposed += 1
+                # Routing invariant: every child must resolve to a known team, and
+                # match the pipeline team when one is declared. A violation alerts +
+                # holds the goal rather than emitting misrouted/unpullable work.
+                violations = decomposition.routing_violations(
+                    created, pipeline.team, self.roster.resolve)
+                if violations:
+                    self._alert(summary, goal_id=goal.id, hold=True,
+                                invariant="routing", violations=violations)
+                    continue
                 repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
             except Exception as exc:  # noqa: BLE001 - isolate goal failures
                 summary.errors.append(f"decompose goal {goal.id}: {exc}")
@@ -232,6 +319,12 @@ class Engine:
         per goal (MAX_ISSUES_PER_GOAL)."""
         if issue.depth >= self.t.max_depth:
             return False
+        # A simple goal (or explicit single override) is never split — that fast-
+        # path is the primary guard against the over-decomposition blowout.
+        goal = repo.get_goal(self.pool, issue.goal_id)
+        if goal is not None and decomposition.decompose_mode(
+                goal.decompose, goal.title, goal.description) == decomposition.SINGLE:
+            return False
         # Optional capability: reasoners without an architect op never decompose.
         assess = getattr(self.reasoner, "assess_complexity", None)
         if assess is None:
@@ -239,16 +332,28 @@ class Engine:
         assessment = assess(issue)
         if not assessment.decompose:
             return False
-        room = self.t.max_issues_per_goal - repo.count_issues_for_goal(self.pool, issue.goal_id)
-        n = min(len(assessment.subissues), self.t.max_subissues, max(room, 0))
-        if n <= 0:
-            repo.append_log(self.pool, issue.id, "error",
-                            {"cap": "max_issues_per_goal",
-                             "wanted": len(assessment.subissues)})
+        # Architect output is implementation work only — drop QA-gate duplicates.
+        wanted_specs = decomposition.drop_qa_duplicates(assessment.subissues)
+        if not wanted_specs:
             return False
+        room = self.t.max_issues_per_goal - repo.count_issues_for_goal(self.pool, issue.goal_id)
+        if room <= 0:
+            # Per-goal cap reached: alert (don't silently drop work) but let this
+            # issue proceed undecomposed — it's legitimate work, not a blowout. The
+            # heavier hold-the-goal response is reserved for the _decompose blowout.
+            self._alert(summary, goal_id=issue.goal_id, issue_id=issue.id,
+                        cap="max_issues_per_goal", wanted=len(wanted_specs))
+            return False
+        n = min(len(wanted_specs), self.t.max_subissues,
+                self.t.max_children_per_parent, room)
+        if len(wanted_specs) > n:
+            # Wanted more than the width/depth caps allow — record it (not silent).
+            self._alert(summary, goal_id=issue.goal_id, issue_id=issue.id,
+                        cap="max_children_per_parent",
+                        wanted=len(wanted_specs), created=n)
         children = [
             repo.create_subissue(self.pool, issue, spec.title, spec.description)
-            for spec in assessment.subissues[:n]
+            for spec in wanted_specs[:n]
         ]
         self._transition(issue, IssueState.BLOCKED.value, event_type="decomposed",
                          payload={"children": [c.id for c in children]})
@@ -298,7 +403,22 @@ class Engine:
             try:
                 children = repo.list_issues(self.pool, parent_id=issue.id)
                 if not children:
-                    continue  # blocked for some other reason; not ours to resolve
+                    # Not decomposition — maybe blocked-by-contract (contract_check).
+                    # Release as soon as every needed endpoint has an agreed/live
+                    # contract; backend keeps building toward 'live' in parallel.
+                    deps = repo.list_issue_contract_deps(self.pool, issue.id)
+                    if deps and all(
+                        repo.contract_satisfied(self.pool, d["method"], d["path"])
+                        for d in deps
+                    ):
+                        repo.mark_contract_deps_satisfied(self.pool, issue.id)
+                        self._transition(
+                            issue, IssueState.READY.value,
+                            payload={"unblocked_by_contracts":
+                                     [f"{d['method']} {d['path']}" for d in deps]})
+                        summary.unblocked += 1
+                    continue  # otherwise blocked for some other reason; not ours
+                states = {c.state for c in children}
                 states = {c.state for c in children}
                 if states <= {IssueState.DONE.value}:
                     self._transition(issue, IssueState.READY.value,
@@ -313,6 +433,47 @@ class Engine:
                     summary.failed += 1
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"unblock issue {issue.id}: {exc}")
+
+    def _run_contract_check(self, issue: Issue, summary: TickSummary) -> bool:
+        """Contract-first triage for an endpoint-consuming issue. Returns True if
+        the issue was BLOCKED on missing contracts (caller skips the review
+        transition); False means the gate passes (proceed to review → next gate).
+
+        Opt-in (contract_gate_enabled) and scoped to CONTRACT_WORK_TYPES; the
+        endpoint-extraction reasoner op is optional (absent → no-op pass, so old
+        reasoners keep working)."""
+        if not getattr(self.settings, "contract_gate_enabled", False):
+            return False
+        if issue.work_type not in CONTRACT_WORK_TYPES:
+            return False
+        extract = getattr(self.reasoner, "extract_endpoint_deps", None)
+        if extract is None:
+            return False
+        deps = extract(issue) or []
+        missing = [d for d in deps
+                   if not repo.contract_satisfied(self.pool, d["method"], d["path"])]
+        if not missing:
+            return False
+        # Block: ask backend (one message) for the missing contracts and record
+        # the deps; _unblock releases the issue once each reaches agreed/live.
+        for d in missing:
+            repo.propose_contract(self.pool, d["method"], d["path"], owner_team="backend")
+        listing = ", ".join(f"{d['method']} {d['path']}" for d in missing)
+        repo.create_message(
+            self.pool, from_team=issue.team, to_team="backend",
+            subject=f"Contract(s) needed for issue #{issue.id}",
+            body=(f"Issue #{issue.id} ({issue.title}) consumes: {listing}. Please "
+                  "agree each contract (contract_agree) so the frontend can build "
+                  "against the shape, then implement the endpoint(s)."),
+            priority="high", issue_id=issue.id, kind="request",
+        )
+        repo.add_issue_contract_deps(self.pool, issue.id, missing)
+        self._transition(
+            issue, IssueState.BLOCKED.value, gate_type=issue.gate_type,
+            event_type="contract_blocked", payload={"missing": listing.split(", ")},
+        )
+        summary.contract_blocked += 1
+        return True
 
     def _assign(self, summary: TickSummary) -> None:
         for issue in repo.list_issues(self.pool, states=[IssueState.BACKLOG.value]):
@@ -344,8 +505,7 @@ class Engine:
                     self._transition(issue, IssueState.DONE.value, event_type="gate_pass")
                     summary.completed += 1
                     continue
-                agent = repo.find_idle_agent(self.pool, issue.team, gate.owner) \
-                    or repo.find_idle_agent(self.pool, issue.team)
+                agent = self._idle_worker_for(issue, gate)
                 if agent is None:
                     continue  # no capacity this tick; remains READY
                 repo.claim_issue(self.pool, issue.id, agent.id)
@@ -355,10 +515,56 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"assign issue {issue.id}: {exc}")
 
+        # Pull-gate (re)assignment: an issue advanced (by an external worker's
+        # gate_decision) into a pull gate keeps its previous gate's agent. Hand it
+        # to an idle external worker of the new gate's owner — releasing the
+        # carried-over agent — so dev→qa pull handoffs route correctly. Issues
+        # already owned by the right live external worker are left alone (it's
+        # working them out-of-band).
+        for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
+            try:
+                gate = self._pipeline(issue).gate(issue.gate_type or "")
+                if gate is None or gate.mode != "pull":
+                    continue
+                current = (repo.get_agent(self.pool, issue.assigned_agent)
+                           if issue.assigned_agent is not None else None)
+                if (current is not None and current.runtime == "external"
+                        and current.function == gate.owner):
+                    continue  # correctly owned by a live external worker
+                worker = repo.find_idle_agent(self.pool, issue.team, gate.owner,
+                                              runtime="external")
+                if worker is None:
+                    # No eligible external worker: release any carried-over agent
+                    # and leave the gate unassigned, waiting. (liveness handles a
+                    # worker that claims then dies.)
+                    if current is not None:
+                        self._release_agent(issue)
+                        repo.unassign_issue(self.pool, issue.id)
+                    continue
+                self._release_agent(issue)
+                repo.claim_issue(self.pool, issue.id, worker.id)
+                repo.append_log(self.pool, issue.id, "gate_enter",
+                                {"reassigned_to": worker.id, "gate": gate.type})
+                summary.assigned += 1
+            except Exception as exc:  # noqa: BLE001
+                summary.errors.append(f"reassign issue {issue.id}: {exc}")
+
     def _advance(self, summary: TickSummary) -> None:
         # Work step: IN_PROGRESS issues do their gate's work, then enter review.
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
             try:
+                gate = self._pipeline(issue).gate(issue.gate_type or "")
+                if issue.gate_type == "contract_check":
+                    # Mechanical, contract-first triage: pass through to review when
+                    # every consumed endpoint has an agreed/live contract; otherwise
+                    # request the missing contracts and block (handled in-place).
+                    if self._run_contract_check(issue, summary):
+                        continue
+                if gate is not None and gate.mode == "pull":
+                    # Pull gate: a live external worker owns the repo work and
+                    # drives the transition via MCP (report_work + gate_decision).
+                    # The engine is hands-off — no work, no review, no transition.
+                    continue
                 if issue.gate_type == "implementation":
                     self._implementation_worker(issue).implement(self.pool, issue)
                 elif issue.gate_type == "qa_gate" and self.settings.apply_enabled:
@@ -384,15 +590,26 @@ class Engine:
             try:
                 pipeline = self._pipeline(issue)
                 gate = pipeline.gate(issue.gate_type)
+                # Verdict evidence: include the payloads of pull-worker reports
+                # (what the coder committed, what the QA runner found) so the
+                # reviewer judges the actual work, not just the event sequence.
+                _evidence = {"code_committed", "tests_run", "verification"}
                 recent = [
-                    {"event_type": e.event_type, "to_state": e.to_state}
+                    ({"event_type": e.event_type, "to_state": e.to_state,
+                      "payload": e.payload} if e.event_type in _evidence
+                     else {"event_type": e.event_type, "to_state": e.to_state})
                     for e in repo.recent_events(self.pool, issue.id, limit=20)
                 ]
                 rules = self._applicable_rules(issue)
-                review = self._call_with_rules(
-                    self.reasoner.gate_review, issue, issue.gate_type, recent,
-                    rules=adr_rules.format_rules_block(rules),
-                )
+                if issue.gate_type == "contract_check":
+                    # The work phase already decided (passed, else it blocked and
+                    # never reached review) — auto-pass without a reasoner call.
+                    review = GateReview(passed=True, reasons=["contracts satisfied"])
+                else:
+                    review = self._call_with_rules(
+                        self.reasoner.gate_review, issue, issue.gate_type, recent,
+                        rules=adr_rules.format_rules_block(rules),
+                    )
                 outcome = apply_gate_decision(
                     pipeline, gate, passed=review.passed,
                     retry_count=issue.retry_count, retry_cap=self.t.retry_cap,
@@ -444,6 +661,39 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"sweep issue {issue.id}: {exc}")
 
+    def _reclaim(self, summary: TickSummary) -> None:
+        """Liveness for pull gates: a pull-gate issue whose external worker hasn't
+        been seen within agent_stale_seconds is reclaimed — the dead worker is
+        marked offline and the issue unassigned, so the _assign reassign scan can
+        hand it to a fresh worker. After reclaim_cap reclaims the issue is
+        quarantined (off_rails), matching the autonomous focus/off-rails latch."""
+        for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
+            try:
+                gate = self._pipeline(issue).gate(issue.gate_type or "")
+                if (gate is None or gate.mode != "pull"
+                        or issue.assigned_agent is None):
+                    continue
+                age = repo.agent_seconds_since_seen(self.pool, issue.assigned_agent)
+                if age is not None and age <= self.t.agent_stale_seconds:
+                    continue  # worker is alive
+                dead = issue.assigned_agent
+                n = sum(1 for e in repo.recent_events(self.pool, issue.id, limit=200)
+                        if e.event_type == "reclaimed") + 1
+                repo.set_agent_status(self.pool, dead, "offline")
+                repo.unassign_issue(self.pool, issue.id)
+                repo.append_log(self.pool, issue.id, "reclaimed",
+                                {"agent": dead, "count": n, "stale_seconds": age})
+                if n >= self.t.reclaim_cap:
+                    self._transition(issue, IssueState.OFF_RAILS.value,
+                                     gate_type=issue.gate_type, event_type="state_change",
+                                     payload={"reason": "reclaim_cap", "reclaims": n})
+                    repo.set_goal_state(self.pool, issue.goal_id, GoalState.PAUSED.value)
+                    summary.quarantined += 1
+                else:
+                    summary.reclaimed += 1
+            except Exception as exc:  # noqa: BLE001
+                summary.errors.append(f"reclaim issue {issue.id}: {exc}")
+
     def _reengage(self, summary: TickSummary) -> None:
         for issue in repo.list_issues(
             self.pool, states=[IssueState.IN_PROGRESS.value, IssueState.IN_REVIEW.value]
@@ -481,6 +731,7 @@ class Engine:
         self._unblock(summary)
         self._assign(summary)
         self._advance(summary)
+        self._reclaim(summary)
         self._sweep(summary)
         self._reengage(summary)
         self._reconcile(summary)

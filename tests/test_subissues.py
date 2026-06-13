@@ -87,10 +87,10 @@ def test_decompose_blocks_parent_until_children_done(settings, pool):
     engine.run()
 
     all_issues = repo.list_issues(pool, goal_id=goal.id)
-    # StubReasoner decomposes goal into 2 top-level issues; _DecomposingReasoner
-    # further decomposes the "Implement:..." one into 2 children.
-    assert len(all_issues) == 4, (
-        f"expected 4 issues (2 top-level + 2 sub); got {len(all_issues)}: "
+    # StubReasoner decomposes the goal into 1 top-level "Implement:" issue;
+    # _DecomposingReasoner further decomposes it into 2 children.
+    assert len(all_issues) == 3, (
+        f"expected 3 issues (1 top-level + 2 sub); got {len(all_issues)}: "
         f"{[i.title for i in all_issues]}"
     )
 
@@ -168,11 +168,11 @@ def test_depth_cap_prevents_grandchildren(settings, pool):
 # --------------------------------------------------------------------------- #
 
 def test_goal_cap_stops_decomposition(settings, pool):
-    """max_issues_per_goal=2 prevents any sub-issues being created.
+    """max_issues_per_goal=1 prevents any sub-issues being created.
 
-    StubReasoner.decompose_goal already creates 2 issues; the cap is already
-    reached, so _maybe_decompose must record an error event and let the parent
-    proceed as a normal issue.
+    StubReasoner.decompose_goal creates one "Implement:" issue, which already
+    reaches the cap, so _maybe_decompose must raise an alert event (no silent
+    truncation) and let the parent proceed undecomposed.
     """
     goal = repo.create_goal(pool, "Big feature", "hit the cap")
     repo.register_agent(pool, "backend", "dev")
@@ -180,24 +180,24 @@ def test_goal_cap_stops_decomposition(settings, pool):
 
     engine = _make_engine(settings, pool,
                           reasoner=_DecomposingReasoner(),
-                          max_issues_per_goal=2)
+                          max_issues_per_goal=1)
     engine.run()
 
     all_issues = repo.list_issues(pool, goal_id=goal.id)
-    assert len(all_issues) == 2, (
-        f"expected exactly 2 issues (no sub-issues created); got {len(all_issues)}: "
+    assert len(all_issues) == 1, (
+        f"expected exactly 1 issue (no sub-issues created); got {len(all_issues)}: "
         f"{[i.title for i in all_issues]}"
     )
 
-    # The would-be parent has an "error" event with cap == "max_issues_per_goal"
+    # The would-be parent has an "alert" event with cap == "max_issues_per_goal"
     parent = next((i for i in all_issues if i.title.startswith("Implement")), None)
     assert parent is not None, "Implement issue not found"
-    error_events = [
+    alert_events = [
         e for e in _events(pool, parent.id)
-        if e.event_type == "error" and e.payload.get("cap") == "max_issues_per_goal"
+        if e.event_type == "alert" and e.payload.get("cap") == "max_issues_per_goal"
     ]
-    assert len(error_events) >= 1, (
-        f"expected error event with cap=='max_issues_per_goal'; "
+    assert len(alert_events) >= 1, (
+        f"expected alert event with cap=='max_issues_per_goal'; "
         f"events: {[(e.event_type, e.payload) for e in _events(pool, parent.id)]}"
     )
 

@@ -45,7 +45,13 @@ _ALLOWED: dict[str, set[str]] = {
     IssueState.DONE.value: set(),
     IssueState.FAILED.value: set(),
     IssueState.OFF_RAILS.value: set(),
+    IssueState.CANCELLED.value: set(),
 }
+
+# cancelled is reachable from any non-done state (operator/auto triage of garbage
+# or superseded work). Like off_rails it is a deliberate escape, not part of the
+# autonomous gate flow — only repository.cancel_issue sets it.
+_CANCELLABLE = _ACTIVE | {IssueState.FAILED.value, IssueState.OFF_RAILS.value}
 
 
 def validate_transition(from_state: str, to_state: str, *, directive: bool = False) -> bool:
@@ -57,6 +63,8 @@ def validate_transition(from_state: str, to_state: str, *, directive: bool = Fal
     """
     if directive and from_state == IssueState.OFF_RAILS.value:
         return to_state == IssueState.IN_PROGRESS.value
+    if to_state == IssueState.CANCELLED.value:
+        return from_state in _CANCELLABLE
     if to_state == IssueState.OFF_RAILS.value:
         return from_state in _ACTIVE
     return to_state in _ALLOWED.get(from_state, set())

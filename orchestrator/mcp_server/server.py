@@ -10,7 +10,13 @@ from mcp.server.fastmcp import FastMCP
 
 from ..config import load_settings
 from ..db import get_pool
-from . import tools_issues, tools_memory, tools_skills
+from . import (
+    tools_contracts,
+    tools_issues,
+    tools_memory,
+    tools_skills,
+    tools_status,
+)
 
 
 def build_server() -> FastMCP:
@@ -20,6 +26,8 @@ def build_server() -> FastMCP:
     tools_issues.register(mcp, pool)
     tools_memory.register(mcp, pool)
     tools_skills.register(mcp, pool)
+    tools_status.register(mcp, pool, settings)
+    tools_contracts.register(mcp, pool)
     return mcp
 
 

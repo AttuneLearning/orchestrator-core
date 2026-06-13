@@ -1,4 +1,5 @@
-"""Skill MCP tools ported from the agent-workflow skill set.
+"""Skill MCP tools ported from the upstream agent-workflow skill set
+(github.com/AttuneLearning/agent-workflow @ 555ff00).
 
 These are the orchestrator-native counterparts of the slash-command skills
 (adr, comms, context, reflect, refine) defined in agent-workflow. They are thin
@@ -58,6 +59,22 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         return repo.approve_adr(pool, adr_key, actor=actor)
 
     @mcp.tool()
+    def adr_update(adr_key: str, title: Optional[str] = None,
+                   decision: Optional[str] = None, context: Optional[str] = None,
+                   work_types: Optional[list[str]] = None,
+                   teams: Optional[list[str]] = None,
+                   repos: Optional[list[str]] = None) -> dict[str, Any]:
+        """Edit an ADR's content (decision/context/title/selectors). Only provided
+        fields change; status is preserved (an accepted rule stays live with the
+        corrected text). This is the single-source-of-truth edit path."""
+        applies_to = None
+        if work_types is not None or teams is not None or repos is not None:
+            applies_to = {"work_types": work_types or [], "teams": teams or [],
+                          "repos": repos or []}
+        return repo.update_adr(pool, adr_key, title=title, decision=decision,
+                               context=context, applies_to=applies_to)
+
+    @mcp.tool()
     def comms_send(from_team: str, to_team: str, subject: str, body: str = "",
                    priority: str = "medium",
                    issue_id: Optional[int] = None) -> dict[str, Any]:
@@ -69,6 +86,13 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
     def comms_check(team: Optional[str] = None) -> list[dict[str, Any]]:
         """List inbound requests awaiting triage. Mirror of /comms check."""
         return repo.pending_messages(pool, to_team=team)
+
+    @mcp.tool()
+    def comms_read(team: Optional[str] = None) -> list[dict[str, Any]]:
+        """List inbound responses (answers) addressed to a team, newest first.
+        The read side of comms_send: how a worker consumes a reply to a question
+        it (or its team) raised."""
+        return repo.list_responses(pool, to_team=team)
 
     @mcp.tool()
     def context_load(scope: str = "global", topic: Optional[str] = None,

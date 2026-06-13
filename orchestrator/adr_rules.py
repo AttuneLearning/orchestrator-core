@@ -14,8 +14,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-# Work-type detection, ported from the agent-workflow /context skill's
-# keyword table. First matching bucket wins; order is the priority.
+# Work-type detection, ported from the upstream agent-workflow /context skill's
+# keyword table (github.com/AttuneLearning/agent-workflow @ 555ff00).
+# First matching bucket wins; order is the priority.
 WORK_TYPE_KEYWORDS: list[tuple[str, list[str]]] = [
     ("auth-change", ["auth", "permission", "access control", "role", "login", "rbac"]),
     ("new-endpoint", ["route", "endpoint", "api", "controller", "rest"]),

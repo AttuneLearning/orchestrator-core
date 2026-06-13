@@ -81,7 +81,7 @@ def test_happy_path(settings, pool):
     engine.run()
 
     issues = repo.list_issues(pool, goal_id=goal.id)
-    assert len(issues) == 2, "StubReasoner decomposes into exactly 2 issues"
+    assert len(issues) == 1, "StubReasoner decomposes into one implementation issue"
     for issue in issues:
         assert issue.state == "done", f"issue {issue.id} state={issue.state!r}"
 

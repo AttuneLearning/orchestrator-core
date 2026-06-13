@@ -24,24 +24,44 @@ class IssueState(str, Enum):
     BLOCKED = "blocked"
     FAILED = "failed"
     OFF_RAILS = "off_rails"
+    CANCELLED = "cancelled"  # terminal; operator/auto triage (no further work)
 
 
 class GoalState(str, Enum):
+    SUGGESTED = "suggested"  # externally proposed; inert until a human promotes
     BACKLOG = "backlog"
     PLANNING = "planning"
     ACTIVE = "active"
     PAUSED = "paused"
     DONE = "done"
+    REJECTED = "rejected"  # a suggestion a human declined
 
 
 class GateType(str, Enum):
-    """The five gates of pipeline #1 (PROCESS_GUIDE.md)."""
+    """The gates of the issue lifecycle (PROCESS_GUIDE.md).
+
+    The first five are pipeline #1; `verification` is the pull-model gate where a
+    QA runner executes the suite (config/pipelines.yaml `pull-1`).
+    """
 
     INTAKE = "intake"
+    CONTRACT_CHECK = "contract_check"  # contract-first triage (config/pipelines.yaml pull-fe)
     IMPLEMENTATION = "implementation"
+    VERIFICATION = "verification"
+    E2E = "e2e"
     QA_GATE = "qa_gate"
     COMPLETION = "completion"
     COMMS_RESPONSE = "comms_response"
+
+
+class ContractStatus(str, Enum):
+    """API contract lifecycle (migration 0011). A contract is *satisfied* (a
+    consumer may build against it) once it is agreed or live."""
+
+    PROPOSED = "proposed"      # shape requested; inert until the owner agrees
+    AGREED = "agreed"          # owner agreed the shape; consumers may build now
+    LIVE = "live"              # endpoint actually implemented
+    DEPRECATED = "deprecated"  # superseded; historical only
 
 
 class EventType(str, Enum):
@@ -64,6 +84,14 @@ class EventType(str, Enum):
     VERIFICATION = "verification"
     PROMOTED = "promoted"
     ADR_PROPOSED = "adr_proposed"
+    # Pull-model evidence reported by external workers via MCP. code_committed:
+    # {sha, branch, pr_url?, tests_passed?, diff?}; tests_run: {passed, failures,
+    # summary}. The verdict (gate_review) consumes these instead of running code.
+    CODE_COMMITTED = "code_committed"
+    TESTS_RUN = "tests_run"
+    CANCELLED = "cancelled"      # issue cancelled (operator/auto triage)
+    ALERT = "alert"              # decomposition cap / routing-invariant breach
+    CONTRACT_BLOCKED = "contract_blocked"  # contract_check held the issue on missing contracts
 
 
 @dataclass
@@ -75,6 +103,11 @@ class Goal:
     pipeline: str = "pipeline-1"
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    suggested_by: str = ""  # provenance for externally proposed goals
+    source: str = ""        # free-text rationale / origin of a suggestion
+    # Decomposition override (migration 0010): None = simple-goal heuristic;
+    # 'single' = exactly one implementation issue; 'full' = force decomposition.
+    decompose: Optional[str] = None
 
 
 @dataclass
@@ -103,11 +136,15 @@ class Issue:
 class Agent:
     id: int
     team: str
-    function: str = "dev"
-    runtime: str = "api"
+    function: str = "dev"      # dev | qa | lead (lead = reviewer / verdict)
+    runtime: str = "api"       # api | cli | external (external = pull daemon)
     status: str = "idle"
     last_seen: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    # Pull-loop policy (migration 0009). loop_enabled=false -> worker stops after
+    # draining its queue; true -> keeps polling every poll_interval_seconds.
+    loop_enabled: bool = False
+    poll_interval_seconds: int = 300
 
 
 @dataclass
@@ -128,3 +165,24 @@ class MemoryNote:
     scope: str
     body: str
     created_at: Optional[datetime] = None
+
+
+@dataclass
+class Contract:
+    """One API endpoint contract, keyed (method, path). The DB row is the
+    coordination layer the engine gates on; request_ref/response_dto/source_ref
+    are pointers into the owning repo's authoritative schema (migration 0011)."""
+
+    id: int
+    method: str
+    path: str
+    request_ref: str = ""
+    response_dto: str = ""
+    auth: str = "none"
+    owner_team: str = "backend"
+    status: str = ContractStatus.PROPOSED.value
+    version: str = "1.0"
+    content_hash: Optional[str] = None
+    source_ref: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
