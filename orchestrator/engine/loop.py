@@ -613,6 +613,14 @@ class Engine:
                     # The work phase already decided (passed, else it blocked and
                     # never reached review) — auto-pass without a reasoner call.
                     review = GateReview(passed=True, reasons=["contracts satisfied"])
+                elif issue.gate_type == "intake":
+                    # Intake is lightweight admission, NOT an ADR-compliance verdict.
+                    # ADR governance belongs at gates where the work exists (qa_gate/
+                    # completion); judging a not-yet-implemented issue's description
+                    # against rules like "ships matching tests" is structurally
+                    # premature (the tests can't exist yet) and rejects valid work.
+                    # Admit without a reasoner call — applies to every pipeline's intake.
+                    review = GateReview(passed=True, reasons=["admitted"])
                 else:
                     review = self._call_with_rules(
                         self.reasoner.gate_review, issue, issue.gate_type, recent,
