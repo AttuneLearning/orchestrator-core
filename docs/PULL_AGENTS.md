@@ -13,6 +13,32 @@ repo. Real agentic coders do that, in repos they were launched in, and report a
 **pointer** (commit SHA / PR / test result) back over MCP — the orchestrator never
 holds or applies the code.
 
+## Monorepo mode (one repo, worktree per agent)
+
+When the project is a **monorepo** (e.g. `AttuneLearning/cadencelms` with `apps/api`,
+`apps/web`, `packages/contracts`), activate the monorepo roster via `.env`:
+
+```
+ROSTER_FILE=config/roster.monorepo.yaml
+```
+
+Each team's `repos:` then names a **package path** (`apps/api`, `apps/web`,
+`packages/contracts`) rather than a separate repo — these only scope ADR rules; the
+orchestrator stays repo-agnostic. Pull workers all clone the **one** monorepo and
+launch in their **own git worktree scoped to their lane** so concurrent agents don't
+collide:
+
+```
+git -C /path/to/cadencelms worktree add ../wt-backend-dev    # backend-dev works apps/api
+git -C /path/to/cadencelms worktree add ../wt-frontend-dev   # frontend-dev works apps/web
+# launch each worker with --repo <its worktree>; render-agent-docs writes the
+# per-lane CLAUDE.md/AGENTS.md into apps/api & apps/web.
+```
+
+The shared `@cadencelms/contracts` package is the type SSOT; the TypeScript compiler
+enforces it across the repo, so cross-team contract drift fails the build in one PR.
+Switch back to per-repo teams with `ROSTER_FILE=config/roster.yaml`.
+
 ## The role taxonomy
 
 - **Dev coder** (`function: dev`, `mode: pull`) — writes code *and* tests (TDD).
