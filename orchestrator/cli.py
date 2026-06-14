@@ -298,7 +298,9 @@ def _cmd_serve_dashboard(args, settings) -> int:
 
     from .dashboard.app import create_app
 
-    app = create_app(get_pool(settings), settings)
+    # No explicit pool: let create_app build the multi-coordinator registry from
+    # config/instances.yaml (passing a pool forces the single-'default' test path).
+    app = create_app(settings=settings)
     print(f"dashboard: http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0

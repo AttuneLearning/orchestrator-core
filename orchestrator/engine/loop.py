@@ -755,6 +755,10 @@ class Engine:
         """Tick forever, sleeping between quiescent ticks. Ctrl-C returns cleanly."""
         try:
             while True:
+                try:
+                    repo.record_daemon_heartbeat(self.pool)
+                except Exception:  # noqa: BLE001 - liveness stamp must never stop the loop
+                    pass
                 summary = self.tick()
                 if on_tick is not None:
                     on_tick(summary)

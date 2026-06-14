@@ -29,22 +29,53 @@ from . import templates
 def create_app(pool: Optional[ConnectionPool] = None,
                settings: Optional[Settings] = None,
                reasoner=None) -> FastAPI:
-    settings = settings or load_settings()
-    pool = pool or get_pool(settings)
+    from . import context
+    from .instances import load_registry
+    # One dashboard, many coordinators (one per DB). The registry routes each
+    # request to the coordinator named by ?project=; an injected pool / no
+    # instances.yaml collapses to a single 'default' coordinator (current behavior).
+    registry = load_registry(settings=settings, pool=pool)
+    context.install_registry(registry)
+    base_settings = registry.get(registry.default_key).settings
     app = FastAPI(title="orchestrator-dashboard")
 
+    # Request-scoped proxies — these resolve to whichever coordinator ?project=
+    # selected, so the route bodies below stay coordinator-agnostic.
+    pool = context.POOL
+    settings = context.SETTINGS
+    _roster = context.ROSTER
+
     from ..pipelines import load_pipelines
-    from ..roster import load_roster
     from ..engine.loop import MONITOR_TEAMS
-    _pipeline_names = sorted(load_pipelines(settings.pipelines))
-    _roster = load_roster(settings.roster)
-    # Drafts the suggested reply on the /orch/monitor page. Built once; tests
-    # inject a stub. make_reasoner picks the configured backend (e.g. Qwen).
+    # Drafts the suggested reply on the /orch/monitor page. Built once from the
+    # default coordinator's settings; tests inject a stub. make_reasoner picks the
+    # configured backend (e.g. Qwen).
     if reasoner is None:
         from ..agents.reasoning import make_reasoner
-        reasoner = make_reasoner(settings)
+        reasoner = make_reasoner(base_settings)
     _reasoner = reasoner
     from ..monitor_kb import retrieve_context
+
+    def _pipelines() -> list:
+        return sorted(load_pipelines(settings.pipelines))
+
+    @app.middleware("http")
+    async def _coordinator_scope(request, call_next):
+        key = registry.resolve_key(request.query_params.get("project"))
+        token = context.set_current(registry.get(key))
+        try:
+            response = await call_next(request)
+        finally:
+            context.reset_current(token)
+        # Preserve the coordinator across redirects: a write must return to the
+        # same DB its form was submitted against (default stays on clean URLs).
+        if response.status_code in (301, 302, 303, 307, 308):
+            loc = response.headers.get("location", "")
+            if (loc.startswith("/") and "://" not in loc
+                    and "project=" not in loc and key != registry.default_key):
+                sep = "&" if "?" in loc else "?"
+                response.headers["location"] = f"{loc}{sep}project={key}"
+        return response
 
     def _monitor_pending() -> list:
         # Pending questions for any monitor team, resolving aliases (e.g. 'orch-monitor')
@@ -61,7 +92,7 @@ def create_app(pool: Optional[ConnectionPool] = None,
         summary = fleet_summary(pool, settings)
         summary["suggested_goals"] = [asdict(g) for g in
                                       repo.list_goals_by_state(pool, "suggested")]
-        summary["pipelines"] = _pipeline_names
+        summary["pipelines"] = _pipelines()
         summary["default_pipeline"] = settings.default_pipeline
         # Orchestrator-queue alert badge + recent correspondence for the side panel.
         summary["open_monitor_msgs"] = len(_monitor_pending())
@@ -75,7 +106,7 @@ def create_app(pool: Optional[ConnectionPool] = None,
         title = title.strip()
         if not title:
             return RedirectResponse("/", status_code=303)
-        pl = pipeline if pipeline in _pipeline_names else settings.default_pipeline
+        pl = pipeline if pipeline in _pipelines() else settings.default_pipeline
         mode = decompose if decompose in ("single", "full") else None
         repo.create_goal(pool, title, description.strip(), pipeline=pl, decompose=mode)
         return RedirectResponse(f"/?added={quote(title)}", status_code=303)

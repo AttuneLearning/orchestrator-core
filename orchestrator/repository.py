@@ -795,6 +795,30 @@ def set_system_state(pool: ConnectionPool, key: str, value: str) -> None:
         )
 
 
+_DAEMON_HEARTBEAT_KEY = "daemon_heartbeat"
+
+
+def record_daemon_heartbeat(pool: ConnectionPool) -> None:
+    """Stamp the daemon's liveness (server clock). The multi-coordinator dashboard
+    reads each instance's heartbeat age to show live / idle / unreachable."""
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO system_state (key, value) VALUES (%s, now()::text) "
+            "ON CONFLICT (key) DO UPDATE SET value = now()::text, updated_at = now()",
+            (_DAEMON_HEARTBEAT_KEY,),
+        )
+
+
+def daemon_heartbeat_age_seconds(pool: ConnectionPool) -> Optional[float]:
+    """Seconds since the daemon last ticked, by the DB's own clock (None if never)."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT EXTRACT(EPOCH FROM now() - value::timestamptz) FROM system_state "
+            "WHERE key = %s", (_DAEMON_HEARTBEAT_KEY,),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # ADRs & messages (skill-tool backing)
 # --------------------------------------------------------------------------- #

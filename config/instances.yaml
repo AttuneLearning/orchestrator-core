@@ -1,0 +1,23 @@
+# Coordinators this dashboard can switch between via ?project=<key>.
+# One database == one coordinator (DB-per-project model). The dashboard reads
+# this file to build the project dropdown and to route each request to the right
+# DB; the daemon for each project must run against the same DATABASE_URL.
+#
+# Secrets stay in the environment: `database_url_env` names the env var holding
+# that coordinator's DATABASE_URL, so this file is safe to commit. (`database_url`
+# may be given literally for throwaway/local use, but prefer the env indirection.)
+# The dashboard process must have every referenced env var set.
+
+default: cadencelms
+
+instances:
+  cadencelms:
+    label: CadenceLMS
+    database_url_env: DATABASE_URL          # reuses the instance .env
+    roster_file: config/roster.monorepo.yaml
+
+  # Add another project by pointing at its own database + roster:
+  # acme:
+  #   label: Acme LMS
+  #   database_url_env: DATABASE_URL_ACME
+  #   roster_file: config/roster.acme.yaml

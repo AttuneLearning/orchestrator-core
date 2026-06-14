@@ -7,8 +7,11 @@ string; page() wraps a body fragment in the shared shell.
 
 from __future__ import annotations
 
+import re
 from html import escape
 from typing import Any, Optional
+
+from . import context
 
 _CSS = """
   :root { --bg:#0f1115; --panel:#1a1d24; --ink:#e6e6e6; --muted:#8a91a0;
@@ -72,20 +75,60 @@ def _state(s: str) -> str:
     return f'<span class="pill s-{escape(s)}">{escape(s)}</span>'
 
 
+_STATUS_DOT = {"live": "🟢", "idle": "🟡", "down": "🔴"}
+
+
+def _coordinator_picker() -> str:
+    """A dropdown to switch coordinators (?project=). Hidden when only one exists."""
+    if not context.show_picker():
+        return ""
+    opts = context.instance_options()
+    options = "".join(
+        f"<option value='{escape(o['key'])}'{' selected' if o['current'] else ''}>"
+        f"{_STATUS_DOT.get(o['status'], '')} {escape(o['label'])}</option>"
+        for o in opts
+    )
+    js = ("var u=new URL(window.location);u.searchParams.set('project',this.value);"
+          "window.location=u.toString();")
+    return (f"<select title='Coordinator' onchange=\"{js}\" "
+            "style='margin-left:auto;background:var(--bg);color:var(--ink);"
+            "border:1px solid var(--line);border-radius:5px;padding:4px 8px;font:inherit'>"
+            f"{options}</select>")
+
+
+def _with_project(html: str) -> str:
+    """Thread the active coordinator through every internal link/form so navigation
+    and writes stay on the same DB. No-op on the default coordinator (clean URLs)."""
+    proj = context.current_key()
+    if not proj or proj == context.default_key():
+        return html
+
+    def repl(m: "re.Match") -> str:
+        attr, url = m.group(1), m.group(2)
+        if url.startswith("//") or "project=" in url:
+            return m.group(0)
+        sep = "&" if "?" in url else "?"
+        return f"{attr}='{url}{sep}project={proj}'"
+
+    return re.sub(r"(href|action)='(/[^']*)'", repl, html)
+
+
 def page(title: str, body: str) -> str:
-    return (
+    html = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>{escape(title)} · orchestrator</title><style>{_CSS}</style></head><body>"
-        "<header><nav>"
+        "<header><nav style='display:flex;align-items:center'>"
         "<a href='/'>Fleet</a><a href='/agents'>Agents</a>"
         "<a href='/orch/monitor'>Monitor</a>"
         "<a href='/contracts'>Contracts</a>"
         "<a href='/adrs'>ADRs</a>"
         "<a href='/api/state'>JSON</a>"
+        f"{_coordinator_picker()}"
         "</nav></header><main>"
         f"{body}"
         "</main></body></html>"
     )
+    return _with_project(html)
 
 
 _MON_TA = ("width:100%;max-width:760px;padding:6px;background:var(--panel);"
