@@ -256,6 +256,8 @@ class Engine:
 
     def _decompose(self, summary: TickSummary) -> None:
         for goal in repo.list_open_goals(self.pool):
+            if goal.kind == "maintenance":
+                continue  # a standing backlog container — never reasoner-decomposed
             if goal.state == GoalState.BACKLOG.value:
                 repo.set_goal_state(self.pool, goal.id, GoalState.PLANNING.value)
                 goal.state = GoalState.PLANNING.value
@@ -497,7 +499,13 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"plan issue {issue.id}: {exc}")
 
-        for issue in repo.list_issues(self.pool, states=[IssueState.READY.value]):
+        # Maintenance backfill: standard work claims idle workers first; a
+        # maintenance issue is assignable only when its team has no standard work
+        # ready or in flight (focus.select_assignable, pure).
+        ready = repo.list_issues(self.pool, states=[IssueState.READY.value])
+        in_progress = repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value])
+        maint_ids = repo.maintenance_goal_ids(self.pool)
+        for issue in focus.select_assignable(ready, in_progress, maint_ids):
             try:
                 gate = first_gate(self._pipeline(issue),
                                   triggered_by_message=issue.triggered_by_message)
@@ -708,6 +716,8 @@ class Engine:
 
     def _reconcile(self, summary: TickSummary) -> None:
         for goal in repo.list_open_goals(self.pool):
+            if goal.kind == "maintenance":
+                continue  # perpetual standing backlog — never auto-complete/pause
             issues = repo.list_issues(self.pool, goal_id=goal.id)
             if not issues:
                 continue

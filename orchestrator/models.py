@@ -108,6 +108,10 @@ class Goal:
     # Decomposition override (migration 0010): None = simple-goal heuristic;
     # 'single' = exactly one implementation issue; 'full' = force decomposition.
     decompose: Optional[str] = None
+    # Goal kind (migration 0017): 'standard' | 'maintenance'. A maintenance goal is
+    # a perpetual standing backlog whose issues backfill idle team capacity (worked
+    # only when the team has no standard work) and which never auto-completes.
+    kind: str = "standard"
 
 
 @dataclass

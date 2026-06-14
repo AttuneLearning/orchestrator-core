@@ -97,11 +97,40 @@ def _cmd_add_goal(args, settings) -> int:
         print(f"unknown pipeline {args.pipeline!r}; available: {', '.join(sorted(known))}")
         return 1
     pool = get_pool(settings)
-    goal = repo.create_goal(pool, args.title, args.description or "",
-                            pipeline=args.pipeline,
-                            decompose=getattr(args, "decompose", None) or None)
-    note = f" decompose={goal.decompose}" if goal.decompose else ""
-    print(f"created goal {goal.id}: {goal.title} (pipeline={goal.pipeline}{note})")
+    maintenance = getattr(args, "maintenance", False)
+    goal = repo.create_goal(
+        pool, args.title, args.description or "", pipeline=args.pipeline,
+        decompose=getattr(args, "decompose", None) or None,
+        kind="maintenance" if maintenance else "standard",
+        # A maintenance goal is a standing container, not decomposed: start it
+        # 'active' so it skips the backlog→planning decomposition leg outright.
+        state="active" if maintenance else "backlog")
+    if maintenance:
+        print(f"created maintenance goal {goal.id}: {goal.title} "
+              f"(perpetual backlog; add tasks with: add-task {goal.id} \"<title>\")")
+    else:
+        note = f" decompose={goal.decompose}" if goal.decompose else ""
+        print(f"created goal {goal.id}: {goal.title} (pipeline={goal.pipeline}{note})")
+    return 0
+
+
+def _cmd_add_task(args, settings) -> int:
+    """Append a task to a maintenance goal's standing backlog (worked when the
+    team is otherwise idle)."""
+    pool = get_pool(settings)
+    goal = repo.get_goal(pool, args.goal_id)
+    if goal is None:
+        print(f"no goal {args.goal_id}")
+        return 1
+    if goal.kind != "maintenance":
+        print(f"goal {goal.id} is '{goal.kind}', not a maintenance goal; "
+              "use add-goal --maintenance to create one")
+        return 1
+    pipeline = args.pipeline or goal.pipeline
+    issue = repo.create_issue(pool, goal.id, args.title, args.description or "",
+                              team=args.team, pipeline=pipeline)
+    print(f"added maintenance task {issue.id} to goal {goal.id}: {issue.title} "
+          f"(team={issue.team}, pipeline={issue.pipeline})")
     return 0
 
 
@@ -431,7 +460,20 @@ def build_parser() -> argparse.ArgumentParser:
     ag.add_argument("--decompose", choices=["single", "full"], default=None,
                     help="override the heuristic: 'single' = one impl issue, "
                          "'full' = force decomposition (default: auto)")
+    ag.add_argument("--maintenance", action="store_true",
+                    help="create a perpetual maintenance goal (standing backlog "
+                         "worked only when the team is otherwise idle)")
     ag.set_defaults(func=_cmd_add_goal)
+
+    at = sub.add_parser("add-task", help="append a task to a maintenance goal")
+    at.add_argument("goal_id", type=int)
+    at.add_argument("title")
+    at.add_argument("--description", default="")
+    at.add_argument("--team", default="backend",
+                    help="owning team (default: backend)")
+    at.add_argument("--pipeline", default=None,
+                    help="pipeline for this task (default: the goal's pipeline)")
+    at.set_defaults(func=_cmd_add_task)
 
     rn = sub.add_parser("run", help="drive the engine until quiescent")
     rn.add_argument("--max-ticks", type=int, default=100)

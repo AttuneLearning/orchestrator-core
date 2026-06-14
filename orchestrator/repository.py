@@ -63,25 +63,36 @@ def _pgvector_available(pool: ConnectionPool) -> bool:
 
 _GOAL_COLS = (
     "id, title, description, state, pipeline, created_at, updated_at, "
-    "suggested_by, source, decompose"
+    "suggested_by, source, decompose, kind"
 )
 
 
 def create_goal(pool: ConnectionPool, title: str, description: str = "",
                 pipeline: str = "pipeline-1", *, state: str = "backlog",
                 suggested_by: str = "", source: str = "",
-                decompose: Optional[str] = None) -> Goal:
+                decompose: Optional[str] = None, kind: str = "standard") -> Goal:
     with pool.connection() as conn:
         row = conn.execute(
             f"""
             INSERT INTO goals (title, description, state, pipeline,
-                               suggested_by, source, decompose)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                               suggested_by, source, decompose, kind)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING {_GOAL_COLS}
             """,
-            (title, description, state, pipeline, suggested_by, source, decompose),
+            (title, description, state, pipeline, suggested_by, source, decompose, kind),
         ).fetchone()
     return Goal(*row)
+
+
+def maintenance_goal_ids(pool: ConnectionPool) -> set[int]:
+    """IDs of active maintenance goals — the standing backlogs whose issues only
+    backfill idle team capacity (engine.focus.select_assignable)."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM goals WHERE kind = 'maintenance' "
+            "AND state NOT IN ('done', 'cancelled', 'rejected')"
+        ).fetchall()
+    return {r[0] for r in rows}
 
 
 def propose_goal(pool: ConnectionPool, title: str, description: str = "",
@@ -137,9 +148,8 @@ def list_open_goals(pool: ConnectionPool) -> list[Goal]:
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(Goal))
         return cur.execute(
-            """
-            SELECT id, title, description, state, pipeline, created_at, updated_at,
-                   suggested_by, source, decompose
+            f"""
+            SELECT {_GOAL_COLS}
             FROM goals
             WHERE state NOT IN ('done', 'paused', 'suggested', 'rejected')
             ORDER BY id
@@ -153,8 +163,7 @@ def list_all_goals(pool: ConnectionPool) -> list[Goal]:
     with pool.connection() as conn:
         cur = conn.cursor(row_factory=class_row(Goal))
         return cur.execute(
-            "SELECT id, title, description, state, pipeline, created_at, updated_at, "
-            "suggested_by, source, decompose FROM goals ORDER BY id"
+            f"SELECT {_GOAL_COLS} FROM goals ORDER BY id"
         ).fetchall()
 
 

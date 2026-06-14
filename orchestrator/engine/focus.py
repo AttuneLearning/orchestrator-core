@@ -17,6 +17,33 @@ REPEATED_ERROR_LIMIT = 3
 OSCILLATION_LIMIT = 3
 
 
+def select_assignable(
+    ready: Iterable[Issue],
+    in_progress: Iterable[Issue],
+    maintenance_goal_ids: Iterable[int],
+) -> list[Issue]:
+    """Order this tick's READY issues for assignment, applying the maintenance
+    backfill rule: a maintenance issue (one whose goal is a maintenance goal) is
+    only assignable to a team that has NO standard work pending — i.e. no standard
+    issue that is READY or IN_PROGRESS for that team. Standard work is returned
+    first (oldest id first), then eligible maintenance work, so real work always
+    claims idle workers before maintenance backfills the remainder. Pure."""
+    maint = set(maintenance_goal_ids)
+    ready = list(ready)
+
+    def is_maint(i: Issue) -> bool:
+        return i.goal_id in maint
+
+    # Teams that still have standard (non-maintenance) work queued or in flight.
+    busy_teams = {i.team for i in ready if not is_maint(i)}
+    busy_teams |= {i.team for i in in_progress if not is_maint(i)}
+
+    standard = sorted((i for i in ready if not is_maint(i)), key=lambda i: i.id)
+    backfill = sorted((i for i in ready if is_maint(i) and i.team not in busy_teams),
+                      key=lambda i: i.id)
+    return standard + backfill
+
+
 def mechanical_signals(
     issue: Issue, events: Iterable[IssueEvent], thresholds: Thresholds
 ) -> list[str]:
