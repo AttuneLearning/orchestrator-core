@@ -337,20 +337,6 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
             "Review and issue a directive below.</div>"
         )
 
-    paused_html = ""
-    if paused:
-        prows = "".join(
-            f"<tr><td><a href='/goals/{g['id']}'>#{g['id']}</a></td>"
-            f"<td>{escape(g['title'])}</td>"
-            f"<td><form method='post' action='/goals/{g['id']}/resume'>"
-            "<button class='alt'>Resume</button></form></td></tr>"
-            for g in paused
-        )
-        paused_html = (
-            "<h2>Paused goals</h2><table><tr><th>Goal</th><th>Title</th>"
-            f"<th>Action</th></tr>{prows}</table>"
-        )
-
     suggested = summary.get("suggested_goals", [])
     suggested_html = ""
     if suggested:
@@ -383,25 +369,44 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
         if flagged_rows else "<h2>Flagged issues</h2><p class='muted'>None — all clear.</p>"
     )
 
-    def _goal_table(heading: str, items: list[dict[str, Any]], empty: str) -> str:
+    def _goal_actions(g: dict[str, Any], *, resume: bool, complete: bool) -> str:
+        btns = ""
+        if resume:
+            btns += (f"<form method='post' action='/goals/{g['id']}/resume'>"
+                     "<button class='alt'>Resume</button></form> ")
+        if complete:
+            btns += (f"<form method='post' action='/goals/{g['id']}/complete'>"
+                     "<button class='ok'>Mark complete</button></form>")
+        return btns
+
+    def _goal_table(heading: str, items: list[dict[str, Any]], empty: str,
+                    *, resume: bool = False, complete: bool = False) -> str:
+        actions = resume or complete
         rows = "".join(
             f"<tr><td><a href='/goals/{g['id']}'>#{g['id']}</a></td>"
             f"<td>{_state(g['state'])}</td><td>{escape(g['title'])}</td>"
-            f"<td>{g['issue_count']}</td></tr>"
+            f"<td>{g['issue_count']}</td>"
+            + (f"<td>{_goal_actions(g, resume=resume, complete=complete)}</td>"
+               if actions else "")
+            + "</tr>"
             for g in items
         )
         if not rows:
             return f"<h2>{escape(heading)}</h2><p class='muted'>{escape(empty)}</p>"
+        action_th = "<th>Action</th>" if actions else ""
         return (f"<h2>{escape(heading)}</h2>"
                 "<table><tr><th>Goal</th><th>State</th><th>Title</th>"
-                f"<th>Issues</th></tr>{rows}</table>")
+                f"<th>Issues</th>{action_th}</tr>{rows}</table>")
 
-    _all_goals = summary["goals_list"]
-    _completed = [g for g in _all_goals if g["state"] == "done"]
-    _active = [g for g in _all_goals if g["state"] != "done"]
+    _g = summary["goals_list"]
+    _active = [g for g in _g if g["state"] in ("backlog", "planning", "active")]
+    _paused = [g for g in _g if g["state"] == "paused"]
+    _completed = [g for g in _g if g["state"] == "done"]
     goals = (
-        _goal_table("Active Goals", _active, "No active goals.")
-        + _goal_table("Completed Goals", _completed, "No completed goals yet.")
+        _goal_table("Active goals", _active, "No active goals.", complete=True)
+        + _goal_table("Paused or blocked", _paused, "None — nothing held.",
+                      resume=True, complete=True)
+        + _goal_table("Completed", _completed, "No completed goals yet.")
     )
 
     pls = summary.get("pipelines") or []
@@ -445,7 +450,7 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
         f"{add_goal_form}"
         f"<h2>Goals by state</h2>{_counts_cards('goals', summary['goals'])}"
         f"<h2>Issues by state</h2>{_counts_cards('issues', summary['issues'])}"
-        f"{suggested_html}{paused_html}{flagged}{goals}"
+        f"{suggested_html}{flagged}{goals}"
     )
     return page("Fleet",
                 f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")

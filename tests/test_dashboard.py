@@ -192,7 +192,16 @@ def test_off_rails_surfaces_in_dashboard(settings, pool):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "Fleet focus" in resp.text
-    assert "Paused goals" in resp.text
+    assert "Paused or blocked" in resp.text
+
+
+def test_complete_goal_route_marks_done(pool, settings):
+    goal = repo.create_goal(pool, "work actually finished", pipeline="pull-1",
+                            state="paused")
+    client = TestClient(create_app(pool, settings))
+    resp = client.post(f"/goals/{goal.id}/complete", follow_redirects=False)
+    assert resp.status_code == 303
+    assert repo.get_goal(pool, goal.id).state == "done"
 
 
 # --------------------------------------------------------------------------- #

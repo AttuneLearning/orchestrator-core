@@ -183,6 +183,20 @@ def get_goal(pool: ConnectionPool, goal_id: int) -> Optional[Goal]:
     return Goal(*row) if row else None
 
 
+def complete_goal(pool: ConnectionPool, goal_id: int) -> None:
+    """Human verdict: mark a goal done. For closing out work the orchestrator can't
+    self-verify (the engine never reads repos) — e.g. a goal whose work is actually
+    finished, or a stale goal being retired. Does not touch the goal's issues."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE goals SET state = 'done', updated_at = now() "
+            "WHERE id = %s AND state <> 'done' RETURNING id",
+            (goal_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"goal {goal_id} not found or already done")
+
+
 def resume_goal(pool: ConnectionPool, goal_id: int) -> None:
     """Human directive: restart a paused goal (paused → active)."""
     with pool.connection() as conn:

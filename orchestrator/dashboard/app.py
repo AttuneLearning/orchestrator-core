@@ -195,6 +195,12 @@ def create_app(pool: Optional[ConnectionPool] = None,
         repo.resume_goal(pool, goal_id)
         return RedirectResponse(f"/goals/{goal_id}", status_code=303)
 
+    @app.post("/goals/{goal_id}/complete")
+    def complete_goal(goal_id: int):
+        # Human verdict: the work is actually done (or the goal is being retired).
+        repo.complete_goal(pool, goal_id)
+        return RedirectResponse("/", status_code=303)
+
     @app.post("/goals/{goal_id}/promote")
     def promote_goal(goal_id: int):
         # Human gate: accept an externally suggested goal into the work queue.
