@@ -383,16 +383,25 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
         if flagged_rows else "<h2>Flagged issues</h2><p class='muted'>None — all clear.</p>"
     )
 
-    goal_rows = "".join(
-        f"<tr><td><a href='/goals/{g['id']}'>#{g['id']}</a></td>"
-        f"<td>{_state(g['state'])}</td><td>{escape(g['title'])}</td>"
-        f"<td>{g['issue_count']}</td></tr>"
-        for g in summary["goals_list"]
-    )
+    def _goal_table(heading: str, items: list[dict[str, Any]], empty: str) -> str:
+        rows = "".join(
+            f"<tr><td><a href='/goals/{g['id']}'>#{g['id']}</a></td>"
+            f"<td>{_state(g['state'])}</td><td>{escape(g['title'])}</td>"
+            f"<td>{g['issue_count']}</td></tr>"
+            for g in items
+        )
+        if not rows:
+            return f"<h2>{escape(heading)}</h2><p class='muted'>{escape(empty)}</p>"
+        return (f"<h2>{escape(heading)}</h2>"
+                "<table><tr><th>Goal</th><th>State</th><th>Title</th>"
+                f"<th>Issues</th></tr>{rows}</table>")
+
+    _all_goals = summary["goals_list"]
+    _completed = [g for g in _all_goals if g["state"] == "done"]
+    _active = [g for g in _all_goals if g["state"] != "done"]
     goals = (
-        "<h2>Goals</h2><table><tr><th>Goal</th><th>State</th><th>Title</th>"
-        f"<th>Issues</th></tr>{goal_rows}</table>"
-        if goal_rows else "<h2>Goals</h2><p class='muted'>No goals yet.</p>"
+        _goal_table("Active Goals", _active, "No active goals.")
+        + _goal_table("Completed Goals", _completed, "No completed goals yet.")
     )
 
     pls = summary.get("pipelines") or []
