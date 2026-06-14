@@ -26,4 +26,8 @@ thresholds:
 # agreed/live contract (see migration 0011). Override live via .env CONTRACT_GATE_ENABLED.
 contract_gate_enabled: false
 
-default_pipeline: pipeline-1
+# Default pipeline for new goals. pull-1 routes work to live external coders
+# (intake → implementation[pull] → verification[pull] → qa_gate/completion[verdict])
+# rather than the in-process reasoner. NOTE: pull-1 has team:backend; create
+# frontend goals explicitly on pull-fe.
+default_pipeline: pull-1

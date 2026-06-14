@@ -111,14 +111,17 @@ def test_research_pipeline_two_gates(settings, pool):
 
 def test_unknown_goal_pipeline_falls_back(settings, pool):
     """A goal with an unknown pipeline name causes issues to be created with the
-    default pipeline ('pipeline-1') and they complete with 4 gate_pass events."""
+    configured default pipeline. Pinned to 'pipeline-1' here so the test exercises
+    the fallback mechanism + verdict completion regardless of the operator's default."""
+    s = copy.deepcopy(settings)
+    s.default_pipeline = "pipeline-1"
     # Create goal directly via repo with an unknown pipeline
     goal = repo.create_goal(pool, "Mystery goal", "unknown pipeline", pipeline="nope")
 
     repo.register_agent(pool, "backend", "dev")
     repo.register_agent(pool, "backend", "qa")
 
-    engine = _make_engine(settings, pool, reasoner=StubReasoner())
+    engine = _make_engine(s, pool, reasoner=StubReasoner())
     engine.run()
 
     issues = repo.list_issues(pool, goal_id=goal.id)
