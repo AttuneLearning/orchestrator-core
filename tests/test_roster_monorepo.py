@@ -7,7 +7,11 @@ from orchestrator.roster import load_roster
 
 
 def test_default_roster_is_independent(monkeypatch):
-    monkeypatch.delenv("ROSTER_FILE", raising=False)
+    # config/roster.yaml is the compiled default. We pin it explicitly rather than
+    # delenv: load_dotenv(override=False) would otherwise repopulate ROSTER_FILE
+    # from a live .env (which may select the monorepo roster), so delenv alone
+    # can't isolate the default.
+    monkeypatch.setenv("ROSTER_FILE", "config/roster.yaml")
     s = load_settings()
     assert s.roster_file == "config/roster.yaml"
     r = load_roster(s.roster)

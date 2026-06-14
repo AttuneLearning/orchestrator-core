@@ -15,6 +15,12 @@ from orchestrator.config import load_settings
 
 @pytest.fixture(scope="session")
 def settings():
+    # Pin the suite to the canonical independent roster (api-repo/web-repo) so
+    # tests are hermetic regardless of the operator's .env ROSTER_FILE choice
+    # (e.g. a live instance pointed at config/roster.monorepo.yaml). load_dotenv
+    # uses override=False, so seeding os.environ first wins over .env. Tests that
+    # exercise a specific roster set ROSTER_FILE explicitly via monkeypatch.
+    os.environ["ROSTER_FILE"] = "config/roster.yaml"
     return load_settings()
 
 
