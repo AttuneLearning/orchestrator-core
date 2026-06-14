@@ -169,12 +169,20 @@ def _contract_fields(d: Optional[dict[str, Any]], status_key: str) -> str:
     def kv(label, val):
         return (f"<div class='muted' style='font-size:12px'>{escape(label)}</div>"
                 f"<div>{escape(str(val if val not in (None, '') else '—'))}</div>")
+    def kv_link(label, val):
+        # type_ref points into the monorepo's packages/contracts; link to the file.
+        if not val:
+            return kv(label, None)
+        href = f"https://github.com/AttuneLearning/cadencelms/blob/main/{escape(str(val))}"
+        return (f"<div class='muted' style='font-size:12px'>{escape(label)}</div>"
+                f"<div><a href='{href}' target='_blank' rel='noopener'>{escape(str(val))}</a></div>")
     # Full field set so the contract can actually be reviewed for accuracy.
     return (kv("method", d.get("method")) + kv("path", d.get("path"))
             + kv("request_ref", d.get("request_ref")) + kv("response_dto", d.get("response_dto"))
             + kv("auth", d.get("auth")) + kv("owner_team", d.get("owner_team"))
             + kv("version", d.get("version")) + kv("status", d.get(status_key))
             + kv("source_ref", d.get("source_ref"))
+            + kv_link("type_ref", d.get("type_ref"))
             + kv("content_hash", (d.get("content_hash") or "")[:16] or None))
 
 
@@ -227,8 +235,15 @@ def contracts(overview: list[dict[str, Any]]) -> str:
         or "<p class='muted'>No pending contract changes — all accepted contracts are up to date.</p>"
     ut = ""
     if uptodate:
+        def _ref(r):
+            tr = (r.get("contract") or {}).get("type_ref")
+            if not tr:
+                return ""
+            href = f"https://github.com/AttuneLearning/cadencelms/blob/main/{escape(tr)}"
+            return (f" <span class='muted'>→</span> "
+                    f"<a href='{href}' target='_blank' rel='noopener'>{escape(tr.split('/')[-1])}</a>")
         ut = ("<h2>Up to date</h2><ul>" + "".join(
-            f"<li>{escape(r['method'])} {escape(r['path'])}</li>" for r in uptodate) + "</ul>")
+            f"<li>{escape(r['method'])} {escape(r['path'])}{_ref(r)}</li>" for r in uptodate) + "</ul>")
     # Global single toggle — opens every card + its Details if any are closed, else
     # collapses all; the label flips to match.
     _toggle_js = (

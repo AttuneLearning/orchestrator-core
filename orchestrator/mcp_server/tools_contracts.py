@@ -27,13 +27,14 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
     @mcp.tool()
     def contract_propose(method: str, path: str, request_ref: str = "",
                          response_dto: str = "", owner_team: str = "backend",
-                         auth: str = "none",
-                         source_ref: Optional[str] = None) -> dict[str, Any]:
+                         auth: str = "none", source_ref: Optional[str] = None,
+                         type_ref: Optional[str] = None) -> dict[str, Any]:
         """Record a contract a consumer needs (status 'proposed'). No-op if one
-        already exists (never downgrades an agreed/live contract)."""
+        already exists (never downgrades an agreed/live contract). type_ref points
+        at the type document in packages/contracts."""
         return repo.propose_contract(pool, method, path, request_ref, response_dto,
                                      owner_team=owner_team, auth=auth,
-                                     source_ref=source_ref)
+                                     source_ref=source_ref, type_ref=type_ref)
 
     @mcp.tool()
     def contract_agree(method: str, path: str) -> dict[str, Any]:
@@ -45,13 +46,15 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
     def contract_upsert(method: str, path: str, request_ref: str = "",
                        response_dto: str = "", auth: str = "none",
                        owner_team: str = "backend", status: str = "proposed",
-                       version: str = "1.0",
-                       source_ref: Optional[str] = None) -> dict[str, Any]:
+                       version: str = "1.0", source_ref: Optional[str] = None,
+                       type_ref: Optional[str] = None) -> dict[str, Any]:
         """Insert or fully update a contract (idempotent on method+path). Used to
-        register live endpoints / bulk-seed from the API repo assessment."""
+        register live endpoints / bulk-seed from the API repo assessment. type_ref
+        points at the type document in packages/contracts."""
         return repo.upsert_contract(pool, method, path, request_ref, response_dto,
                                     auth=auth, owner_team=owner_team, status=status,
-                                    version=version, source_ref=source_ref)
+                                    version=version, source_ref=source_ref,
+                                    type_ref=type_ref)
 
     @mcp.tool()
     def contract_get(method: str, path: str) -> Optional[dict[str, Any]]:

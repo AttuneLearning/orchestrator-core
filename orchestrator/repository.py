@@ -1094,7 +1094,7 @@ def respond_to_message(pool: ConnectionPool, message_id: int, body: str,
 
 _CONTRACT_COLS = ["id", "method", "path", "request_ref", "response_dto", "auth",
                   "owner_team", "status", "version", "content_hash", "source_ref",
-                  "created_at", "updated_at"]
+                  "type_ref", "created_at", "updated_at"]
 _CONTRACT_SELECT = "SELECT " + ", ".join(_CONTRACT_COLS) + " FROM contracts"
 _SATISFIED = ("agreed", "live")
 
@@ -1115,25 +1115,27 @@ def upsert_contract(
     status: str = "proposed",
     version: str = "1.0",
     source_ref: Optional[str] = None,
+    type_ref: Optional[str] = None,
 ) -> dict[str, Any]:
     """Insert or fully update a contract (idempotent on method+path). Used by the
-    seed import and the contract_upsert MCP tool; recomputes content_hash."""
+    seed import and the contract_upsert MCP tool; recomputes content_hash.
+    type_ref points at the contract's type document in packages/contracts."""
     method = method.upper()
     content_hash = _contract_hash(method, path, request_ref, response_dto)
     with pool.connection() as conn:
         row = conn.execute(
             "INSERT INTO contracts (method, path, request_ref, response_dto, auth, "
-            "owner_team, status, version, content_hash, source_ref) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "owner_team, status, version, content_hash, source_ref, type_ref) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (method, path) DO UPDATE SET "
             "request_ref = EXCLUDED.request_ref, response_dto = EXCLUDED.response_dto, "
             "auth = EXCLUDED.auth, owner_team = EXCLUDED.owner_team, "
             "status = EXCLUDED.status, version = EXCLUDED.version, "
             "content_hash = EXCLUDED.content_hash, source_ref = EXCLUDED.source_ref, "
-            "updated_at = now() "
+            "type_ref = EXCLUDED.type_ref, updated_at = now() "
             f"RETURNING {', '.join(_CONTRACT_COLS)}",
             (method, path, request_ref, response_dto, auth, owner_team, status,
-             version, content_hash, source_ref),
+             version, content_hash, source_ref, type_ref),
         ).fetchone()
     return dict(zip(_CONTRACT_COLS, row))
 
@@ -1147,6 +1149,7 @@ def propose_contract(
     owner_team: str = "backend",
     auth: str = "none",
     source_ref: Optional[str] = None,
+    type_ref: Optional[str] = None,
 ) -> dict[str, Any]:
     """Record a 'proposed' contract a consumer needs. If one already exists it is
     left untouched (never downgrades an agreed/live contract) and returned as-is."""
@@ -1155,11 +1158,11 @@ def propose_contract(
     with pool.connection() as conn:
         conn.execute(
             "INSERT INTO contracts (method, path, request_ref, response_dto, auth, "
-            "owner_team, status, content_hash, source_ref) "
-            "VALUES (%s, %s, %s, %s, %s, %s, 'proposed', %s, %s) "
+            "owner_team, status, content_hash, source_ref, type_ref) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'proposed', %s, %s, %s) "
             "ON CONFLICT (method, path) DO NOTHING",
             (method, path, request_ref, response_dto, auth, owner_team,
-             content_hash, source_ref),
+             content_hash, source_ref, type_ref),
         )
     return get_contract(pool, method, path)  # type: ignore[return-value]
 
@@ -1218,7 +1221,8 @@ def contract_satisfied(pool: ConnectionPool, method: str, path: str) -> bool:
 
 _PROPOSAL_COLS = ["id", "method", "path", "change_type", "request_ref",
                   "response_dto", "auth", "owner_team", "version", "target_status",
-                  "content_hash", "source_ref", "status", "created_at", "resolved_at"]
+                  "content_hash", "source_ref", "type_ref", "status",
+                  "created_at", "resolved_at"]
 _PROPOSAL_SELECT = "SELECT " + ", ".join(_PROPOSAL_COLS) + " FROM contract_proposals"
 
 
@@ -1226,7 +1230,8 @@ def stage_proposal(pool: ConnectionPool, method: str, path: str, change_type: st
                    request_ref: str = "", response_dto: str = "", auth: str = "none",
                    owner_team: str = "backend", version: str = "1.0",
                    target_status: str = "live",
-                   source_ref: Optional[str] = None) -> dict[str, Any]:
+                   source_ref: Optional[str] = None,
+                   type_ref: Optional[str] = None) -> dict[str, Any]:
     """Stage the single pending proposal for an endpoint (replaces any prior
     pending one). The accepted `contracts` row is untouched until accept_proposal."""
     method = method.upper()
@@ -1237,10 +1242,10 @@ def stage_proposal(pool: ConnectionPool, method: str, path: str, change_type: st
         row = conn.execute(
             "INSERT INTO contract_proposals (method, path, change_type, request_ref, "
             "response_dto, auth, owner_team, version, target_status, content_hash, "
-            "source_ref) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "source_ref, type_ref) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
             f"RETURNING {', '.join(_PROPOSAL_COLS)}",
             (method, path, change_type, request_ref, response_dto, auth, owner_team,
-             version, target_status, content_hash, source_ref),
+             version, target_status, content_hash, source_ref, type_ref),
         ).fetchone()
     return dict(zip(_PROPOSAL_COLS, row))
 
@@ -1290,7 +1295,8 @@ def stage_from_seed(pool: ConnectionPool, rows: list[dict[str, Any]],
                        owner_team=r.get("owner_team", "backend"),
                        version=str(r.get("version", "1.0")),
                        target_status=r.get("status", "live"),
-                       source_ref=r.get("source_ref"))
+                       source_ref=r.get("source_ref"),
+                       type_ref=r.get("type_ref"))
         counts[ctype] += 1
     if full:
         for c in list_contracts(pool):
@@ -1298,7 +1304,8 @@ def stage_from_seed(pool: ConnectionPool, rows: list[dict[str, Any]],
                 stage_proposal(pool, c["method"], c["path"], "remove",
                                request_ref=c["request_ref"], response_dto=c["response_dto"],
                                auth=c["auth"], owner_team=c["owner_team"],
-                               version=c["version"], source_ref=c["source_ref"])
+                               version=c["version"], source_ref=c["source_ref"],
+                               type_ref=c.get("type_ref"))
                 counts["remove"] += 1
     return counts
 
@@ -1319,7 +1326,7 @@ def accept_proposal(pool: ConnectionPool, method: str, path: str,
             pool, method, path, request_ref=p["request_ref"],
             response_dto=p["response_dto"], auth=p["auth"], owner_team=p["owner_team"],
             status=status or p["target_status"], version=p["version"],
-            source_ref=p["source_ref"])
+            source_ref=p["source_ref"], type_ref=p.get("type_ref"))
     with pool.connection() as conn:
         conn.execute("UPDATE contract_proposals SET status='accepted', resolved_at=now() "
                      "WHERE id=%s", (p["id"],))

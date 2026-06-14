@@ -37,6 +37,30 @@ def test_upsert_is_idempotent_on_method_path(pool):
     assert len(repo.list_contracts(pool)) == 1
 
 
+def test_type_ref_threads_through_seed_stage_and_accept(pool):
+    """Phase 3: type_ref (pointer into packages/contracts) survives the seed →
+    stage → accept path and lands on the live contract."""
+    rows = [{"method": "GET", "path": "/courses", "response_dto": "CourseDTO",
+             "status": "live", "type_ref": "packages/contracts/types/curriculum.ts"}]
+    repo.stage_from_seed(pool, rows, full=True)
+    prop = repo.get_proposal(pool, "GET", "/courses")
+    assert prop["type_ref"] == "packages/contracts/types/curriculum.ts"  # carried into staging
+    contract = repo.accept_proposal(pool, "GET", "/courses")
+    assert contract["type_ref"] == "packages/contracts/types/curriculum.ts"  # and onto the contract
+    assert repo.get_contract(pool, "GET", "/courses")["type_ref"] == \
+        "packages/contracts/types/curriculum.ts"
+
+
+def test_type_ref_is_metadata_not_part_of_content_hash(pool):
+    """Refreshing type_ref must not register as contract drift (it is not hashed)."""
+    a = repo.upsert_contract(pool, "GET", "/users", response_dto="UserDTO", status="live",
+                             type_ref="packages/contracts/types/auth.ts")
+    b = repo.upsert_contract(pool, "GET", "/users", response_dto="UserDTO", status="live",
+                             type_ref="packages/contracts/types/organization.ts")
+    assert a["content_hash"] == b["content_hash"]      # shape unchanged → no drift
+    assert b["type_ref"] == "packages/contracts/types/organization.ts"  # pointer updated in place
+
+
 def test_contract_satisfied_only_for_agreed_or_live(pool):
     repo.upsert_contract(pool, "POST", "/widgets", status="proposed")
     assert repo.contract_satisfied(pool, "POST", "/widgets") is False
