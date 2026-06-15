@@ -113,6 +113,16 @@ class Engine:
     def _pipeline(self, issue: Issue) -> Pipeline:
         return self.pipelines.get(issue.pipeline) or self.pipelines[self.settings.default_pipeline]
 
+    def _ingest_pipeline_for(self, team_id: str) -> str:
+        """Pipeline a comms-ingested goal for `team_id` should run on: the team's
+        pull pipeline (so a live coder works the cross-team request) if one exists,
+        else the configured default. Without this, ingested goals fell back to the
+        verdict pipeline-1 and auto-failed (the reasoner can't implement)."""
+        for name, pl in self.pipelines.items():
+            if pl.team == team_id:
+                return name
+        return self.settings.default_pipeline
+
     def _transition(self, issue: Issue, to_state: str, *, gate_type=None,
                     event_type="state_change", payload=None,
                     retry_count=None, step_count=None) -> Issue:
@@ -235,14 +245,16 @@ class Engine:
                     continue  # optional capability: leave message pending
                 decision = triage(msg)
                 if decision.accept:
+                    pipeline = self._ingest_pipeline_for(team.id)
                     goal = repo.create_goal(
-                        self.pool, f"[comms] {msg['subject']}", msg.get("body", "")
+                        self.pool, f"[comms] {msg['subject']}", msg.get("body", ""),
+                        pipeline=pipeline,
                     )
                     repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
                     repo.create_issue(
                         self.pool, goal.id,
                         decision.title or msg["subject"], decision.description,
-                        team=team.id, triggered_by_message=True,
+                        team=team.id, pipeline=pipeline, triggered_by_message=True,
                         origin_message_id=msg["id"],
                     )
                     repo.triage_message(self.pool, msg["id"], accept=True)

@@ -68,6 +68,16 @@ class _RejectingReasoner:
 # 1. Full happy-path: message → issue → done → response
 # --------------------------------------------------------------------------- #
 
+def test_ingest_routes_to_team_pull_pipeline(settings, pool):
+    """Comms-ingested cross-team requests run on the team's PULL pipeline (live
+    coder), not the verdict pipeline-1 — so they reach a worker instead of
+    auto-failing at the reasoner verdict. Unknown teams fall back to the default."""
+    engine = _make_engine(settings, pool)
+    assert engine._ingest_pipeline_for("backend") == "pull-1"
+    assert engine._ingest_pipeline_for("frontend") == "pull-fe"
+    assert engine._ingest_pipeline_for("nope") == engine.settings.default_pipeline
+
+
 def test_request_ingested_to_done_with_response(settings, pool):
     """A frontend→api (alias for backend) message flows end-to-end: ingestion,
     issue creation, gate progression, comms response, and message archival."""
@@ -81,6 +91,10 @@ def test_request_ingested_to_done_with_response(settings, pool):
     msg_id = msg["id"]
 
     engine = _make_engine(settings, pool)
+    # This test validates the full comms loop on the verdict pipeline. Ingestion now
+    # routes team work to its pull pipeline; pin to pipeline-1 so the loop completes
+    # deterministically under the StubReasoner (no external worker needed).
+    engine._ingest_pipeline_for = lambda team_id: "pipeline-1"
     engine.run()
 
     # Exactly one issue, team backend, state done, triggered_by_message True
