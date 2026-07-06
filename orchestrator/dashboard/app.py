@@ -272,23 +272,44 @@ def create_app(pool: Optional[ConnectionPool] = None,
 
     @app.post("/contracts/accept")
     def contract_accept(method: str = Form(...), path: str = Form(...)):
-        repo.accept_proposal(pool, method, path)
+        try:
+            repo.accept_contract_review(pool, method, path)
+        except ValueError as e:
+            return HTMLResponse(
+                templates.page("Contract Acceptance Error",
+                               f"<h1>Contract Acceptance Error</h1><p>{e}</p>"),
+                status_code=400
+            )
         return RedirectResponse("/contracts", status_code=303)
 
     @app.post("/contracts/accept_with_issue")
     def contract_accept_with_issue(method: str = Form(...), path: str = Form(...)):
-        p = repo.get_proposal(pool, method, path)
-        repo.accept_proposal(pool, method, path, status="agreed")
-        if p:
-            _changes_to_work([p])
+        try:
+            p = repo.get_proposal(pool, method, path)
+            repo.accept_contract_review(pool, method, path, status="agreed")
+            if p:
+                _changes_to_work([p])
+        except ValueError as e:
+            return HTMLResponse(
+                templates.page("Contract Acceptance Error",
+                               f"<h1>Contract Acceptance Error</h1><p>{e}</p>"),
+                status_code=400
+            )
         return RedirectResponse("/contracts", status_code=303)
 
     @app.post("/contracts/accept_removal")
     def contract_accept_removal(method: str = Form(...), path: str = Form(...)):
-        p = repo.get_proposal(pool, method, path)
-        repo.accept_proposal(pool, method, path)  # remove -> deprecate
-        if p:
-            _changes_to_work([p])  # consumer cleanup
+        try:
+            p = repo.get_proposal(pool, method, path)
+            repo.accept_contract_review(pool, method, path)  # remove -> deprecate
+            if p:
+                _changes_to_work([p])  # consumer cleanup
+        except ValueError as e:
+            return HTMLResponse(
+                templates.page("Contract Acceptance Error",
+                               f"<h1>Contract Acceptance Error</h1><p>{e}</p>"),
+                status_code=400
+            )
         return RedirectResponse("/contracts", status_code=303)
 
     @app.post("/contracts/mark_redevelopment")

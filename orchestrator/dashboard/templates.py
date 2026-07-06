@@ -247,7 +247,7 @@ def _contract_card(row: dict[str, Any]) -> str:
                 + form("accept_with_issue", "Accept changes &amp; create issue", "ok")
                 + form("mark_redevelopment", "Mark for redevelopment"))
     elif c and c["status"] == "proposed":
-        btns = form("accept", "Accept", "ok")
+        btns = form("accept", "Accept as agreed", "ok")
     else:
         btns = ""
     right = (_contract_fields(p, "target_status")

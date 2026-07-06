@@ -1380,6 +1380,24 @@ def accept_proposal(pool: ConnectionPool, method: str, path: str,
     return contract
 
 
+def accept_contract_review(pool: ConnectionPool, method: str, path: str,
+                           status: Optional[str] = None) -> dict[str, Any]:
+    """Accept the contract row currently visible on the /contracts page."""
+    p = get_proposal(pool, method, path)
+    if p is not None:
+        contract = accept_proposal(pool, method, path, status=status)
+        if contract is None:
+            raise ValueError(f"no contract produced for {method.upper()} {path}")
+        return contract
+
+    contract = get_contract(pool, method, path)
+    if contract is None:
+        raise ValueError(f"no contract {method.upper()} {path}")
+    if contract["status"] != "proposed":
+        raise ValueError(f"no pending proposal for {method.upper()} {path}")
+    return set_contract_status(pool, method, path, status or "agreed")
+
+
 def reject_proposal(pool: ConnectionPool, method: str, path: str) -> None:
     with pool.connection() as conn:
         conn.execute("UPDATE contract_proposals SET status='rejected', resolved_at=now() "

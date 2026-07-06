@@ -90,6 +90,23 @@ def test_contracts_accept_route(pool, settings):
     assert repo.contract_satisfied(pool, "POST", "/widgets") is True
 
 
+def test_contracts_accept_direct_proposed_row(pool, settings):
+    repo.propose_contract(pool, "GET", "/clinicians",
+                          response_dto="ClinicianListResponse",
+                          owner_team="backend", auth="role")
+    html = _client(pool, settings).get("/contracts").text
+    assert "GET /clinicians" in html
+    assert "Accept as agreed" in html
+
+    r = _client(pool, settings).post("/contracts/accept",
+                                     data={"method": "GET", "path": "/clinicians"},
+                                     follow_redirects=False)
+    assert r.status_code == 303
+    c = repo.get_contract(pool, "GET", "/clinicians")
+    assert c["status"] == "agreed"
+    assert repo.contract_satisfied(pool, "GET", "/clinicians") is True
+
+
 def test_accept_with_issue_routes_to_owner_and_consumer(pool, settings):
     # a frontend issue consumes the endpoint -> consumer = frontend; owner = backend
     goal = repo.create_goal(pool, "g")

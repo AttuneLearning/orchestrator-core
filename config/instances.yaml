@@ -16,6 +16,13 @@ instances:
     database_url_env: DATABASE_URL          # reuses the instance .env
     roster_file: config/roster.monorepo.yaml
 
+  tendcharting:
+    label: TendCharting (EHR)
+    database_url_env: DATABASE_URL_TENDCHARTING
+    roster_file: config/roster.monorepo.yaml
+    settings:
+      promote_repo_path: /home/adam/github/tendcharting-ws/tendcharting
+
   # Add another project by pointing at its own database + roster:
   # acme:
   #   label: Acme LMS

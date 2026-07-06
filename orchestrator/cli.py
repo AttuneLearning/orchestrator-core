@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+from pathlib import Path
 
 from . import repository as repo
 from .config import REPO_ROOT, load_settings
@@ -29,6 +32,58 @@ from .db import close_pool, get_pool, migrate
 
 # Issues already terminal (won't be re-cancelled when bulk-cancelling a goal).
 _CANCEL_TERMINAL = {"done", "cancelled"}
+
+# Files that affect the API contract review surface. The importer still consumes
+# the explicit seed file; this list is the tripwire that tells agents/CI when the
+# seed must be staged or likely needs edits.
+_CONTRACT_SOURCE_PREFIXES = ("packages/contracts/",)
+_CONTRACT_API_PREFIX = "apps/api/src/"
+_CONTRACT_API_EXACT = {"apps/api/src/app.ts"}
+_CONTRACT_API_SUFFIXES = ("Router.ts",)
+
+
+def _norm_repo_rel(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def _is_contract_relevant(path: str, seed_rel: str = "contracts.seed.json") -> bool:
+    p = _norm_repo_rel(path)
+    if p == _norm_repo_rel(seed_rel):
+        return True
+    if p.startswith(_CONTRACT_SOURCE_PREFIXES):
+        return True
+    if p in _CONTRACT_API_EXACT:
+        return True
+    return p.startswith(_CONTRACT_API_PREFIX) and p.endswith(_CONTRACT_API_SUFFIXES)
+
+
+def _git_changed_files(repo_path: str, base_ref: str = "main") -> set[str]:
+    """Return committed, staged, unstaged, and untracked paths changed in repo_path."""
+
+    def git(*args: str) -> list[str]:
+        r = subprocess.run(
+            ["git", "-C", repo_path, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            return []
+        return [_norm_repo_rel(line) for line in r.stdout.splitlines() if line.strip()]
+
+    changed: set[str] = set()
+    if base_ref:
+        changed.update(git("diff", "--name-only", f"{base_ref}...HEAD"))
+    changed.update(git("diff", "--name-only", "--cached"))
+    changed.update(git("diff", "--name-only"))
+    changed.update(git("ls-files", "--others", "--exclude-standard"))
+    return changed
+
+
+def _contract_relevant_changed_files(
+    changed: set[str], seed_rel: str = "contracts.seed.json"
+) -> list[str]:
+    return sorted(p for p in changed if _is_contract_relevant(p, seed_rel))
 
 
 def _cmd_migrate(args, settings) -> int:
@@ -375,6 +430,65 @@ def _cmd_import_contracts(args, settings) -> int:
     return 0
 
 
+def _cmd_sync_contracts(args, settings) -> int:
+    """Agent/CI contract tripwire.
+
+    If contract-relevant source changed, validate the seed and stage it through
+    the normal proposal workflow. With --require-seed-change, source changes
+    fail unless contracts.seed.json changed too, so a new route/type cannot
+    quietly skip the /contracts review page.
+    """
+    repo_path = str(Path(args.repo).resolve())
+    seed_rel = _norm_repo_rel(args.seed)
+    seed_path = Path(repo_path) / seed_rel
+    changed = _git_changed_files(repo_path, args.base_ref)
+    relevant = _contract_relevant_changed_files(changed, seed_rel)
+    seed_changed = seed_rel in {_norm_repo_rel(p) for p in changed}
+
+    if not relevant and not args.force:
+        print("contracts sync: no contract-relevant changes")
+        return 0
+
+    if args.require_seed_change and relevant and not seed_changed and not args.force:
+        print(
+            "contracts sync: contract-relevant files changed but "
+            f"{seed_rel} did not. Update the seed so /contracts can review the "
+            "new API surface.\nchanged: " + ", ".join(relevant),
+            file=sys.stderr,
+        )
+        return 1
+
+    if not seed_path.is_file():
+        print(f"contracts sync: missing seed file {seed_path}", file=sys.stderr)
+        return 1
+
+    try:
+        with seed_path.open() as fh:
+            rows = json.load(fh)
+    except json.JSONDecodeError as exc:
+        print(f"contracts sync: invalid JSON in {seed_path}: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(rows, list):
+        print("contracts sync: expected a JSON array of contract records", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        print(
+            f"contracts sync: would stage {len(rows)} contracts from {seed_path} "
+            f"({len(relevant)} relevant changed file(s))"
+        )
+        return 0
+
+    pool = get_pool(settings)
+    counts = repo.stage_from_seed(pool, rows, full=not args.partial)
+    print(
+        f"contracts sync: staged from {seed_path}: {counts['add']} add, "
+        f"{counts['modify']} modify, {counts['remove']} remove "
+        f"({counts['skip']} unchanged). Review & accept on /contracts."
+    )
+    return 0
+
+
 def _cmd_ingest_monitor_kb(args, settings) -> int:
     """Rebuild the orch-monitor knowledge base (scope monitor:kb) from current
     source — migrations, IMPLEMENTATION_SUMMARY, MCP docstrings, repo API, config,
@@ -442,6 +556,10 @@ def _cmd_self_update(args, settings) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestrator")
+    p.add_argument(
+        "--instance", "-i", default=None, metavar="KEY",
+        help="orchestrator instance from config/instances.yaml; also honored via ORCH_INSTANCE"
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("migrate", help="apply pending SQL migrations").set_defaults(func=_cmd_migrate)
@@ -573,6 +691,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seed is not the full set — don't infer removals")
     ic.set_defaults(func=_cmd_import_contracts)
 
+    sc = sub.add_parser("sync-contracts",
+                        help="agent/CI guard: detect contract changes and stage seed proposals")
+    sc.add_argument("--repo", default=".",
+                    help="product repository containing contracts.seed.json")
+    sc.add_argument("--seed", default="contracts.seed.json",
+                    help="seed path relative to --repo")
+    sc.add_argument("--base-ref", default="main",
+                    help="git ref for changed-file detection (default: main)")
+    sc.add_argument("--partial", action="store_true",
+                    help="seed is not the full set — don't infer removals")
+    sc.add_argument("--force", action="store_true",
+                    help="stage the seed even when no relevant changed files are detected")
+    sc.add_argument("--require-seed-change", action="store_true",
+                    help="fail if API/contract source changed but the seed file did not")
+    sc.add_argument("--dry-run", action="store_true",
+                    help="validate and report what would be staged without touching the DB")
+    sc.set_defaults(func=_cmd_sync_contracts)
+
     sub.add_parser("ingest-monitor-kb",
                    help="rebuild the orch-monitor knowledge base from current source"
                    ).set_defaults(func=_cmd_ingest_monitor_kb)
@@ -591,7 +727,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    settings = load_settings()
+    if getattr(args, "instance", None):
+        os.environ["ORCH_INSTANCE"] = args.instance
+    settings = load_settings(getattr(args, "instance", None))
     try:
         return args.func(args, settings)
     finally:

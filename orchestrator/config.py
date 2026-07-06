@@ -108,11 +108,36 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw not in (None, "") else default
 
 
-def load_settings() -> Settings:
+def _resolve_instance(instance: str, s_yaml: dict[str, Any]) -> str:
+    """Resolve an orchestrator instance from config/instances.yaml."""
+    instances = (_yaml(CONFIG_DIR / "instances.yaml") or {}).get("instances", {}) or {}
+    entry = instances.get(instance)
+    if entry is None:
+        raise ValueError(
+            f"unknown orchestrator instance {instance!r}; "
+            f"known: {sorted(instances)} (see config/instances.yaml)"
+        )
+    env_name = entry.get("database_url_env")
+    db = (os.getenv(env_name) if env_name else None) or entry.get("database_url")
+    if not db:
+        raise ValueError(
+            f"instance {instance!r}: env {env_name!r} is unset and no literal "
+            "database_url is given in config/instances.yaml"
+        )
+    if entry.get("roster_file"):
+        s_yaml["roster_file"] = entry["roster_file"]
+    for key, val in (entry.get("settings") or {}).items():
+        s_yaml[key] = val
+    return db
+
+
+def load_settings(instance: str | None = None) -> Settings:
     """Load settings from config/*.yaml, then apply environment overrides."""
     load_dotenv(REPO_ROOT / ".env")
 
     s_yaml = _yaml(CONFIG_DIR / "settings.yaml")
+    instance = instance or os.getenv("ORCH_INSTANCE") or None
+    inst_db = _resolve_instance(instance, s_yaml) if instance else None
     t_yaml = s_yaml.get("thresholds", {}) or {}
 
     thresholds = Thresholds(
@@ -139,10 +164,13 @@ def load_settings() -> Settings:
             return val.lower() in ("1", "true", "yes")
         return bool(s_yaml.get(yaml_key, default))
 
-    roster_file = pick("ROSTER_FILE", "roster_file", "config/roster.yaml")
+    if instance and s_yaml.get("roster_file"):
+        roster_file = s_yaml["roster_file"]
+    else:
+        roster_file = pick("ROSTER_FILE", "roster_file", "config/roster.yaml")
 
     return Settings(
-        database_url=os.getenv("DATABASE_URL", Settings.database_url),
+        database_url=inst_db or os.getenv("DATABASE_URL", Settings.database_url),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         reasoning_model=pick("REASONING_MODEL", "reasoning_model", "claude-opus-4-8"),
         reasoner=pick("REASONER", "reasoner", ""),
