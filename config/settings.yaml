@@ -1,19 +1,47 @@
 # =============================================================================
-# Orchestrator settings. Environment variables (see .env.example) override
-# any value here at load time (orchestrator/config.py).
+# Orchestrator settings. This file is the canonical local configuration.
+# Process environment variables still override matching values at runtime
+# (orchestrator/config.py), but the app no longer auto-loads a repo .env file.
 # =============================================================================
 
 reasoning_model: claude-opus-4-8
+database_url: postgresql://orchestrator:orchestrator@localhost:5432/orchestrator
+anthropic_api_key: ""
+
+# Engine reasoner (decomposition, gate review, drift scoring).
+reasoner: openai
+reasoner_base_url: http://10.100.90.132:8081/v1
+reasoner_model: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL
+reasoner_api_key: ""
+reasoner_cli_cmd: claude -p "{prompt}"
+
+# Docs AI-edit reasoner (dashboard Docs tab only) — isolated from the engine
+# reasoner so it can be repointed independently, but here it targets the SAME
+# on-prem network model server the engine uses (10.100.90.132:8081, Qwen3-Coder-30B).
+# `cli` stays available here for a future DB-capable "hypervisor" editor.
+# Set docs_reasoner: "" to reuse the engine reasoner above.
+docs_reasoner: openai
+docs_reasoner_base_url: http://10.100.90.132:8081/v1
+docs_reasoner_model: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL
+docs_reasoner_api_key: ""                # network server needs no key
 
 code_provider: stub        # stub | openai | anthropic
 code_base_url: ""
 code_model: ""
+code_api_key: ""
 
 # Engine thresholds / caps
 thresholds:
   drift_threshold: 0.5     # off_rails latches only when a signal fires AND drift < this
   retry_cap: 3             # gate declines before an issue lands in failed
   step_budget: 25          # max gate-advances per issue before exhaustion
+  # Liveness: a pull worker is reclaimed if its last_seen exceeds this. Must be
+  # LONGER than the slowest legitimate gate run — QA verification/e2e runs full
+  # suites (typecheck+test+build+playwright) that exceed 300s, so a busy agent
+  # was being falsely reclaimed mid-suite. 900s (15m) gives headroom. Workers
+  # poll at 60s, so a genuinely dead worker is still detected well within this.
+  agent_stale_seconds: 900
+  reclaim_cap: 3           # reclaims before a pull issue lands in off_rails
   # Decomposition guardrails (spec: prevent the 24-issue blowout). Backstops, not
   # the primary fix — breaching one alerts + holds the goal (never silent truncation).
   max_depth: 2                 # sub-issue nesting depth
@@ -23,8 +51,26 @@ thresholds:
 
 # Contract-first gate. OFF by default. When true, pull-fe's contract_check gate
 # blocks new-endpoint frontend issues until their consumed endpoints have an
-# agreed/live contract (see migration 0011). Override live via .env CONTRACT_GATE_ENABLED.
+# agreed/live contract (see migration 0011). Override live with CONTRACT_GATE_ENABLED.
 contract_gate_enabled: false
+
+# Auto-promote on completion. When an issue passes its final gate, the engine merges
+# its committed branch (resolved from the code_committed event) into promote_branch in
+# a dedicated worktree of promote_repo_path, so the next team sees the work. LOCAL merge
+# only — never pushes; downstream teams pull the integration branch. A merge conflict
+# bounces the issue back to implementation (rebase & resolve). promote_branch must NOT be
+# checked out in any other worktree (the integrator needs it free).
+auto_promote_enabled: true
+promote_repo_path: /home/adam/github/cadencelms-working/cadencelms
+promote_branch: main
+auto_rebase_downstream: true
+
+# Shared development-docs browser (dashboard "Docs" tab). Read-only: lists + renders
+# files under this dir and its subdirs so agents and humans share dev docs in one place.
+# Empty = tab hidden.
+docs_path: /home/adam/github/cadencelms-working/docs
+
+embed_api_key: ""
 
 # Default pipeline for new goals. pull-1 routes work to live external coders
 # (intake → implementation[pull] → verification[pull] → qa_gate/completion[verdict])

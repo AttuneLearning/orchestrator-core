@@ -117,16 +117,16 @@ def test_request_ingested_to_done_with_response(settings, pool):
     original = repo.get_message(pool, msg_id)
     assert original["status"] == "archived", f"original message status={original['status']!r}"
 
-    # A response message was sent: kind=response, status=sent, from_team=backend, to_team=frontend
+    # A receipt and final response were sent; only the response is kind=response.
     with pool.connection() as conn:
         from psycopg.rows import dict_row
         rows = conn.cursor(row_factory=dict_row).execute(
             "SELECT * FROM messages ORDER BY id"
         ).fetchall()
-    assert len(rows) == 2, f"expected 2 messages total, got {len(rows)}"
+    assert len(rows) == 3, f"expected 3 messages total, got {len(rows)}"
     response_msgs = [r for r in rows if r["kind"] == "response"]
-    assert len(response_msgs) == 1
-    resp = response_msgs[0]
+    assert len(response_msgs) == 2
+    resp = next(r for r in response_msgs if r["subject"].startswith("Re: "))
     assert resp["status"] == "sent", f"response status={resp['status']!r}"
     assert resp["from_team"] == "backend"
     assert resp["to_team"] == "frontend"

@@ -282,10 +282,9 @@ def test_full_recovery_cycle(settings, pool):
         resp = client.post(f"/issues/{issue.id}/directive", follow_redirects=False)
         assert resp.status_code == 303
 
-    # POST resume for each paused goal
+    # Directives reactivate the goal automatically.
     for pg in paused_goals:
-        resp = client.post(f"/goals/{pg.id}/resume", follow_redirects=False)
-        assert resp.status_code == 303
+        assert repo.get_goal(pool, pg.id).state == "active"
 
     # Run a fresh engine with StubReasoner to completion
     engine2 = Engine(s, pool, reasoner=StubReasoner())

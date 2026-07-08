@@ -1,8 +1,9 @@
 # =============================================================================
 # Roster (INDEPENDENT-REPOS variant) — the current/active roster: each team maps
 # to its own repo (api-repo, web-repo). The monorepo variant lives in
-# config/roster.monorepo.yaml; switch the active roster via .env ROSTER_FILE
-# (e.g. ROSTER_FILE=config/roster.monorepo.yaml) once the monorepo is live.
+# config/roster.monorepo.yaml. The active roster is selected by
+# config/instances.yaml, with ROSTER_FILE still available as an explicit
+# environment override.
 #
 # Roster: the generic role catalog plus the project's active teams.
 #

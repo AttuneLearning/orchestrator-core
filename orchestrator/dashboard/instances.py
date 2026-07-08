@@ -114,11 +114,16 @@ def load_registry(settings: Optional[Settings] = None,
             else spec.get("database_url")
         if not db:
             continue  # referenced env var unset → skip (don't guess credentials)
-        roster_file = spec.get("roster_file", base.roster_file)
-        s = dataclasses.replace(
-            base, database_url=db, roster_file=roster_file,
-            roster=_yaml(REPO_ROOT / roster_file),
-        )
+        if settings is None:
+            s = load_settings(instance=key)
+        else:
+            roster_file = spec.get("roster_file", base.roster_file)
+            overrides = spec.get("settings") or {}
+            s = dataclasses.replace(
+                base, database_url=db, roster_file=roster_file,
+                roster=_yaml(REPO_ROOT / roster_file),
+                **{k: v for k, v in overrides.items() if hasattr(base, k)},
+            )
         instances[key] = Instance(key, spec.get("label", key), s)
     if not instances:
         return _single(base)

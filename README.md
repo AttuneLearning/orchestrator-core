@@ -65,7 +65,6 @@ sudo -u postgres psql -c "CREATE ROLE orchestrator LOGIN PASSWORD 'orchestrator'
 sudo -u postgres createdb orchestrator -O orchestrator
 
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env   # set DATABASE_URL; ANTHROPIC_API_KEY optional (see below)
 
 .venv/bin/python -m orchestrator.cli migrate
 .venv/bin/python -m orchestrator.cli register-agent --team backend --function dev
@@ -80,10 +79,10 @@ prefer a containerized database.
 
 ## Agents & providers
 
-- **Reasoning agent** (`agents/reasoning.py`) uses the Anthropic SDK
-  (`api.anthropic.com`, reachable from the cloud env) when `ANTHROPIC_API_KEY`
-  is set. Without a key it falls back to a deterministic stub so the pipeline
-  runs and the test suite passes hermetically.
+- **Reasoning agent** (`agents/reasoning.py`) is configured in
+  `config/settings.yaml`. Anthropic mode uses `ANTHROPIC_API_KEY` from the
+  process environment; without a key it falls back to a deterministic stub so
+  the pipeline runs and the test suite passes hermetically.
 - **Code agent** (`agents/providers.py`) is configurable via `CODE_PROVIDER`:
   - `stub` (default) — deterministic placeholder output, no network.
   - `openai` — any OpenAI-compatible endpoint (`CODE_BASE_URL` / `CODE_MODEL` /
@@ -94,6 +93,73 @@ prefer a containerized database.
 > Anthropic cloud env**. To use it, point `CODE_PROVIDER=openai` at a publicly
 > reachable endpoint (added to the environment's Custom allowed domains) or run
 > via a teleported local session.
+
+### Dashboard-managed model profiles
+
+The dashboard settings page can manage shared OpenAI-compatible model profiles:
+
+```text
+http://10.100.55.87:8800/settings?project=tendcharting
+```
+
+Profiles live under `model_profiles` and are consumed by role settings such as
+`orch_manager_codex`, `orch_manager_claude`, `engine_reasoner`, and
+`devqa_worker`. Project-specific values are stored under
+`config/instances.yaml` at `instances.<project>.settings`; global defaults live
+in `config/settings.yaml`.
+
+The default Codex orch-manager profile is DigitalOcean:
+
+```yaml
+model_profiles:
+  digitalocean:
+    base_url: https://inference.do-ai.run/v1
+    model: deepseek-v4-pro
+    wire_api: chat
+    api_key_env: MODEL_ACCESS_KEY
+orch_manager_codex:
+  profile: digitalocean
+  reasoning_effort: high
+```
+
+Use `api_key_env` to avoid storing secrets in plaintext. The dashboard stores
+only the environment variable name, and launcher resolution retrieves the actual
+secret from that process environment. Direct `api_key` values remain supported
+for local compatibility but should be treated as plaintext config.
+
+When `engine_reasoner.profile` is set, the loader maps the selected profile onto
+the existing OpenAI-compatible reasoner fields (`reasoner=openai`,
+`reasoner_base_url`, `reasoner_model`, and `reasoner_api_key`) unless the
+corresponding legacy environment variables are set.
+
+DigitalOcean tool-calling uses the chat-completions request shape. `tool_choice`
+is a top-level sibling of `tools`:
+
+```json
+{
+  "model": "deepseek-v4-pro",
+  "messages": [
+    { "role": "user", "content": "What is the weather in Austin?" }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" }
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+```
 
 ## MCP server
 
@@ -127,6 +193,13 @@ and the sample [`examples/mcp-client-config.json`](examples/mcp-client-config.js
 Pure-function suites (`test_pipelines`, `test_state_machine`,
 `test_focus_offrails`) need no database; `test_repository` runs against the
 configured `DATABASE_URL`.
+
+## Contract Acceptance Error Handling
+
+Fixed 500 Internal Server Error when accepting contracts in the dashboard.
+Previously, attempting to accept a contract with no pending proposal would raise
+a ValueError that wasn't caught, causing a 500 error. Now, such errors are
+caught and return a user-friendly 400 error page instead.
 
 ## Layout
 
@@ -167,7 +240,7 @@ docker compose --profile ops up -d
 
 | Service   | URL                    | Default credentials                          |
 |-----------|------------------------|----------------------------------------------|
-| Directus  | http://localhost:8055  | `DIRECTUS_ADMIN_EMAIL` / `DIRECTUS_ADMIN_PASSWORD` from `.env` (defaults: `admin@example.com` / `Admin1234!`) |
+| Directus  | http://localhost:8055  | `DIRECTUS_ADMIN_EMAIL` / `DIRECTUS_ADMIN_PASSWORD` from the process environment (defaults: `admin@example.com` / `Admin1234!`) |
 | Metabase  | http://localhost:3000  | Set up on first visit via the setup wizard   |
 
 ### First-time setup
@@ -181,7 +254,7 @@ docker compose exec db createdb -U orchestrator metabase
 ```
 
 **Directus first login** — On first startup Directus seeds the admin account
-using `DIRECTUS_ADMIN_EMAIL` and `DIRECTUS_ADMIN_PASSWORD` from your `.env`.
+using `DIRECTUS_ADMIN_EMAIL` and `DIRECTUS_ADMIN_PASSWORD` from your process environment.
 Change these from the defaults before any internet-facing deployment.
 
 ### Connecting Metabase to the orchestrator data
@@ -231,6 +304,7 @@ be rejected with a permission error.
 | `serve-dashboard --port 8000` | C | FastAPI ops dashboard (fleet, timelines, directives) |
 | `add-goal "..." --pipeline hotfix` | J | route a goal through an alternate pipeline |
 | `apply-promote <issue-id> --note "..."` | F | merge an issue's *verified* worktree branch (human gate; local only) |
+| `install-launchers --workspace /path/to/ws --project <name>` | Ops | install parent-dir Claude/Codex/Qwen launcher scripts for a project workspace |
 
 Cross-team messages ingest automatically each tick (slice D): a pending request
 to a rostered team is triaged into a local issue; its completion sends a

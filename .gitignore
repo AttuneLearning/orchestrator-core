@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+backups/
+*.log
+*.bak
+.launch-dash.sh
+setup_agent.py

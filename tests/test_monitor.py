@@ -108,6 +108,10 @@ def test_monitor_page_lists_and_caches_draft(settings, pool):
     client = _client(pool, settings)
     html = client.get("/orch/monitor").text
     assert "ingestion shape?" in html
+    assert "DRAFT-ANSWER for ingestion shape?" not in html
+    r = client.post(f"/orch/monitor/{q['id']}/draft", follow_redirects=False)
+    assert r.status_code == 303
+    html = client.get("/orch/monitor").text
     assert "DRAFT-ANSWER for ingestion shape?" in html
     # draft is the QA'd (2-pass) output and is cached so a reload won't re-call.
     cached = repo.get_message(pool, q["id"])["draft_response"]
@@ -144,7 +148,7 @@ def test_fleet_index_shows_open_message_badge(settings, pool):
     client = _client(pool, settings)
     html = client.get("/").text
     assert "open message(s) in the orchestrator queue" in html  # alert badge/banner
-    assert "Correspondence" in html                             # fleet side panel
+    assert "Recent correspondence" in html                      # fleet correspondence panel
 
 
 def test_monitor_submit_falls_back_to_suggested(settings, pool):

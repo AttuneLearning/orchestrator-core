@@ -119,6 +119,7 @@ pipelines:
         order: 3
         owner: qa
         mode: pull
+        on_failure: implementation
         description: "QA runner executes the suite at depth, reports tests_run."
       - type: qa_gate
         order: 4
@@ -170,18 +171,16 @@ pipelines:
         order: 4
         owner: qa
         mode: pull
-        description: "QA runner runs unit tests (Vitest), reports tests_run."
-      - type: e2e
-        order: 5
-        owner: qa
-        mode: pull
-        description: "QA runner runs Playwright E2E, reports tests_run."
         on_failure: implementation
+        description: "QA runner runs unit tests (Vitest), reports tests_run."
+      # NOTE: the Playwright e2e gate is deferred — the QA workers don't yet have a
+      # served app + browser binaries, so it blocked every frontend issue. Real e2e is
+      # handled by the dedicated Phase 4 issue (#55); re-add this gate once that lands.
       - type: qa_gate
         order: 6
         owner: lead
         mode: verdict
-        description: "Reviewer/lead judges code + unit + e2e: pass or decline."
+        description: "Reviewer/lead judges code + unit tests: pass or decline."
         on_failure: implementation
       - type: completion
         order: 7

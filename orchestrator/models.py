@@ -149,6 +149,10 @@ class Agent:
     # draining its queue; true -> keeps polling every poll_interval_seconds.
     loop_enabled: bool = False
     poll_interval_seconds: int = 300
+    # Cooldown / auto-retry window (migration 0019). When set to a future time the
+    # engine won't assign new work and a pull worker sleeps until then, then resumes.
+    # Set on a token-limit backoff (now()+2h) or manually from the dashboard.
+    paused_until: Optional[datetime] = None
 
 
 @dataclass

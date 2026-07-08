@@ -131,9 +131,6 @@ def _config_notes() -> list[str]:
         p = CONFIG_DIR / fname
         if p.exists():
             notes.append(f"[config:{fname}]\n{p.read_text()}")
-    env = REPO_ROOT / ".env.example"
-    if env.exists():
-        notes.append(f"[config:.env.example]\n{env.read_text()}")
     return notes
 
 

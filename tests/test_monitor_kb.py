@@ -91,6 +91,9 @@ def test_dashboard_draft_is_grounded_in_kb(settings, pool):
     # StubReasoner.draft_reply tags the output [draft+ctx] when context is supplied,
     # proving the dashboard retrieved KB snippets and passed them in.
     client = TestClient(create_app(pool, settings, reasoner=StubReasoner()))
+    message_id = repo.pending_messages(pool, to_team="orch-monitor")[0]["id"]
+    r = client.post(f"/orch/monitor/{message_id}/draft", follow_redirects=False)
+    assert r.status_code == 303
     html = client.get("/orch/monitor").text
     # [draft+ctx] = grounded (pass 1); [qa] = cross-checked (pass 2). Both present
     # proves the draft was grounded AND ran through the QA cross-check.

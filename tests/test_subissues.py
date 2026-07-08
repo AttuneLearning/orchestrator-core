@@ -251,10 +251,12 @@ def test_failed_child_fails_parent_and_pauses_goal(settings, pool):
         f"events: {[(e.event_type, e.payload) for e in _events(pool, parent.id)]}"
     )
 
-    # Goal is paused
+    # Goal is closed with a monitor alert instead of remaining paused.
     with pool.connection() as conn:
         row = conn.execute("SELECT state FROM goals WHERE id = %s", (goal.id,)).fetchone()
-    assert row[0] == "paused", f"goal state={row[0]!r}, expected 'paused'"
+    assert row[0] == "done", f"goal state={row[0]!r}, expected 'done'"
+    pending = repo.pending_messages(pool, to_team="orch-monitor")
+    assert pending and "unresolved issue" in pending[0]["subject"]
 
 
 # --------------------------------------------------------------------------- #

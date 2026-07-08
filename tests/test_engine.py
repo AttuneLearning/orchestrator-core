@@ -140,7 +140,9 @@ def test_failure_path(settings, pool):
 
     with pool.connection() as conn:
         row = conn.execute("SELECT state FROM goals WHERE id = %s", (goal.id,)).fetchone()
-    assert row[0] == "paused", f"goal state={row[0]!r}, expected 'paused'"
+    assert row[0] == "done", f"goal state={row[0]!r}, expected 'done'"
+    pending = repo.pending_messages(pool, to_team="orch-monitor")
+    assert pending and "unresolved issue" in pending[0]["subject"]
 
 
 # --------------------------------------------------------------------------- #
@@ -209,8 +211,8 @@ def test_directive_unquarantine(settings, pool):
         assert restored.gate_type == issue.gate_type, \
             f"gate_type changed from {issue.gate_type!r} to {restored.gate_type!r}"
 
-    # Resume the paused goal
-    repo.resume_goal(pool, goal.id)
+    # apply_directive reactivates the closed/paused goal automatically.
+    assert repo.get_goal(pool, goal.id).state == "active"
 
     # Phase 2: run with StubReasoner (passes everything)
     # Swap reasoner and create a fresh engine instance on the same pool

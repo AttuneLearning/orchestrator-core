@@ -57,9 +57,18 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
             retry_cap=settings.thresholds.retry_cap,
             triggered_by_message=issue.triggered_by_message,
         )
+        payload = {"reasons": reasons or []}
+        if issue.gate_type == "e2e" and passed:
+            from ..backup import record_backup
+            payload["database_backup"] = record_backup(
+                pool, settings,
+                reason=f"after-e2e-issue-{issue.id}",
+                issue_id=issue.id,
+                goal_id=issue.goal_id,
+            )
         updated = repo.update_state(
             pool, issue_id, outcome.state, gate_type=outcome.gate_type,
-            event_type=outcome.event_type, payload={"reasons": reasons or []},
+            event_type=outcome.event_type, payload=payload,
             retry_count=outcome.retry_count,
         )
         return asdict(updated)
@@ -95,16 +104,39 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         'stop after the queue drains'; otherwise it's the idle poll cadence."""
         repo.touch_agent(pool, agent_id)
         agent = repo.get_agent(pool, agent_id)
+        if agent is None:
+            # No such agent in THIS coordinator's DB — almost always means the MCP
+            # server is pointed at the wrong database. Signal it clearly instead of
+            # silently reporting loop_enabled=False (which reads as "looping disabled").
+            return {
+                "status": "unknown_agent",
+                "agent_id": agent_id,
+                "note": ("no agent %d in this coordinator — the MCP server is likely "
+                         "connected to the wrong database. Launch it with "
+                         "`--instance <project>` (e.g. tendcharting)." % agent_id),
+                "loop_enabled": False,
+                "next_poll_seconds": 0,
+            }
         reactivated = False
         if agent is not None and agent.status == "offline":
             repo.set_agent_status(pool, agent_id, "idle")
             reactivated = True
         loop_enabled = bool(agent.loop_enabled) if agent else False
+        # Cooldown window (migration 0019): if paused_until is in the future, the
+        # worker should sleep until then instead of polling; the engine also skips
+        # assigning to it. pause_seconds is how long to sleep (0 = active).
+        import datetime as _dt
+        paused_until = agent.paused_until if agent else None
+        pause_seconds = 0
+        if paused_until is not None:
+            pause_seconds = max(0, int((paused_until - _dt.datetime.now(_dt.timezone.utc)).total_seconds()))
         return {
             "status": "ok",
             "reactivated": reactivated,
             "loop_enabled": loop_enabled,
             "next_poll_seconds": repo.agent_next_poll_seconds(agent) if agent else 0,
+            "paused_until": paused_until.isoformat() if paused_until else None,
+            "pause_seconds": pause_seconds,
         }
 
     @mcp.tool()

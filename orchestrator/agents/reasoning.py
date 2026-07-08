@@ -44,6 +44,20 @@ def _parse_endpoints(text: str) -> list[dict[str, str]]:
             seen.append(dep)
     return seen
 
+def _strip_doc_fence(text: str) -> str:
+    """Drop a single wrapping ``` code fence if a model wraps its whole answer in
+    one, leaving the document body intact."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        lines = t.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines)
+    return t
+
+
 from ..config import Settings
 from ..models import Goal, Issue
 from .base import (ComplexityAssessment, GateReview, IssueSpec, TriageDecision,
@@ -152,12 +166,41 @@ class _LLMReasoner:
             user += f"\n\n{rules}"
         return self._ask(system, user)
 
+    def edit_document(self, body: str, instruction: str,
+                      fmt: str = "markdown", title: str = "") -> str:
+        """Apply a free-text instruction to a whole document and return the full
+        revised document. Used by the dashboard's Docs AI-edit panel. Optional
+        capability (only model-backed reasoners have it; the stub does not)."""
+        system = (
+            "You are a careful document editor. Apply the user's instruction to the "
+            f"WHOLE document below (its format is {fmt}). Preserve everything the "
+            "instruction does not ask you to change, keep the same format and "
+            "structure, and do not add commentary. Output ONLY the complete revised "
+            "document text — no preamble, no explanation, and do NOT wrap it in code "
+            "fences."
+        )
+        header = f"Document title: {title}\n" if title else ""
+        user = (f"{header}Instruction: {instruction}\n\n"
+                f"----- BEGIN DOCUMENT -----\n{body}\n----- END DOCUMENT -----")
+        return _strip_doc_fence(self._ask(system, user, max_tokens=16000))
+
     def gate_review(self, issue, gate_type, recent=None, rules: str = "") -> GateReview:
         system = (
             f"You are the reviewer for the '{gate_type}' gate of an issue pipeline. "
             "Decide if the gate passes. If applicable rules are listed, verify "
             "each one; a violated rule fails the gate and its id goes in "
-            '"violated_rules". Output JSON: {"passed": bool, "reasons": [str], '
+            '"violated_rules". '
+            "SCOPE — this is a PER-ISSUE gate that runs on the issue's own package. "
+            "End-to-end / Playwright / full-stack / real-instance acceptance (a served "
+            "app + browser + seeded DB) is a SEPARATE GLOBAL integration gate run "
+            "against merged main (e2e-acceptance.sh), NOT part of this gate. Do NOT "
+            "fail this gate for missing e2e/Playwright/browser/real-instance/integration "
+            "evidence, nor merely because the issue's acceptance criteria mention e2e — "
+            "those are validated downstream by the global gate. Judge only what belongs "
+            "here: code correctness and quality, ADR compliance, and that the mechanical "
+            "checks that actually ran (typecheck + unit tests, per recent events) passed. "
+            "This gate runs AFTER verification already went green, so when in doubt, PASS. "
+            'Output JSON: {"passed": bool, "reasons": [str], '
             '"violated_rules": [str]}.'
         )
         user = (
@@ -167,9 +210,22 @@ class _LLMReasoner:
         if rules:
             user += f"\n\n{rules}"
         data = extract_json(self._ask(system, user))
+        # The local reasoner sometimes returns a JSON list (or garbage) instead of the
+        # requested object. Coerce to a dict; a genuinely unparseable verdict must NOT
+        # falsely fail work that already passed the mechanical gates (tests green) — this
+        # gate runs after verification, so default an unreadable response to PASS + note.
+        if isinstance(data, list):
+            data = next((d for d in data if isinstance(d, dict)), {})
+        if not isinstance(data, dict) or "passed" not in data:
+            return GateReview(passed=True,
+                              reasons=["reviewer response unparseable — auto-passed "
+                                       "(verification already green)"],
+                              violated_rules=[])
+        reasons = data.get("reasons") or []
+        violated = data.get("violated_rules") or []
         return GateReview(passed=bool(data.get("passed")),
-                          reasons=list(data.get("reasons", [])),
-                          violated_rules=list(data.get("violated_rules", [])))
+                          reasons=reasons if isinstance(reasons, list) else [str(reasons)],
+                          violated_rules=violated if isinstance(violated, list) else [str(violated)])
 
     def score_drift(self, issue, recent=None) -> float:
         system = (

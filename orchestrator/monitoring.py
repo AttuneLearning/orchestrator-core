@@ -68,6 +68,15 @@ def fleet_summary(pool: ConnectionPool, settings: Settings) -> dict[str, Any]:
         for i in repo.list_issues(pool, states=["off_rails"])
     ]
     paused_goals = [g for g in goals_list if g["state"] == "paused"]
+    # Terminal-failed issues: the engine won't re-drive them (retry cap exhausted),
+    # so they need a human directive (re-open) or cancel — surface them for action.
+    failed_issues = [
+        {"id": i.id, "title": i.title, "state": i.state, "retry_count": i.retry_count,
+         # A decomposed parent (epic) has no gate; retrying it is a no-op. Flag it so
+         # the dashboard hides the retry button and points at the failed child instead.
+         "has_children": bool(repo.list_issues(pool, parent_id=i.id))}
+        for i in repo.list_issues(pool, states=["failed"])
+    ]
 
     attention = flagged + quarantined
     denom = len(active) + len(quarantined)
@@ -79,6 +88,7 @@ def fleet_summary(pool: ConnectionPool, settings: Settings) -> dict[str, Any]:
         "fleet_focus": focus.fleet_focus(denom, len(attention)),
         "below_threshold": bool(attention or paused_goals),
         "flagged_issues": attention,
+        "failed_issues": failed_issues,
         "paused_goals": paused_goals,
         "goals_list": goals_list,
     }

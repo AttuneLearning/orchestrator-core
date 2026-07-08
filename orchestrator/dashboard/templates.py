@@ -7,15 +7,22 @@ string; page() wraps a body fragment in the shared shell.
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Optional
+from urllib.parse import quote
 
 from . import context
 
 _CSS = """
   :root { --bg:#0f1115; --panel:#1a1d24; --ink:#e6e6e6; --muted:#8a91a0;
-          --line:#2a2f3a; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --link:#58a6ff; }
+          --line:#2a2f3a; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --link:#58a6ff;
+          --orange:#db6d28; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; flex:none; }
+  .dot.green{background:var(--ok)} .dot.yellow{background:var(--warn)}
+  .dot.orange{background:var(--orange)} .dot.red{background:var(--bad)}
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
@@ -68,6 +75,45 @@ _CSS = """
   details.members > summary::-webkit-details-marker { display:none; }
   details.members > summary::before { content:'▸ '; color:var(--muted); }
   details.members[open] > summary::before { content:'▾ '; }
+  .doc { max-width:860px; } .doc h1,.doc h2,.doc h3 { margin:18px 0 8px; }
+  .doc code { background:#0b0d11; border:1px solid var(--line); border-radius:4px;
+              padding:1px 5px; font-size:13px; }
+  .doc pre.doc-code { background:#0b0d11; } .doc pre.doc-code code { border:0; padding:0; }
+  .doc blockquote { margin:8px 0; padding:4px 12px; border-left:3px solid var(--line);
+                    color:var(--muted); }
+  .doc ul,.doc ol { padding-left:22px; } .doc hr { border:0; border-top:1px solid var(--line); }
+  .doc table.doc-table { border:1px solid var(--line); margin:12px 0; }
+  .doc table.doc-table th { color:var(--ink); background:#0b0d11; border-bottom:2px solid var(--line); }
+  .doc table.doc-table td { border-bottom:1px solid var(--line); vertical-align:top; }
+  .doc table.doc-table tr:hover td { background:rgba(88,166,255,.06); }
+  .ai-panel { max-width:900px; margin-top:20px; padding:12px 14px; background:var(--panel);
+              border:1px solid var(--line); border-radius:8px; }
+  .ai-panel h2 { margin-top:0; } .ai-panel h3 { font-size:14px; margin:14px 0 6px; }
+  .ai-panel textarea { width:100%; min-height:66px; padding:8px; background:var(--bg);
+              color:var(--ink); border:1px solid var(--line); border-radius:6px; font:inherit; }
+  .settings-form { max-width:980px; }
+  .settings-group { background:var(--panel); border:1px solid var(--line);
+                    border-radius:8px; padding:12px 14px; margin:0 0 14px; }
+  .settings-grid { display:grid; grid-template-columns:minmax(190px, 260px) 1fr;
+                   gap:10px 14px; align-items:start; }
+  .settings-grid label { color:var(--muted); padding-top:6px; }
+  .settings-grid input[type=text], .settings-grid input[type=password],
+  .settings-grid input[type=number], .settings-grid select {
+      width:100%; background:var(--bg); color:var(--ink); border:1px solid var(--line);
+      border-radius:6px; padding:6px 8px; font:inherit; }
+  .settings-grid .help { color:var(--muted); font-size:12px; margin-top:3px; }
+  .settings-grid .env { color:var(--warn); font-size:12px; margin-top:3px; }
+  .settings-actions { display:flex; gap:10px; align-items:center; margin:14px 0; }
+  .settings-scope { display:flex; gap:8px; align-items:center; margin:0 0 14px; flex-wrap:wrap; }
+  .settings-scope a { border:1px solid var(--line); border-radius:6px; padding:5px 10px; }
+  .settings-scope a.active { background:var(--link); color:#06101f; border-color:var(--link); }
+  .doc-editor { width:100%; max-width:900px; min-height:60vh; padding:8px; background:var(--panel);
+              color:var(--ink); border:1px solid var(--line); border-radius:6px;
+              font:13px/1.5 ui-monospace,Menlo,monospace; }
+  pre.diff { max-height:52vh; overflow:auto; }
+  pre.diff span { display:block; }
+  .diff-add { color:var(--ok); } .diff-del { color:var(--bad); }
+  .diff-ctx { color:var(--muted); } .diff-skip { color:var(--link); font-style:italic; }
 """
 
 
@@ -79,7 +125,11 @@ _STATUS_DOT = {"live": "🟢", "idle": "🟡", "down": "🔴"}
 
 
 def _coordinator_picker() -> str:
-    """A dropdown to switch coordinators (?project=). Hidden when only one exists."""
+    """Coordinator switcher (?project=). JS-FREE: a GET form (no action → submits to
+    the current page) with a real submit button, so it works even when inline JS is
+    blocked/disabled. onchange auto-submits when JS is available (progressive
+    enhancement); the Switch button is the guaranteed path otherwise. Hidden when
+    only one coordinator exists."""
     if not context.show_picker():
         return ""
     opts = context.instance_options()
@@ -88,12 +138,18 @@ def _coordinator_picker() -> str:
         f"{_STATUS_DOT.get(o['status'], '')} {escape(o['label'])}</option>"
         for o in opts
     )
-    js = ("var u=new URL(window.location);u.searchParams.set('project',this.value);"
-          "window.location=u.toString();")
-    return (f"<select title='Coordinator' onchange=\"{js}\" "
-            "style='margin-left:auto;background:var(--bg);color:var(--ink);"
-            "border:1px solid var(--line);border-radius:5px;padding:4px 8px;font:inherit'>"
-            f"{options}</select>")
+    sel_style = ("background:var(--bg);color:var(--ink);border:1px solid var(--line);"
+                 "border-radius:5px;padding:4px 8px;font:inherit")
+    btn_style = ("background:var(--panel);color:var(--ink);border:1px solid var(--line);"
+                 "border-radius:5px;padding:4px 10px;font:inherit;cursor:pointer")
+    # No `action` → the GET submits to the CURRENT path, so switching keeps the page
+    # and just sets ?project=. `name=project` is what the middleware reads.
+    return (
+        "<form method='get' style='margin-left:auto;display:flex;gap:6px;align-items:center'>"
+        f"<select name='project' title='Coordinator' onchange='this.form.submit()' "
+        f"style='{sel_style}'>{options}</select>"
+        f"<button type='submit' style='{btn_style}'>Switch</button>"
+        "</form>")
 
 
 def _with_project(html: str) -> str:
@@ -119,9 +175,12 @@ def page(title: str, body: str) -> str:
         f"<title>{escape(title)} · orchestrator</title><style>{_CSS}</style></head><body>"
         "<header><nav style='display:flex;align-items:center'>"
         "<a href='/'>Fleet</a><a href='/agents'>Agents</a>"
+        "<a href='/workers'>Workers</a>"
         "<a href='/orch/monitor'>Monitor</a>"
         "<a href='/contracts'>Contracts</a>"
         "<a href='/adrs'>ADRs</a>"
+        "<a href='/docs'>Docs</a>"
+        "<a href='/settings'>Settings</a>"
         "<a href='/api/state'>JSON</a>"
         f"{_coordinator_picker()}"
         "</nav></header><main>"
@@ -129,6 +188,436 @@ def page(title: str, body: str) -> str:
         "</main></body></html>"
     )
     return _with_project(html)
+
+
+def workers_page(agents: list[dict[str, Any]], project: str) -> str:
+    """Live worker monitor: one panel per registered agent, each tailing that
+    worker's tmux pane. Panels auto-refresh in place via polling (no page reload).
+    The orchestrator/claude session isn't a registered agent, so it never shows."""
+    import json
+
+    def _win(team: str, fn: str) -> str:
+        pre = {"backend": "be", "frontend": "fe", "senior": "sr"}.get(team, (team or "wt")[:2])
+        return f"{pre}-{fn}"
+
+    panels = []
+    for a in sorted(agents, key=lambda x: x["id"]):
+        aid, team, fn = a["id"], a.get("team", ""), a.get("function", "")
+        status = a.get("status", "?")
+        panels.append(
+            "<section class='wpanel'>"
+            f"<div class='whead'><span class='wdot' id='dot-{aid}' data-status='{escape(status)}'></span>"
+            f"<strong>agent {aid} · {escape(team)}/{escape(fn)}</strong>"
+            "<span class='muted' style='margin-left:auto'>tmux "
+            f"<code>{escape(_win(team, fn))}</code> · <span id='wstat-{aid}'>{escape(status)}</span></span>"
+            f"</div><pre class='wlog' id='pane-{aid}'>loading…</pre></section>"
+        )
+    # Orchestrator/hypervisor session (this Claude session + its subagents) — pinned first.
+    # Not a registered agent; its live output comes from the tmux 'orch' window.
+    orch_panel = (
+        "<section class='wpanel' style='border-color:#3b82f6'>"
+        "<div class='whead' style='background:#0e1b2e'>"
+        "<span class='wdot' id='dot-orch' style='background:#3b82f6'></span>"
+        "<strong>orchestrator · this session (hypervisor + subagents)</strong>"
+        "<span class='muted' style='margin-left:auto'>tmux <code>orch</code> · "
+        "<span id='wstat-orch'>—</span></span></div>"
+        "<pre class='wlog' id='pane-orch'>loading…</pre></section>"
+    )
+    grid = ("<div class='wgrid'>" + orch_panel + "".join(panels) + "</div>") if (panels or True) else \
+        "<p class='muted'>No registered agents to monitor.</p>"
+
+    css = """<style>
+      .wtoolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:8px 0 14px}
+      .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:14px}
+      .wpanel{border:1px solid #2a2f3a;border-radius:8px;overflow:hidden;background:#0d1117}
+      .whead{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#161b22;
+             border-bottom:1px solid #2a2f3a;font-size:13px;color:#c9d1d9}
+      .whead code{color:#9ca3af}
+      .wdot{width:9px;height:9px;border-radius:50%;background:#6b7280;flex:none}
+      .wdot[data-status=busy]{background:#22c55e}
+      .wdot[data-status=idle]{background:#9ca3af}
+      .wdot[data-status=offline]{background:#ef4444}
+      .wdot.stale{box-shadow:0 0 0 2px #f59e0b}
+      .wlog{margin:0;padding:10px;height:340px;overflow:auto;background:#0d1117;color:#c9d1d9;
+            font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+      .wlog.err{color:#f59e0b}
+    </style>"""
+
+    toolbar = (
+        "<div class='wtoolbar'>"
+        "<label><input type='checkbox' id='wpause'> pause auto-refresh</label>"
+        "<label>scrollback <select id='wlines'>"
+        "<option>100</option><option selected>200</option><option>500</option><option>1000</option>"
+        "</select> lines</label>"
+        "<span class='muted'>updates every 2.5s · last: <span id='wts'>—</span></span>"
+        "</div>"
+    )
+
+    js = """<script>
+      const PROJECT = __PROJECT__;
+      function u(p){ return PROJECT ? p+(p.includes('?')?'&':'?')+'project='+encodeURIComponent(PROJECT) : p; }
+      let paused=false, lines=200;
+      async function refresh(){
+        if(paused) return;
+        try{
+          const r = await fetch(u('/workers/panes?lines='+lines), {cache:'no-store'});
+          if(!r.ok) return;
+          const data = await r.json();
+          for(const id in data){
+            const el=document.getElementById('pane-'+id); if(!el) continue;
+            const d=data[id];
+            const atBottom = el.scrollTop+el.clientHeight >= el.scrollHeight-24;
+            el.textContent = d.ok ? (d.text||'(pane empty)') : ('⚠ '+d.text);
+            el.classList.toggle('err', !d.ok);
+            if(atBottom) el.scrollTop=el.scrollHeight;
+            const st=document.getElementById('wstat-'+id); if(st&&d.status) st.textContent=d.status;
+            const dot=document.getElementById('dot-'+id);
+            if(dot){ if(d.status) dot.dataset.status=d.status; dot.classList.toggle('stale', !!d.stale); }
+          }
+          const ts=document.getElementById('wts'); if(ts) ts.textContent=new Date().toLocaleTimeString();
+        }catch(e){}
+      }
+      setInterval(refresh, 2500);
+      refresh();
+      const _p=document.getElementById('wpause');
+      if(_p) _p.addEventListener('change',()=>{ paused=_p.checked; if(!paused) refresh(); });
+      const _s=document.getElementById('wlines');
+      if(_s) _s.addEventListener('change',()=>{ lines=parseInt(_s.value)||200; refresh(); });
+    </script>""".replace("__PROJECT__", json.dumps(project or ""))
+
+    body = ("<h1>Workers</h1>"
+            "<p class='muted'>Live tail of each registered worker's tmux pane — auto-refreshes "
+            "in place, no reload. Panels reflect the current coordinator's agents.</p>"
+            + css + toolbar + grid + js)
+    return page("Workers", body)
+
+
+def settings_page(data: dict[str, Any]) -> str:
+    """Structured settings editor for global defaults and per-project overrides."""
+
+    def field_html(f: dict[str, Any]) -> str:
+        name = f["name"]
+        value = f["value"]
+        kind = f["kind"]
+        choices = f.get("choices") or []
+        disabled = ""
+        input_name = f"name='{escape(name)}'"
+        if kind == "select":
+            opts = "".join(
+                f"<option value='{escape(str(c))}'"
+                f"{' selected' if str(value) == str(c) else ''}>"
+                f"{escape(str(c) or '(auto)')}</option>"
+                for c in choices
+            )
+            control = f"<select {input_name}{disabled}>{opts}</select>"
+        elif kind == "bool":
+            checked = " checked" if bool(value) else ""
+            control = (
+                f"<input type='hidden' {input_name} value='false'>"
+                f"<label style='color:var(--ink);padding-top:0'>"
+                f"<input type='checkbox' {input_name} value='true'{checked}{disabled}> enabled"
+                "</label>"
+            )
+        elif kind in ("int", "float"):
+            step = "any" if kind == "float" else "1"
+            control = (f"<input type='number' step='{step}' {input_name} "
+                       f"value='{escape(str(value))}'{disabled}>")
+        else:
+            typ = "password" if kind == "password" else "text"
+            control = (f"<input type='{typ}' {input_name} "
+                       f"value='{escape(str(value or ''))}'{disabled}>")
+        help_bits = []
+        if f.get("help"):
+            help_bits.append(f"<div class='help'>{escape(f['help'])}</div>")
+        if f.get("env"):
+            msg = f"Environment override: {f['env']}"
+            if f.get("env_active"):
+                msg += (" is currently set, so dashboard edits to this value will not "
+                        "take effect until that env var is unset.")
+            help_bits.append(f"<div class='env'>{escape(msg)}</div>")
+        return (
+            f"<label>{escape(f['label'])}<br><code class='muted'>{escape(name)}</code></label>"
+            f"<div>{control}{''.join(help_bits)}</div>"
+        )
+
+    groups = []
+    for group in data["groups"]:
+        fields = "".join(field_html(f) for f in group["fields"])
+        groups.append(
+            "<section class='settings-group'>"
+            f"<h2>{escape(group['group'])}</h2>"
+            f"<div class='settings-grid'>{fields}</div>"
+            "</section>"
+        )
+
+    flash = ""
+    if data.get("flash"):
+        flash = (
+            "<div class='banner' style='border-color:var(--ok);color:var(--ok);"
+            "background:rgba(63,185,80,.12)'>Settings saved.</div>"
+        )
+    if data.get("restarted"):
+        flash += (
+            "<div class='banner' style='border-color:var(--ok);color:var(--ok);"
+            "background:rgba(63,185,80,.12)'>Engine restarted. "
+            f"New daemon PID: <code>{escape(str(data['restarted']))}</code>.</div>"
+        )
+    if data.get("restart_error"):
+        msg = "Engine restart failed."
+        if data.get("restart_error") == "not_configured":
+            msg = "Engine restart is only available for configured project instances."
+        flash += f"<div class='banner'>{escape(msg)}</div>"
+    save_path = escape(data.get("save_path") or data.get("overlay_path") or "")
+    scope = data.get("scope") or "project"
+    project_label = escape(data.get("project_label") or data.get("project_key") or "")
+    project_key = escape(data.get("project_key") or "")
+    can_edit_project = bool(data.get("can_edit_project"))
+    project_cls = "active" if scope == "project" else ""
+    global_cls = "active" if scope == "global" else ""
+    project_tab = ""
+    if can_edit_project:
+        project_tab = (
+            f"<a class='{project_cls}' href='/settings?scope=project'>"
+            f"Project: {project_label}</a>"
+        )
+    else:
+        project_tab = "<span class='muted'>Project overrides unavailable in single-instance mode</span>"
+    scope_note = (
+        f"Editing project overrides for <code>{project_key}</code>. These values are stored "
+        "under that project&apos;s <code>settings:</code> block in "
+        "<code>config/instances.yaml</code> when they differ from the global defaults."
+        if scope == "project"
+        else "Editing canonical global defaults in <code>config/settings.yaml</code>. "
+             "Projects override these defaults in <code>config/instances.yaml</code>."
+    )
+    restart_panel = ""
+    if can_edit_project:
+        restart_panel = (
+            "<section class='settings-group'>"
+            "<h2>Runtime</h2>"
+            "<p class='muted'>Restart the selected project&apos;s engine daemon after changing "
+            "provider or reasoner settings. This recreates the orchestrator engine and its "
+            "reasoner client from the latest config; it does not restart an external "
+            "OpenAI-compatible model server.</p>"
+            "<form method='post' action='/settings/restart-engine'>"
+            f"<input type='hidden' name='scope' value='{escape(scope)}'>"
+            "<button class='alt' type='submit' "
+            "onclick=\"return confirm('Restart this project engine now?')\">"
+            "Restart engine</button>"
+            "</form>"
+            "</section>"
+        )
+    body = (
+        "<h1>Settings</h1>"
+        f"{flash}"
+        "<div class='settings-scope'>"
+        f"{project_tab}"
+        f"<a class='{global_cls}' href='/settings?scope=global'>Global defaults</a>"
+        "</div>"
+        f"<p class='muted'>{scope_note} Saves write to <code>{save_path}</code>. "
+        "Process environment variables still win. Engine daemons and already-created "
+        "model clients may need a restart before they pick up provider changes.</p>"
+        f"{restart_panel}"
+        "<form method='post' action='/settings' class='settings-form'>"
+        f"<input type='hidden' name='scope' value='{escape(scope)}'>"
+        f"{''.join(groups)}"
+        "<div class='settings-actions'><button class='ok' type='submit'>Save settings</button>"
+        f"<a href='/settings?scope={escape(scope)}'>Reset form</a></div>"
+        "</form>"
+    )
+    return page("Settings", body)
+
+
+def docs_page(items: list[dict[str, Any]]) -> str:
+    """The Docs tab: shared dev docs from the DB (repo.doc_list rows: path, title,
+    format, author, updated_at), grouped by top-level folder of the path slug."""
+    new_btn = ("<form method='get' action='/docs/new' style='display:inline'>"
+               "<button class='ok' type='submit'>+ New doc</button></form>")
+    if not items:
+        return page("Docs",
+                    "<h1>Docs</h1>"
+                    "<p class='muted'>No shared docs yet. Agents write them via the "
+                    "<code>doc_write</code> MCP tool; you can create one here too.</p>"
+                    f"<p>{new_btn}</p>")
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for it in items:
+        slug = it["path"]
+        folder = slug.rsplit("/", 1)[0] if "/" in slug else ""
+        groups.setdefault(folder, []).append(it)
+
+    sections = []
+    for d in sorted(groups, key=lambda x: (x == "", x)):
+        rows = []
+        for it in sorted(groups[d], key=lambda x: x["path"]):
+            href = f"/docs/view?path={quote(it['path'])}"
+            name = it["title"] or it["path"].rsplit("/", 1)[-1]
+            when = str(it.get("updated_at") or "")[:16].replace("T", " ")
+            rows.append(
+                f"<tr><td><a href='{href}'>{escape(name)}</a>"
+                f"<div class='muted' style='font-size:12px'>{escape(it['path'])}</div></td>"
+                f"<td class='muted'>{escape(it.get('format') or '')}</td>"
+                f"<td class='muted'>{escape(it.get('author') or '—')}</td>"
+                f"<td class='muted'>{escape(when)}</td></tr>"
+            )
+        sections.append(
+            f"<h2>{escape(d + '/') if d else '(top level)'}</h2>"
+            "<table><tr><th>Document</th><th>Format</th><th>Author</th>"
+            f"<th>Updated</th></tr>{''.join(rows)}</table>"
+        )
+    body = (
+        "<h1>Docs</h1>"
+        f"<p class='muted'>Shared development docs (orchestrator DB) · {len(items)} "
+        f"doc(s). Agents read/write via <code>doc_*</code> MCP tools.</p>"
+        f"<p>{new_btn}</p>"
+        + "".join(sections)
+    )
+    return page("Docs", body)
+
+
+def doc_view_page(doc: dict[str, Any], body_html: str) -> str:
+    """Single-doc viewer that toggles between a rendered view and an inline
+    raw-markdown editor, plus an AI-edit panel (prompt → diff preview → accept).
+    HTML docs render in a sandboxed iframe; markdown/text render inline as
+    `body_html`. Progressive: the separate /docs/edit page still works if JS is off."""
+    path = doc["path"]
+    title = doc["title"] or path.rsplit("/", 1)[-1]
+    fmt = doc.get("format", "markdown")
+    author = doc.get("author") or "human"
+    body = doc.get("body") or ""
+
+    meta = (f"<p class='muted'><a href='/docs'>Docs</a> / {escape(path)} · {escape(fmt)}"
+            f" · {escape(str(author))}"
+            f" · updated {escape(str(doc.get('updated_at') or '')[:16].replace('T',' '))}</p>")
+
+    # Rendered (view) content.
+    if fmt == "html":
+        srcdoc = escape(body, quote=True)
+        rendered = (f"<iframe srcdoc='{srcdoc}' sandbox='allow-same-origin' "
+                    "style='width:100%;height:74vh;border:1px solid var(--line);"
+                    "border-radius:6px;background:#fff'></iframe>")
+    else:
+        rendered = f"<div class='doc'>{body_html}</div>"
+
+    # View-mode toolbar.
+    view_actions = (
+        "<button class='ok' type='button' onclick='__docToggle(true)'>Edit</button> "
+        f"<form method='post' action='/docs/delete' style='display:inline' "
+        "onsubmit=\"return confirm('Delete this doc?')\">"
+        f"<input type='hidden' name='path' value='{escape(path)}'>"
+        "<button type='submit'>Delete</button></form>"
+    )
+    view = (f"<div id='doc-view'><p>{view_actions}</p>{rendered}</div>")
+
+    # Edit mode: raw editor (Save form) + AI-edit panel.
+    save_form = (
+        "<form method='post' action='/docs/save'>"
+        f"<input type='hidden' name='path' value='{escape(path)}'>"
+        f"<input type='hidden' name='title' value='{escape(title)}'>"
+        f"<input type='hidden' name='format' value='{escape(fmt)}'>"
+        f"<input type='hidden' name='author' value='{escape(str(author))}'>"
+        f"<textarea id='doc-body' name='body' class='doc-editor'>{escape(body)}</textarea>"
+        "<p><button class='ok' type='submit'>Save</button> "
+        "<button type='button' onclick='__docToggle(false)'>Cancel</button></p>"
+        "</form>"
+    )
+    ai_panel = (
+        "<div class='ai-panel'>"
+        "<h2>AI edit</h2>"
+        "<p class='muted'>Describe a change to apply to the whole document. "
+        "You'll see a diff to accept or discard before anything is saved.</p>"
+        "<textarea id='ai-prompt' placeholder='e.g. Tighten the overview and turn "
+        "the risks section into a table'></textarea>"
+        "<p><button id='ai-go' class='alt' type='button' onclick='__aiEdit()'>"
+        "Apply AI edit</button> <span id='ai-status' class='muted'></span></p>"
+        "<div id='ai-diff' style='display:none'>"
+        "<h3>Proposed changes (previous → new)</h3>"
+        "<div id='ai-diff-body'></div>"
+        "<p><button class='ok' type='button' onclick='__aiAccept()'>"
+        "Accept → load into editor</button> "
+        "<button type='button' onclick='__aiDiscard()'>Discard</button></p>"
+        "</div></div>"
+    )
+    edit = (f"<div id='doc-edit' style='display:none'>{save_form}{ai_panel}</div>")
+
+    script = (
+        "<script>(function(){"
+        f"var PATH={json.dumps(path)};"
+        "var proj=new URLSearchParams(location.search).get('project');"
+        "function q(u){return proj?(u+(u.indexOf('?')>-1?'&':'?')+'project='+"
+        "encodeURIComponent(proj)):u;}"
+        "window.__docToggle=function(edit){"
+        "document.getElementById('doc-view').style.display=edit?'none':'';"
+        "document.getElementById('doc-edit').style.display=edit?'':'none';"
+        "if(edit){window.scrollTo(0,0);}};"
+        "window.__aiEdit=async function(){"
+        "var p=document.getElementById('ai-prompt').value.trim();"
+        "var s=document.getElementById('ai-status');"
+        "if(!p){s.textContent='Enter an instruction.';return;}"
+        "var b=document.getElementById('doc-body').value;"
+        "var go=document.getElementById('ai-go');go.disabled=true;"
+        "s.textContent='Thinking… (a large document can take a while)';"
+        "try{var fd=new URLSearchParams();fd.set('path',PATH);fd.set('prompt',p);"
+        "fd.set('body',b);"
+        "var r=await fetch(q('/docs/ai-edit'),{method:'POST',headers:{"
+        "'Content-Type':'application/x-www-form-urlencoded'},body:fd.toString()});"
+        "var j=await r.json();"
+        "if(!r.ok){s.textContent=(j&&j.error)||('Error '+r.status);go.disabled=false;return;}"
+        "window.__aiNew=j.new_body;"
+        "document.getElementById('ai-diff-body').innerHTML=j.diff_html;"
+        "document.getElementById('ai-diff').style.display='';"
+        "s.textContent=j.changed?'Review the proposed changes below.':"
+        "'The AI returned no changes.';"
+        "}catch(e){s.textContent='Request failed: '+e;}"
+        "go.disabled=false;};"
+        "window.__aiAccept=function(){"
+        "if(window.__aiNew!=null){document.getElementById('doc-body').value=window.__aiNew;}"
+        "document.getElementById('ai-diff').style.display='none';"
+        "document.getElementById('ai-status').textContent="
+        "'Applied to the editor — review and click Save to persist.';};"
+        "window.__aiDiscard=function(){"
+        "document.getElementById('ai-diff').style.display='none';"
+        "document.getElementById('ai-status').textContent='Discarded.';};"
+        "})();</script>"
+    )
+    return page(title, f"<h1>{escape(title)}</h1>{meta}{view}{edit}{script}")
+
+
+def doc_edit_page(doc: Optional[dict[str, Any]]) -> str:
+    """Create/edit form. `doc` is None for a new doc, else the existing row."""
+    is_new = doc is None
+    d = doc or {"path": "", "title": "", "body": "", "format": "markdown", "author": ""}
+    heading = "New doc" if is_new else f"Edit · {escape(d['path'])}"
+    ta = ("width:100%;max-width:900px;min-height:60vh;padding:8px;background:var(--panel);"
+          "color:var(--ink);border:1px solid var(--line);border-radius:6px;"
+          "font:13px/1.5 ui-monospace,Menlo,monospace")
+    inp = ("padding:6px;background:var(--panel);color:var(--ink);"
+           "border:1px solid var(--line);border-radius:5px")
+    fmt = d.get("format", "markdown")
+    opts = "".join(
+        f"<option value='{f}'{' selected' if f == fmt else ''}>{f}</option>"
+        for f in ("markdown", "html", "text"))
+    path_field = (
+        f"<input name='path' value='{escape(d['path'])}' placeholder='architecture/my-doc' "
+        f"style='{inp};width:420px' required>" if is_new
+        else f"<input type='hidden' name='path' value='{escape(d['path'])}'>"
+             f"<code>{escape(d['path'])}</code>")
+    body = (
+        f"<h1>{heading}</h1>"
+        "<form method='post' action='/docs/save'>"
+        f"<p><label class='muted'>Path </label>{path_field}</p>"
+        f"<p><label class='muted'>Title </label>"
+        f"<input name='title' value='{escape(d.get('title') or '')}' style='{inp};width:420px'></p>"
+        f"<p><label class='muted'>Format </label>"
+        f"<select name='format' style='{inp}'>{opts}</select>"
+        f"<label class='muted' style='margin-left:14px'>Author </label>"
+        f"<input name='author' value='{escape(d.get('author') or 'human')}' style='{inp};width:200px'></p>"
+        f"<p><textarea name='body' style='{ta}'>{escape(d.get('body') or '')}</textarea></p>"
+        "<p><button class='ok' type='submit'>Save</button> "
+        f"<a href='{('/docs' if is_new else '/docs/view?path=' + quote(d['path']))}'>Cancel</a></p>"
+        "</form>"
+    )
+    return page("Edit doc" if not is_new else "New doc", body)
 
 
 _MON_TA = ("width:100%;max-width:760px;padding:6px;background:var(--panel);"
@@ -187,6 +676,11 @@ def orch_monitor(messages: list[dict[str, Any]],
             f"{escape(m.get('priority','medium'))}{link}</div>"
             f"<h2 style='margin:6px 0'>{escape(m['subject'])}</h2>"
             f"<pre>{escape(m.get('body') or '')}</pre>"
+            f"<form method='post' action='/orch/monitor/{m['id']}/draft' style='display:inline'>"
+            "<button class='alt'>Generate AI draft</button></form>"
+            f"<form method='post' action='/orch/monitor/{m['id']}/archive' style='display:inline;margin-left:8px'>"
+            "<button class='alt' onclick=\"return confirm('Archive this message?')\">Archive</button></form>"
+            "<span class='muted' style='margin-left:8px'>(uses the reasoner — may take a moment)</span>"
             f"<form method='post' action='/orch/monitor/{m['id']}/respond'>"
             "<label class='muted'>Suggested response (agent draft — editable)</label><br>"
             f"<textarea name='suggested' rows='6' style='{_MON_TA}'>{escape(draft)}</textarea><br>"
@@ -196,7 +690,13 @@ def orch_monitor(messages: list[dict[str, Any]],
             "<button class='ok' style='margin-top:8px'>Submit</button>"
             "</form></div>"
         )
-    main = "<h1>Orchestration / Monitor</h1>" + "".join(blocks)
+    header = (
+        "<h1>Orchestration / Monitor</h1>"
+        "<form method='post' action='/orch/monitor/archive-all' style='margin-bottom:12px'>"
+        f"<button class='alt' onclick=\"return confirm('Archive all {len(messages)} pending "
+        f"message(s)?')\">Archive all ({len(messages)})</button></form>"
+    )
+    main = header + "".join(blocks)
     return page("Monitor",
                 f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
 
@@ -317,6 +817,181 @@ def _counts_cards(label: str, counts: dict[str, int]) -> str:
     return f"<div class='cards'>{cards}</div>"
 
 
+def _ago(dt: Optional[datetime]) -> str:
+    """Compact relative age, e.g. '3m', '2h', '5d'. '—' if unknown."""
+    if dt is None:
+        return "—"
+    try:
+        secs = (datetime.now(timezone.utc) - dt).total_seconds()
+    except (TypeError, ValueError):
+        return "—"
+    if secs < 90:
+        return f"{int(secs)}s"
+    if secs < 5400:
+        return f"{int(secs / 60)}m"
+    if secs < 172800:
+        return f"{int(secs / 3600)}h"
+    return f"{int(secs / 86400)}d"
+
+
+# Human labels for the raw issue_events.event_type values.
+_EVENT_LABEL = {
+    "state_change": "state change", "gate_enter": "entered gate",
+    "gate_pass": "gate passed", "gate_decline": "gate declined",
+    "gate_decision": "gate decision", "reclaimed": "reclaimed (stale)",
+    "directive": "human directive", "alert": "alert",
+    "code_committed": "code committed", "created": "created", "plan": "planned",
+    "promoted": "promoted", "promote_conflict": "promote conflict",
+    "downstream_synced": "downstream synced", "drift_score": "drift score",
+    "error": "error", "cancelled": "cancelled", "decomposed": "decomposed",
+    "senior_diagnosis": "senior diagnosis", "note": "note",
+    "comms_response_received": "reply received",
+}
+
+
+def _work_status(w: dict[str, Any]) -> tuple[str, str]:
+    """(color, label) for a current-work row. Priority: failed > stale > paused >
+    active — the most-urgent condition wins so the dot reflects what needs a human."""
+    state = w.get("state")
+    agent = w.get("agent")
+    # failed/off_rails are terminal-ish: the engine will NOT re-drive them and there is
+    # no auto-routing to senior — they need a human directive (re-open/retry or cancel).
+    # Say that plainly rather than implying senior is already on it.
+    if state == "failed":
+        return "red", "failed — needs directive (re-open/cancel)"
+    if state == "off_rails":
+        return "red", "off-rails — needs directive (re-open/cancel)"
+    if agent is None:
+        return "orange", "stale — unassigned"
+    if agent.get("stale"):
+        return "orange", "stale — worker silent"
+    if w.get("goal_paused"):
+        return "yellow", "paused — goal on hold"
+    if agent.get("paused_now"):
+        return "yellow", "paused — worker cooldown"
+    return "green", "active"
+
+
+_WORK_ORDER = {"red": 0, "orange": 1, "yellow": 2, "green": 3}
+
+
+def _active_work_panel(work: list[dict[str, Any]]) -> str:
+    """The 'Currently being worked on' table: one row per in-progress/latched issue,
+    with a status dot, owner, gate, and the most-recent lifecycle event + age."""
+    if not work:
+        return ("<h2>Currently being worked on</h2>"
+                "<p class='muted'>Nothing in progress right now.</p>")
+    rows_data = []
+    for w in work:
+        color, label = _work_status(w)
+        rows_data.append((color, label, w))
+    rows_data.sort(key=lambda t: (_WORK_ORDER.get(t[0], 9), -(t[2].get("id") or 0)))
+
+    rows = []
+    for color, label, w in rows_data:
+        agent = w.get("agent")
+        if agent is not None:
+            owner = (f"{escape(agent.get('team', '') or '')}/"
+                     f"{escape(agent.get('function', '') or '')} "
+                     f"<span class='muted'>#{agent.get('id')}</span>")
+        else:
+            owner = "<span class='muted'>unassigned</span>"
+        ev = w.get("last_event") or {}
+        ev_label = _EVENT_LABEL.get(ev.get("event_type"), ev.get("event_type") or "—")
+        to_state = ev.get("to_state")
+        if to_state and ev.get("event_type") == "state_change":
+            ev_label = f"{ev_label} → {escape(to_state)}"
+        last = f"{escape(ev_label)} <span class='muted'>· {_ago(ev.get('created_at'))} ago</span>"
+        # A failed/off-rails issue (red) needs a human directive — offer the one-click
+        # escalation to the senior dev right on the row.
+        if color == "red":
+            action = (
+                f"<form method='post' action='/issues/{w['id']}/promote-senior' "
+                "style='display:inline' "
+                "onsubmit=\"return confirm('Re-open and assign to the senior dev?')\">"
+                "<button class='alt' title='Re-open and hand to the senior escalation dev'>"
+                "→ senior</button></form>"
+            )
+        else:
+            action = ""
+        rows.append(
+            "<tr>"
+            f"<td><span class='dot {color}' title='{escape(label)}'></span></td>"
+            f"<td><a href='/issues/{w['id']}'>#{w['id']}</a></td>"
+            f"<td>{escape(label)}</td>"
+            f"<td>{owner}</td>"
+            f"<td class='muted'>{escape(w.get('gate_type') or '—')}</td>"
+            f"<td>{last}</td>"
+            f"<td>{escape((w.get('title') or '')[:70])}</td>"
+            f"<td>{action}</td>"
+            "</tr>"
+        )
+    return (
+        "<h2>Currently being worked on</h2>"
+        "<table><tr><th></th><th>Issue</th><th>Status</th><th>Owner</th>"
+        "<th>Gate</th><th>Last change</th><th>Title</th><th>Action</th></tr>"
+        + "".join(rows) + "</table>"
+    )
+
+
+def _acceptance_panel(acc: Optional[dict[str, Any]]) -> str:
+    """E2E acceptance-gate indicator: overall dot + last-run age + per-goal chips.
+    The gate is the GLOBAL real-instance Playwright run on merged main
+    (e2e-acceptance.sh) — not the per-issue QA gate."""
+    if not acc:
+        return ""
+    goals = acc.get("goals", [])
+    accepted = [g for g in goals if g["status"] == "accepted"]
+    failed = [g for g in goals if g["status"] == "failed"]
+    overall = "red" if failed else ("green" if accepted else "yellow")
+    lr = acc.get("last_run")
+    when = f"last run {_ago(lr['at'])} ago" if lr and lr.get("at") else "no runs recorded"
+    chips = " ".join(
+        f"<a href='/goals/{escape(g['goal'])}' style='text-decoration:none;margin-right:6px'>"
+        f"<span class='dot {'green' if g['status'] == 'accepted' else 'red'}'></span> "
+        f"#{escape(g['goal'])}</a>"
+        for g in goals
+    ) or "<span class='muted'>no goals evaluated yet</span>"
+    line = (f"<p class='muted' style='margin-top:4px'>{escape(lr['line'])}</p>"
+            if lr and lr.get("line") else "")
+    return (
+        f"<h2>E2E acceptance gate <span class='dot {overall}'></span></h2>"
+        f"<p class='muted'>{when} · {len(accepted)} accepted / {len(failed)} failed "
+        "· global real-instance Playwright gate on merged main</p>"
+        f"<p>{chips}</p>{line}"
+    )
+
+
+def _correspondence_main(messages: list[dict[str, Any]], open_count: int) -> str:
+    """Correspondence tail rendered in the main column (under the work panel):
+    the last N messages between agents / the orchestrator, newest first."""
+    badge_cls = "badge alert" if open_count else "badge"
+    head = (f"<a href='/orch/monitor' style='text-decoration:none'>"
+            f"<span class='{badge_cls}'>{open_count}</span> open in queue</a>")
+    rows = []
+    for m in messages:
+        kind = m.get("kind", "request")
+        issue = (f" · <a href='/issues/{m['issue_id']}'>#{m['issue_id']}</a>"
+                 if m.get("issue_id") else "")
+        if kind == "response":
+            tag = ("<span class='read'>✓ read</span>" if m.get("read_at")
+                   else "<span class='unread'>● unread</span>")
+        else:
+            tag = escape(m.get("status", ""))
+        reply = f" ↳#{m['reply_to']}" if m.get("reply_to") else ""
+        when = _ago(m.get("created_at"))
+        rows.append(
+            "<div class='msg'>"
+            f"<span class='muted'>{escape(m['from_team'])}→{escape(m['to_team'])} · "
+            f"{escape(kind)} · {tag}{escape(reply)}{issue} · {when} ago</span><br>"
+            f"{escape((m.get('subject') or '')[:90])}</div>"
+        )
+    body = "".join(rows) or "<p class='muted'>No correspondence yet.</p>"
+    return (f"<h2>Recent correspondence <span class='muted' style='font-weight:400'>"
+            f"(last {len(messages)})</span></h2>"
+            f"<div style='margin-bottom:10px'>{head}</div>{body}")
+
+
 def overview(summary: dict[str, Any], flash: str = "") -> str:
     pct = round(summary["fleet_focus"] * 100)
     flash_html = (
@@ -367,6 +1042,36 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
         "<h2>Flagged issues</h2><table><tr><th>Issue</th><th>State</th>"
         f"<th>Signals</th><th>Title</th></tr>{flagged_rows}</table>"
         if flagged_rows else "<h2>Flagged issues</h2><p class='muted'>None — all clear.</p>"
+    )
+
+    # Failed issues need a human directive (the engine won't re-drive terminal state).
+    # Re-open (retry) or cancel inline — no need to open each issue.
+    # A decomposed parent (epic) has no gate — retrying it is a no-op; the operator
+    # must retry its failed child instead. Show a pointer rather than a dead button.
+    def _fail_action(i: dict[str, Any]) -> str:
+        if i.get("has_children"):
+            return ("<span class='muted'>parent epic — "
+                    f"<a href='/issues/{i['id']}'>retry its failed child</a></span>")
+        return (
+            f"<form method='post' action='/issues/{i['id']}/directive' style='display:inline'>"
+            "<button class='ok'>re-open / retry</button></form> "
+            f"<form method='post' action='/issues/{i['id']}/cancel' style='display:inline' "
+            f"onsubmit=\"return confirm('Cancel #{i['id']}? Terminal.')\">"
+            "<button>cancel</button></form>"
+        )
+    fail_rows = "".join(
+        f"<tr><td><a href='/issues/{i['id']}'>#{i['id']}</a></td>"
+        f"<td class='muted'>{i.get('retry_count', 0)}</td>"
+        f"<td>{escape(i['title'])}</td><td>{_fail_action(i)}</td></tr>"
+        for i in summary.get("failed_issues", [])
+    )
+    failed_sec = (
+        "<h2>Needs resolution — failed</h2>"
+        "<p class='muted'>Terminal (retry cap hit); the engine won't re-drive these. "
+        "Re-open to retry, or cancel.</p>"
+        "<table><tr><th>Issue</th><th>Retries</th><th>Title</th><th>Action</th></tr>"
+        f"{fail_rows}</table>"
+        if fail_rows else ""
     )
 
     def _goal_actions(g: dict[str, Any], *, resume: bool, complete: bool) -> str:
@@ -444,16 +1149,19 @@ def overview(summary: dict[str, Any], flash: str = "") -> str:
             f"<div class='banner'>📨 {open_msgs} open message(s) in the orchestrator "
             "queue — <a href='/orch/monitor'>review</a>.</div>"
         )
-    side = _history_panel(summary.get("recent_messages", []), open_count=open_msgs)
+    work_panel = _active_work_panel(summary.get("active_work", []))
+    accept_panel = _acceptance_panel(summary.get("acceptance"))
+    corr_panel = _correspondence_main(
+        summary.get("recent_messages", []), open_count=open_msgs)
     main = (
         f"<h1>Fleet overview · focus {pct}%</h1>{msg_banner}{banner}{flash_html}"
+        f"{work_panel}{accept_panel}{corr_panel}"
         f"{add_goal_form}"
         f"<h2>Goals by state</h2>{_counts_cards('goals', summary['goals'])}"
         f"<h2>Issues by state</h2>{_counts_cards('issues', summary['issues'])}"
-        f"{suggested_html}{flagged}{goals}"
+        f"{suggested_html}{failed_sec}{flagged}{goals}"
     )
-    return page("Fleet",
-                f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
+    return page("Fleet", main)
 
 
 def goal_detail(goal: dict[str, Any], issues: list[dict[str, Any]]) -> str:
@@ -485,11 +1193,28 @@ def issue_detail(issue: dict[str, Any], events: list[dict[str, Any]]) -> str:
     import json
 
     directive = ""
-    if issue["state"] == "off_rails":
-        directive = (
-            f"<form method='post' action='/issues/{issue['id']}/directive'>"
-            "<button>Resume (clear quarantine)</button></form>"
-        )
+    if issue["state"] in ("off_rails", "failed"):
+        if issue.get("has_children"):
+            # A decomposed parent (epic) is a container with no gate of its own —
+            # retrying it can't do anything (and used to crash-loop it back to
+            # off_rails). Point the operator at the real work: retry the failed child.
+            directive = (
+                "<p class='muted' style='margin:4px 0'>Parent epic — retry can't apply "
+                "(no gate of its own). Re-open the <strong>failed child</strong> issue below; "
+                "this epic resolves automatically once its children are healthy.</p>"
+            )
+        else:
+            label = ("Resume (clear quarantine)" if issue["state"] == "off_rails"
+                     else "Re-open / retry")
+            directive = (
+                f"<form method='post' action='/issues/{issue['id']}/directive' style='display:inline'>"
+                f"<button class='ok'>{label}</button></form> "
+                f"<form method='post' action='/issues/{issue['id']}/promote-senior' "
+                "style='display:inline' "
+                "onsubmit=\"return confirm('Re-open and assign to the senior dev?')\">"
+                "<button class='alt' title='Re-open and hand to the senior escalation dev'>"
+                "→ senior</button></form> "
+            )
     # Cancel (terminal triage) for any non-done, non-cancelled issue — the operator
     # path for garbage / misrouted / superseded work (failed + off_rails included).
     cancel = ""
@@ -620,15 +1345,64 @@ def agents_page(agents: list[dict[str, Any]],
             return f"<span class='s-failed'>stale ({escape(str(a.get('last_seen') or '')[:19])})</span>"
         return escape(str(a.get("last_seen") or "never")[:19])
 
+    _inp = ("padding:3px 5px;background:var(--bg);color:var(--ink);"
+            "border:1px solid var(--line);border-radius:5px;font:inherit")
+
+    def _loop_cell(a: dict[str, Any]) -> str:
+        on = bool(a.get("loop_enabled"))
+        pill = (f"<span class='pill {'s-done' if on else 's-cancelled'}'>"
+                f"{'on' if on else 'off'}</span>")
+        toggle = (
+            "<form method='post' action='/agents/loop' style='display:inline'>"
+            f"<input type='hidden' name='agent_id' value='{a['id']}'>"
+            f"<input type='hidden' name='loop_enabled' value='{'false' if on else 'true'}'>"
+            f"<button type='submit'>{'disable' if on else 'enable'}</button></form>")
+        return f"{pill} {toggle}"
+
+    def _poll_cell(a: dict[str, Any]) -> str:
+        iv = int(a.get("poll_interval_seconds") or 300)
+        form = (
+            "<form method='post' action='/agents/loop' style='display:inline'>"
+            f"<input type='hidden' name='agent_id' value='{a['id']}'>"
+            f"<input name='poll_interval_seconds' type='number' min='60' max='7200' "
+            f"value='{iv}' style='width:64px;{_inp}'> "
+            "<button type='submit'>set</button></form>")
+        nxt = "—"
+        ls = a.get("last_seen")
+        if a.get("loop_enabled") and ls is not None:
+            try:
+                nxt = str(ls + timedelta(seconds=iv))[:19]
+            except Exception:  # noqa: BLE001
+                nxt = "—"
+        return f"{form}<div class='muted' style='font-size:12px'>next ~ {escape(nxt)}</div>"
+
+    def _pause_cell(a: dict[str, Any]) -> str:
+        pu = a.get("paused_until")
+        active = bool(pu) and pu > datetime.now(timezone.utc)
+        label = (f"<span class='s-blocked'>until {escape(str(pu)[:16])}</span>"
+                 if active else "<span class='muted'>active</span>")
+        pause = (
+            "<form method='post' action='/agents/pause' style='display:inline'>"
+            f"<input type='hidden' name='agent_id' value='{a['id']}'>"
+            "<input type='hidden' name='minutes' value='120'>"
+            "<button type='submit'>pause 2h</button></form>")
+        resume = (
+            "<form method='post' action='/agents/pause' style='display:inline'>"
+            f"<input type='hidden' name='agent_id' value='{a['id']}'>"
+            "<input type='hidden' name='clear' value='1'>"
+            "<button class='ok' type='submit'>resume</button></form>") if active else ""
+        return f"{label}<div style='margin-top:2px'>{pause} {resume}</div>"
+
     rows = "".join(
         f"<tr><td>#{a['id']}</td><td>{escape(a['team'])}/{escape(a['function'])}</td>"
         f"<td><span class='pill'>{escape(a['status'])}</span></td>"
-        f"<td>{escape(a['runtime'])}</td><td>{_seen(a)}</td></tr>"
+        f"<td>{escape(a['runtime'])}</td><td>{_seen(a)}</td>"
+        f"<td>{_loop_cell(a)}</td><td>{_poll_cell(a)}</td><td>{_pause_cell(a)}</td></tr>"
         for a in agents
     )
     registry = (
         "<table><tr><th>ID</th><th>Team/Function</th><th>Status</th><th>Runtime</th>"
-        f"<th>Last seen</th></tr>{rows}</table>"
+        f"<th>Last seen</th><th>Loop</th><th>Poll (s) · next</th><th>Cooldown</th></tr>{rows}</table>"
         if rows else "<p class='muted'>None registered.</p>"
     )
 

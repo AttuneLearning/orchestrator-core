@@ -57,11 +57,14 @@ _CANCELLABLE = _ACTIVE | {IssueState.FAILED.value, IssueState.OFF_RAILS.value}
 def validate_transition(from_state: str, to_state: str, *, directive: bool = False) -> bool:
     """True if from_state → to_state is legal. off_rails is always reachable from active.
 
-    directive=True unlocks the human-directive-only escape hatch: off_rails →
-    in_progress. The engine never sets it; only repository.apply_directive does,
-    so the quarantine latch stays latched for autonomous flow.
+    directive=True unlocks the human-directive-only escape hatch: off_rails OR
+    failed → in_progress. The engine never sets it; only repository.apply_directive
+    does, so the quarantine/terminal latch stays latched for autonomous flow.
     """
-    if directive and from_state == IssueState.OFF_RAILS.value:
+    if directive and from_state in (
+        IssueState.OFF_RAILS.value,
+        IssueState.FAILED.value,
+    ):
         return to_state == IssueState.IN_PROGRESS.value
     if to_state == IssueState.CANCELLED.value:
         return from_state in _CANCELLABLE

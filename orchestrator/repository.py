@@ -17,7 +17,7 @@ from psycopg.rows import class_row, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from .models import Agent, Goal, Issue, IssueEvent, IssueState, MemoryNote
+from .models import Agent, Goal, GoalState, Issue, IssueEvent, IssueState, MemoryNote
 from .state_machine import validate_transition
 
 # Module-level cache for pgvector availability.  None = not yet checked.
@@ -314,6 +314,24 @@ def set_work_type(pool: ConnectionPool, issue_id: int, work_type: str) -> None:
 
 def claim_issue(pool: ConnectionPool, issue_id: int, agent_id: int) -> None:
     with pool.connection() as conn, conn.transaction():
+        # Team-affinity guard: a worker may only claim issues for its OWN team.
+        # This is the hard invariant behind the soft "pick an issue whose team is
+        # <team>" prompt rule — without it a model can grab another team's orphaned
+        # issue (e.g. a frontend worker claiming a backend issue that was reclaimed
+        # off a stale backend worker). 'senior' is a cross-team escalation role and
+        # is exempt (it works pre-assigned issues across every lane).
+        row = conn.execute(
+            "SELECT i.team, a.team FROM issues i, agents a "
+            "WHERE i.id = %s AND a.id = %s",
+            (issue_id, agent_id),
+        ).fetchone()
+        if row is not None:
+            issue_team, agent_team = row
+            if agent_team != "senior" and issue_team != agent_team:
+                raise ValueError(
+                    f"agent {agent_id} (team '{agent_team}') may not claim issue "
+                    f"{issue_id} (team '{issue_team}'): cross-team claim rejected"
+                )
         conn.execute(
             "UPDATE issues SET assigned_agent = %s, updated_at = now() WHERE id = %s",
             (agent_id, issue_id),
@@ -395,30 +413,42 @@ def apply_directive(
     note: str = "",
     actor: str = "human",
 ) -> Issue:
-    """Human directive: un-quarantine an off_rails issue (off_rails → in_progress).
+    """Human directive: recover a latched issue (off_rails OR failed → in_progress).
 
-    The only path out of the off_rails latch. Resets retry/step counters and
-    keeps the gate, so work resumes where it was quarantined. Recorded as a
-    'directive' event — the focus sweep only considers events after the latest
-    directive, so the issue gets a genuinely fresh start.
+    The only path out of the off_rails quarantine and the failed terminal latch.
+    Resets retry/step counters and keeps the gate, so work resumes where it
+    stopped. Recorded as a 'directive' event — the focus sweep only considers
+    events after the latest directive, so the issue gets a genuinely fresh start.
+    If the issue's parent goal was closed/paused by this failure, it is re-set to
+    'active' so the recovered issue actually gets picked back up.
     """
     issue = get_issue(pool, issue_id)
     if issue is None:
         raise ValueError(f"no issue {issue_id}")
     to_state = IssueState.IN_PROGRESS.value
-    if issue.state != IssueState.OFF_RAILS.value or not validate_transition(
+    _recoverable = (IssueState.OFF_RAILS.value, IssueState.FAILED.value)
+    if issue.state not in _recoverable or not validate_transition(
         issue.state, to_state, directive=True
     ):
         raise ValueError(
             f"directive '{directive}' not applicable: issue {issue_id} is "
-            f"'{issue.state}', expected 'off_rails'"
+            f"'{issue.state}', expected 'off_rails' or 'failed'"
         )
-    return update_state(
+    recovered = update_state(
         pool, issue_id, to_state, gate_type=issue.gate_type,
         event_type="directive",
         payload={"directive": directive, "note": note, "actor": actor},
         retry_count=0, step_count=0,
     )
+    # Re-activate a parent goal that reconcile closed/paused on this failure,
+    # otherwise the recovered issue would sit in a non-open goal and never run.
+    if issue.goal_id is not None:
+        goal = get_goal(pool, issue.goal_id)
+        if goal is not None and goal.state in (
+            GoalState.DONE.value, GoalState.PAUSED.value,
+        ):
+            set_goal_state(pool, issue.goal_id, GoalState.ACTIVE.value)
+    return recovered
 
 
 def cancel_issue(
@@ -586,7 +616,7 @@ def count_by_state(pool: ConnectionPool, table: str) -> dict[str, int]:
 # --------------------------------------------------------------------------- #
 
 _AGENT_COLS = ("id, team, function, runtime, status, last_seen, created_at, "
-               "loop_enabled, poll_interval_seconds")
+               "loop_enabled, poll_interval_seconds, paused_until")
 
 
 def register_agent(
@@ -662,6 +692,17 @@ def set_agent_loop(pool: ConnectionPool, agent_id: int, *,
     return get_agent(pool, agent_id)
 
 
+def set_agent_pause(pool: ConnectionPool, agent_id: int,
+                    paused_until: Optional[datetime]) -> Optional[Agent]:
+    """Set (or clear, with None) an agent's cooldown window. While paused_until is
+    in the future the engine won't assign it work and a pull worker sleeps until
+    then. Used for token-limit backoff (now()+2h) and manual dashboard pauses."""
+    with pool.connection() as conn:
+        conn.execute("UPDATE agents SET paused_until = %s WHERE id = %s",
+                     (paused_until, agent_id))
+    return get_agent(pool, agent_id)
+
+
 def find_idle_agent(
     pool: ConnectionPool, team: str, function: Optional[str] = None,
     runtime: Optional[str] = None,
@@ -669,7 +710,8 @@ def find_idle_agent(
     """Pick an available agent for a team. `function` (dev/qa/lead) and `runtime`
     (api/cli/external) narrow the search; idle agents rank ahead of busy ones.
     Pull gates pass runtime='external' to require a live worker."""
-    clauses = ["team = %s", "status != 'offline'"]
+    clauses = ["team = %s", "status != 'offline'",
+               "(paused_until IS NULL OR paused_until <= now())"]
     params: list[Any] = [team]
     if function:
         clauses.append("function = %s")
@@ -998,6 +1040,68 @@ def update_adr(pool: ConnectionPool, adr_key: str, *, title: Optional[str] = Non
         return dict(zip(_ADR_COLS, row))
 
 
+# -- docs: shared cross-agent development docs (migration 0018) ------------- #
+_DOC_COLS = ["id", "path", "title", "body", "format", "author",
+             "created_at", "updated_at"]
+
+
+def doc_upsert(pool: ConnectionPool, path: str, *, title: str = "", body: str = "",
+               format: str = "markdown", author: str = "") -> dict[str, Any]:
+    """Create or replace a doc at `path` (unique). On conflict, overwrites
+    title/body/format/author and bumps updated_at — so an edit from the dashboard
+    or an agent's doc_write is a single idempotent call."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            f"""INSERT INTO docs (path, title, body, format, author)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (path) DO UPDATE SET
+                    title = EXCLUDED.title, body = EXCLUDED.body,
+                    format = EXCLUDED.format, author = EXCLUDED.author,
+                    updated_at = now()
+                RETURNING {', '.join(_DOC_COLS)}""",
+            (path, title, body, format, author),
+        ).fetchone()
+    return dict(zip(_DOC_COLS, row))
+
+
+def doc_get(pool: ConnectionPool, path: str) -> Optional[dict[str, Any]]:
+    with pool.connection() as conn:
+        row = conn.execute(
+            f"SELECT {', '.join(_DOC_COLS)} FROM docs WHERE path = %s", (path,),
+        ).fetchone()
+    return dict(zip(_DOC_COLS, row)) if row else None
+
+
+def doc_list(pool: ConnectionPool) -> list[dict[str, Any]]:
+    """All docs, newest-first. Body omitted from the list view for size."""
+    cols = [c for c in _DOC_COLS if c != "body"]
+    with pool.connection() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(cols)} FROM docs ORDER BY updated_at DESC",
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def doc_search(pool: ConnectionPool, query: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Term search over title + body (ILIKE). Term overlap is the reliable signal
+    at this corpus size — same rationale as monitor_kb retrieval."""
+    cols = [c for c in _DOC_COLS if c != "body"]
+    like = f"%{query}%"
+    with pool.connection() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(cols)} FROM docs "
+            "WHERE title ILIKE %s OR body ILIKE %s ORDER BY updated_at DESC LIMIT %s",
+            (like, like, limit),
+        ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def doc_delete(pool: ConnectionPool, path: str) -> bool:
+    with pool.connection() as conn:
+        cur = conn.execute("DELETE FROM docs WHERE path = %s RETURNING id", (path,))
+        return cur.fetchone() is not None
+
+
 _MESSAGE_COLS = ["id", "from_team", "to_team", "subject", "body", "priority",
                  "issue_id", "kind", "status", "draft_response", "reply_to",
                  "read_at", "created_at"]
@@ -1091,6 +1195,28 @@ def mark_message_read(pool: ConnectionPool, message_id: int) -> None:
     """Mark a message consumed so it drops out of my_queue (read_at = now())."""
     with pool.connection() as conn:
         conn.execute("UPDATE messages SET read_at = now() WHERE id = %s", (message_id,))
+
+
+def latest_issue_events(
+    pool: ConnectionPool, issue_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    """Most-recent lifecycle event per issue — powers the dashboard 'current work'
+    view's 'last major state change' column. Returns {issue_id: {event_type,
+    from_state, to_state, created_at, payload}}. Empty in → empty out."""
+    if not issue_ids:
+        return {}
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (issue_id) issue_id, event_type, from_state, "
+            "to_state, created_at, payload FROM issue_events "
+            "WHERE issue_id = ANY(%s) ORDER BY issue_id, id DESC",
+            (list(issue_ids),),
+        ).fetchall()
+    return {
+        r[0]: {"event_type": r[1], "from_state": r[2], "to_state": r[3],
+               "created_at": r[4], "payload": r[5]}
+        for r in rows
+    }
 
 
 def list_messages(pool: ConnectionPool, limit: int = 50) -> list[dict[str, Any]]:
@@ -1382,7 +1508,15 @@ def accept_proposal(pool: ConnectionPool, method: str, path: str,
 
 def accept_contract_review(pool: ConnectionPool, method: str, path: str,
                            status: Optional[str] = None) -> dict[str, Any]:
-    """Accept the contract row currently visible on the /contracts page."""
+    """Accept the contract row currently visible on the /contracts page.
+
+    New contract imports land in ``contract_proposals`` and are accepted via
+    ``accept_proposal``. Older/agent-created needs may already exist directly in
+    ``contracts`` with status ``proposed`` and no proposal row. The dashboard
+    renders both forms of pending review, so its Accept action must handle both.
+    Direct proposed rows become ``agreed`` by default: the shape is accepted and
+    frontend gates unblock, without claiming the endpoint is already live.
+    """
     p = get_proposal(pool, method, path)
     if p is not None:
         contract = accept_proposal(pool, method, path, status=status)

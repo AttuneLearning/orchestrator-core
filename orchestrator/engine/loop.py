@@ -220,6 +220,23 @@ class Engine:
 
     # -- tick phases -------------------------------------------------------- #
 
+    def _ack_triage(self, msg: dict, *, from_team: str, subject: str, body: str,
+                    issue_id: Optional[int] = None) -> None:
+        """Best-effort receipt sent to the original sender when their request is
+        triaged (accepted into work, declined, or undeliverable). Lands in their
+        comms_read inbox (kind='response') so a request is never silently consumed.
+        Never lets a messaging failure abort the ingest tick."""
+        try:
+            repo.create_message(
+                self.pool, from_team=from_team, to_team=msg["from_team"],
+                subject=subject, body=body,
+                priority=msg.get("priority", "medium"),
+                issue_id=issue_id, kind="response", status="sent",
+                reply_to=msg["id"],
+            )
+        except Exception:  # noqa: BLE001 — an ack must never break triage
+            pass
+
     def _ingest(self, summary: TickSummary) -> None:
         """Triage pending inbound requests into local issues.
 
@@ -233,6 +250,10 @@ class Engine:
                 if team is None:
                     repo.triage_message(self.pool, msg["id"], accept=False,
                                         reason=f"unknown team {msg['to_team']!r}")
+                    self._ack_triage(msg, from_team="orchestration",
+                                     subject=f"Undeliverable: {msg['subject']}",
+                                     body=(f"Your message could not be routed: "
+                                           f"team {msg['to_team']!r} is not registered."))
                     summary.rejected += 1
                     continue
                 if team.id in MONITOR_TEAMS:
@@ -251,17 +272,35 @@ class Engine:
                         pipeline=pipeline,
                     )
                     repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
-                    repo.create_issue(
+                    issue = repo.create_issue(
                         self.pool, goal.id,
                         decision.title or msg["subject"], decision.description,
                         team=team.id, pipeline=pipeline, triggered_by_message=True,
                         origin_message_id=msg["id"],
                     )
                     repo.triage_message(self.pool, msg["id"], accept=True)
+                    # Acknowledge the sender on triage: a cross-team request is
+                    # consumed into work (it never lands in the recipient's
+                    # comms_read inbox), so without this the sender can't tell it
+                    # arrived. Sent from the recipient team so this ack and the
+                    # later comms_response completion reply form one thread.
+                    self._ack_triage(
+                        msg, from_team=team.id, issue_id=issue.id,
+                        subject=f"Received: {msg['subject']}",
+                        body=(f"Your request was triaged into goal #{goal.id} / "
+                              f"issue #{issue.id} ({issue.title}) on the {team.id} "
+                              f"board and is queued for work. A completion reply "
+                              f"will follow when it's done."))
                     summary.ingested += 1
                 else:
                     repo.triage_message(self.pool, msg["id"], accept=False,
                                         reason=decision.reason)
+                    self._ack_triage(
+                        msg, from_team=team.id,
+                        subject=f"Not filed: {msg['subject']}",
+                        body=(f"Your request to {team.id} was reviewed but not "
+                              f"turned into work: "
+                              f"{decision.reason or 'no actionable item identified'}."))
                     summary.rejected += 1
             except Exception as exc:  # noqa: BLE001 - isolate message failures
                 summary.errors.append(f"ingest message {msg['id']}: {exc}")
@@ -603,22 +642,46 @@ class Engine:
                 summary.advanced += 1
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"work issue {issue.id}: {exc}")
-                repo.append_log(self.pool, issue.id, "error", {"phase": "work", "error": str(exc)})
+                self._safe_log(issue.id, {"phase": "work", "error": str(exc)})
 
         # Review step: IN_REVIEW issues get a gate_review and transition.
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_REVIEW.value]):
             try:
                 pipeline = self._pipeline(issue)
                 gate = pipeline.gate(issue.gate_type)
+                if gate is None:
+                    # No such gate in this issue's pipeline (e.g. a re-opened parent/epic,
+                    # or a stale gate_type). Reviewing it would dereference None and crash
+                    # every tick — the repeated errors then trip the drift sweep and the
+                    # issue is quarantined to off_rails. Fail safe: park it in blocked for
+                    # human triage instead of crash-looping.
+                    self._transition(
+                        issue, IssueState.BLOCKED.value, gate_type=issue.gate_type,
+                        event_type="state_change",
+                        payload={"reason": f"no gate '{issue.gate_type}' in pipeline "
+                                 f"'{issue.pipeline}' — not reviewable (misrouted/parent epic); blocked"},
+                    )
+                    continue
                 # Verdict evidence: include the payloads of pull-worker reports
                 # (what the coder committed, what the QA runner found) so the
                 # reviewer judges the actual work, not just the event sequence.
                 _evidence = {"code_committed", "tests_run", "verification"}
+                # Fresh-start after a human directive (ADR-DEV-001 evidence rule):
+                # a recovered/resumed issue must be judged on its POST-directive
+                # evidence only — stale pre-directive declines must not re-trip the
+                # verdict. Same cutoff the sweep uses (focus.signals_after_directive):
+                # recent_events is newest-first, so keep everything before the latest
+                # 'directive' event.
+                _events = repo.recent_events(self.pool, issue.id, limit=50)
+                _cut = next((i for i, e in enumerate(_events)
+                             if e.event_type == "directive"), None)
+                if _cut is not None:
+                    _events = _events[:_cut]
                 recent = [
                     ({"event_type": e.event_type, "to_state": e.to_state,
                       "payload": e.payload} if e.event_type in _evidence
                      else {"event_type": e.event_type, "to_state": e.to_state})
-                    for e in repo.recent_events(self.pool, issue.id, limit=20)
+                    for e in _events
                 ]
                 rules = self._applicable_rules(issue)
                 if issue.gate_type == "contract_check":
@@ -627,12 +690,17 @@ class Engine:
                     review = GateReview(passed=True, reasons=["contracts satisfied"])
                 elif issue.gate_type == "intake":
                     # Intake is lightweight admission, NOT an ADR-compliance verdict.
-                    # ADR governance belongs at gates where the work exists (qa_gate/
-                    # completion); judging a not-yet-implemented issue's description
-                    # against rules like "ships matching tests" is structurally
-                    # premature (the tests can't exist yet) and rejects valid work.
-                    # Admit without a reasoner call — applies to every pipeline's intake.
+                    # ADR governance belongs at gates where the work exists (qa_gate);
+                    # judging a not-yet-implemented issue's description against rules like
+                    # "ships matching tests" is structurally premature (the tests can't
+                    # exist yet) and rejects valid work. Admit without a reasoner call.
                     review = GateReview(passed=True, reasons=["admitted"])
+                elif issue.gate_type == "completion":
+                    # Completion is bookkeeping — record + close AFTER qa_gate already
+                    # rendered the real ADR/quality verdict. Re-running the (flaky) reasoner
+                    # here only lets it falsely veto already-approved, test-green work, so
+                    # auto-pass. The substantive review lives at qa_gate.
+                    review = GateReview(passed=True, reasons=["completed"])
                 else:
                     review = self._call_with_rules(
                         self.reasoner.gate_review, issue, issue.gate_type, recent,
@@ -646,6 +714,28 @@ class Engine:
                 payload = {"reasons": review.reasons}
                 if getattr(review, "violated_rules", None):
                     payload["violated_rules"] = review.violated_rules
+
+                if issue.gate_type == "e2e" and review.passed:
+                    from ..backup import record_backup
+                    payload["database_backup"] = record_backup(
+                        self.pool, self.settings,
+                        reason=f"after-e2e-issue-{issue.id}",
+                        issue_id=issue.id,
+                        goal_id=issue.goal_id,
+                    )
+
+                # Auto-promote on success: when an issue closes, merge its committed
+                # branch into the integration branch so the next team sees the work.
+                # COMPLETE-AND-LOG: the issue always completes. On a clean merge a
+                # 'promoted' event is recorded; on CONFLICT the merge is aborted (tree
+                # left clean), a 'promote_conflict' event is logged, and orch-monitor is
+                # notified (surfaces on the dashboard Fleet page) for a human to merge
+                # manually. We never bounce/re-open over a promote conflict.
+                if (outcome.state == IssueState.DONE.value
+                        and self.settings.auto_promote_enabled):
+                    from ..apply.worktree import auto_promote_on_done
+                    payload["promote"] = auto_promote_on_done(self.pool, issue, self.settings)
+
                 self._transition(
                     issue, outcome.state, gate_type=outcome.gate_type,
                     event_type=outcome.event_type,
@@ -662,7 +752,16 @@ class Engine:
                     summary.failed += 1
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"review issue {issue.id}: {exc}")
-                repo.append_log(self.pool, issue.id, "error", {"phase": "review", "error": str(exc)})
+                self._safe_log(issue.id, {"phase": "review", "error": str(exc)})
+
+    def _safe_log(self, issue_id: int, payload: dict) -> None:
+        """Best-effort error logging that NEVER propagates. An issue can be
+        deleted/cancelled mid-tick, so append_log may hit a FK violation; that
+        must not escape an exception handler and crash the whole daemon tick."""
+        try:
+            repo.append_log(self.pool, issue_id, "error", payload)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _sweep(self, summary: TickSummary) -> None:
         active = repo.list_issues(self.pool, states=_ACTIVE_STATES)
@@ -705,20 +804,34 @@ class Engine:
                 if age is not None and age <= self.t.agent_stale_seconds:
                     continue  # worker is alive
                 dead = issue.assigned_agent
-                n = sum(1 for e in repo.recent_events(self.pool, issue.id, limit=200)
-                        if e.event_type == "reclaimed") + 1
+                # Count reclaims only SINCE the latest human directive. apply_directive
+                # (un-quarantine) emits a 'directive' event; resetting the reclaim budget
+                # here mirrors the focus sweep's signals_after_directive, so a resumed
+                # issue gets a genuinely fresh reclaim_cap instead of being re-quarantined
+                # on the next stale blip by a stale cumulative count.
+                _events = repo.recent_events(self.pool, issue.id, limit=200)
+                _since = max((e.seq for e in _events if e.event_type == "directive"),
+                             default=0)
+                n = sum(1 for e in _events
+                        if e.event_type == "reclaimed" and e.seq > _since) + 1
                 repo.set_agent_status(self.pool, dead, "offline")
                 repo.unassign_issue(self.pool, issue.id)
                 repo.append_log(self.pool, issue.id, "reclaimed",
                                 {"agent": dead, "count": n, "stale_seconds": age})
+                summary.reclaimed += 1
+                # A stale worker is a LIVENESS signal, not issue drift. Do NOT quarantine
+                # (off_rails) or pause the goal on reclaim_cap — pull workers are LLM CLI
+                # agents whose cycles (long blocking test/build runs + reasoning latency)
+                # routinely exceed agent_stale_seconds and cannot emit a heartbeat mid-run,
+                # so they get falsely reclaimed while perfectly alive. The issue stays
+                # in_progress and the _assign reassign scan hands it to a fresh worker.
+                # Quarantine belongs only to genuine DRIFT (_sweep) and gate FAILURE
+                # (retry_cap → failed). Past the cap we raise a visibility ALERT only.
                 if n >= self.t.reclaim_cap:
-                    self._transition(issue, IssueState.OFF_RAILS.value,
-                                     gate_type=issue.gate_type, event_type="state_change",
-                                     payload={"reason": "reclaim_cap", "reclaims": n})
-                    repo.set_goal_state(self.pool, issue.goal_id, GoalState.PAUSED.value)
-                    summary.quarantined += 1
-                else:
-                    summary.reclaimed += 1
+                    repo.append_log(self.pool, issue.id, "alert",
+                                    {"reason": "reclaim_cap_exceeded", "reclaims": n,
+                                     "stale_seconds": age, "note": "worker repeatedly stale; "
+                                     "reassigning (not quarantining) — check worker liveness"})
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"reclaim issue {issue.id}: {exc}")
 
@@ -743,11 +856,56 @@ class Engine:
                 continue
             states = {i.state for i in issues}
             if states <= _TERMINAL:
-                if IssueState.OFF_RAILS.value in states or IssueState.FAILED.value in states:
-                    repo.set_goal_state(self.pool, goal.id, GoalState.PAUSED.value)
-                    summary.goals_paused += 1
+                bad = [
+                    i for i in issues
+                    if i.state in (IssueState.OFF_RAILS.value, IssueState.FAILED.value)
+                ]
+                if bad:
+                    # Surface, don't freeze: post one actionable alert to the
+                    # orch-monitor Correspondence pane naming the unresolved
+                    # issue(s), then close the goal. A human recovers any issue
+                    # via apply_directive (failed/off_rails → in_progress), which
+                    # re-activates this goal. Closing here means reconcile won't
+                    # re-process it, so the alert fires exactly once.
+                    ids = [i.id for i in bad]
+                    reasons = "; ".join(
+                        f"#{i.id} ({i.state})" for i in bad
+                    )
+                    repo.create_message(
+                        self.pool,
+                        from_team="orchestration",
+                        to_team="orch-monitor",
+                        subject=(
+                            f"Goal #{goal.id} closed with unresolved issue(s): "
+                            f"{ids}"
+                        ),
+                        body=(
+                            f"Goal '{goal.title[:80]}' finished, but {reasons} "
+                            f"did not pass. Review on the Fleet page. To retry, "
+                            f"recover an issue with the un-fail directive "
+                            f"(apply_directive resume) — it resets the issue to "
+                            f"in_progress and re-activates this goal."
+                        ),
+                        priority="high",
+                        issue_id=ids[0],
+                        kind="request",
+                    )
+                    repo.set_goal_state(self.pool, goal.id, GoalState.DONE.value)
+                    from ..backup import record_backup
+                    record_backup(
+                        self.pool, self.settings,
+                        reason=f"goal-{goal.id}-completion",
+                        goal_id=goal.id,
+                    )
+                    summary.goals_done += 1
                 else:
                     repo.set_goal_state(self.pool, goal.id, GoalState.DONE.value)
+                    from ..backup import record_backup
+                    record_backup(
+                        self.pool, self.settings,
+                        reason=f"goal-{goal.id}-completion",
+                        goal_id=goal.id,
+                    )
                     summary.goals_done += 1
 
     # -- public ------------------------------------------------------------- #

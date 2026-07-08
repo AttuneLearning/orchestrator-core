@@ -12,6 +12,7 @@ from ..config import load_settings
 from ..db import get_pool
 from . import (
     tools_contracts,
+    tools_docs,
     tools_issues,
     tools_memory,
     tools_skills,
@@ -23,11 +24,17 @@ def build_server() -> FastMCP:
     settings = load_settings()
     pool = get_pool(settings)
     mcp = FastMCP("orchestrator")
+    # Silence the low-level server's per-request INFO spam ("Processing request of
+    # type CallToolRequest") — it floods every worker's tmux pane / log with no signal.
+    # Set at the logger level so it holds regardless of FastMCP's root logging config.
+    import logging
+    logging.getLogger("mcp").setLevel(logging.WARNING)
     tools_issues.register(mcp, pool)
     tools_memory.register(mcp, pool)
     tools_skills.register(mcp, pool)
     tools_status.register(mcp, pool, settings)
     tools_contracts.register(mcp, pool)
+    tools_docs.register(mcp, pool)
     # Zero-touch grounding: build the orch-monitor KB on first connect if empty.
     try:
         from ..monitor_kb import bootstrap_monitor_kb

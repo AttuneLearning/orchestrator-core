@@ -5,8 +5,8 @@
 # scope ADR rules — adr_rules._repos_match). Pull workers clone the single
 # monorepo and work in a git worktree scoped to their team's package path.
 #
-# NOT active by default. Activate after the monorepo is live:
-#   ROSTER_FILE=config/roster.monorepo.yaml   (in .env)
+# Selected for the cadencelms instance in config/instances.yaml. ROSTER_FILE
+# remains available as an explicit environment override.
 # =============================================================================
 
 roles:

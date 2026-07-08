@@ -91,16 +91,12 @@ def test_verification_is_a_known_gate_type():
     assert GateType.VERIFICATION.value == "verification"
 
 
-def test_pull_fe_has_an_e2e_pull_gate_before_the_verdict():
+def test_pull_fe_defers_e2e_until_acceptance_harness_lands():
     p = load_pipelines(load_settings().pipelines)["pull-fe"]
     assert [g.type for g in p.gates] == [
-        "intake", "contract_check", "implementation", "verification", "e2e",
+        "intake", "contract_check", "implementation", "verification",
         "qa_gate", "completion", "comms_response",
     ]
-    e2e = p.gate("e2e")
-    assert e2e.mode == "pull" and e2e.owner == "qa"   # QA runner executes Playwright
-    assert e2e.on_failure == "implementation"
-    assert next_gate(p, "e2e").type == "qa_gate"      # e2e feeds the reviewer verdict
     from orchestrator.models import GateType
     assert GateType.E2E.value == "e2e"
     # contract_check sits between intake and implementation (verdict gate, lead-owned).
@@ -108,3 +104,4 @@ def test_pull_fe_has_an_e2e_pull_gate_before_the_verdict():
     assert cc.mode == "verdict" and cc.owner == "lead" and cc.on_failure == "intake"
     assert next_gate(p, "intake").type == "contract_check"
     assert next_gate(p, "contract_check").type == "implementation"
+    assert next_gate(p, "verification").type == "qa_gate"

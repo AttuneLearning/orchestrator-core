@@ -34,8 +34,8 @@ from .db import close_pool, get_pool, migrate
 _CANCEL_TERMINAL = {"done", "cancelled"}
 
 # Files that affect the API contract review surface. The importer still consumes
-# the explicit seed file; this list is the tripwire that tells agents/CI when the
-# seed must be staged or likely needs edits.
+# the explicit seed file; this list is only the tripwire that tells agents/CI
+# when the seed must be staged, and when source changes likely require seed edits.
 _CONTRACT_SOURCE_PREFIXES = ("packages/contracts/",)
 _CONTRACT_API_PREFIX = "apps/api/src/"
 _CONTRACT_API_EXACT = {"apps/api/src/app.ts"}
@@ -58,7 +58,12 @@ def _is_contract_relevant(path: str, seed_rel: str = "contracts.seed.json") -> b
 
 
 def _git_changed_files(repo_path: str, base_ref: str = "main") -> set[str]:
-    """Return committed, staged, unstaged, and untracked paths changed in repo_path."""
+    """Return committed, staged, unstaged, and untracked paths changed in repo_path.
+
+    `base_ref...HEAD` is the normal issue-branch view. The other diffs catch local
+    edits before commit, which is how agent runs usually look immediately before
+    reporting work.
+    """
 
     def git(*args: str) -> list[str]:
         r = subprocess.run(
@@ -489,6 +494,14 @@ def _cmd_sync_contracts(args, settings) -> int:
     return 0
 
 
+def _cmd_backup_db(args, settings) -> int:
+    from .backup import backup_database
+
+    result = backup_database(settings, reason=args.reason)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("passed") else 1
+
+
 def _cmd_ingest_monitor_kb(args, settings) -> int:
     """Rebuild the orch-monitor knowledge base (scope monitor:kb) from current
     source — migrations, IMPLEMENTATION_SUMMARY, MCP docstrings, repo API, config,
@@ -554,12 +567,61 @@ def _cmd_self_update(args, settings) -> int:
     return 0
 
 
+def _cmd_install_launchers(args, settings) -> int:
+    """Install the parent-dir agent launcher kit into a project workspace."""
+    import shutil
+    from pathlib import Path
+
+    src = REPO_ROOT / "templates" / "project-launchers"
+    if not src.exists():
+        print(f"launcher templates missing: {src}", file=sys.stderr)
+        return 1
+
+    workspace = Path(args.workspace).expanduser().resolve()
+    project = args.project or getattr(args, "instance", None) or workspace.name
+    replacements = {
+        "__WORKSPACE_ROOT__": str(workspace),
+        "__ORCH_PATH__": str(Path(args.orchestrator_path).expanduser().resolve()),
+        "__PROJECT_NAME__": project,
+        "__DASHBOARD_URL__": args.dashboard_url,
+    }
+
+    planned: list[tuple[Path, Path]] = []
+    for path in src.rglob("*"):
+        rel = path.relative_to(src)
+        dest = workspace / rel
+        if path.is_dir():
+            continue
+        if dest.exists() and not args.force:
+            print(f"exists, not overwriting: {dest} (use --force)")
+            return 1
+        planned.append((path, dest))
+
+    if args.dry_run:
+        print(f"would install {len(planned)} launcher file(s) into {workspace}")
+        for _, dest in planned:
+            print(f"  {dest}")
+        return 0
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    for path, dest in planned:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text()
+        for key, val in replacements.items():
+            text = text.replace(key, val)
+        dest.write_text(text)
+        shutil.copymode(path, dest)
+        print("wrote", dest)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument(
         "--instance", "-i", default=None, metavar="KEY",
-        help="orchestrator instance from config/instances.yaml; also honored via ORCH_INSTANCE"
-    )
+        help="orchestrator instance (dev group) from config/instances.yaml; "
+             "selects the DB + roster + group-local settings by name instead of "
+             "injecting DATABASE_URL/ROSTER_FILE. Also honored via ORCH_INSTANCE.")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("migrate", help="apply pending SQL migrations").set_defaults(func=_cmd_migrate)
@@ -709,6 +771,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="validate and report what would be staged without touching the DB")
     sc.set_defaults(func=_cmd_sync_contracts)
 
+    bkp = sub.add_parser("backup-db",
+                         help="backup the selected orchestrator coordinator database")
+    bkp.add_argument("--reason", default="manual",
+                     help="reason label included in the backup filename and result")
+    bkp.set_defaults(func=_cmd_backup_db)
+
     sub.add_parser("ingest-monitor-kb",
                    help="rebuild the orch-monitor knowledge base from current source"
                    ).set_defaults(func=_cmd_ingest_monitor_kb)
@@ -721,12 +789,30 @@ def build_parser() -> argparse.ArgumentParser:
                    help="human-gated: git pull + migrate + rebuild monitor KB"
                    ).set_defaults(func=_cmd_self_update)
 
+    il = sub.add_parser("install-launchers",
+                        help="install parent-dir agent launcher scripts into a workspace")
+    il.add_argument("--workspace", required=True,
+                    help="workspace parent dir where launchers should be written")
+    il.add_argument("--project", default=None,
+                    help="orchestrator instance/project name (default: --instance or workspace basename)")
+    il.add_argument("--orchestrator-path", default=str(REPO_ROOT),
+                    help="path to this orchestrator project (default: current install)")
+    il.add_argument("--dashboard-url", default="http://127.0.0.1:8800",
+                    help="dashboard base URL")
+    il.add_argument("--force", action="store_true",
+                    help="overwrite existing launcher files")
+    il.add_argument("--dry-run", action="store_true",
+                    help="show files that would be written")
+    il.set_defaults(func=_cmd_install_launchers)
+
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Propagate the instance so a re-load inside `serve` (mcp_server) resolves the
+    # same coordinator without re-parsing argv.
     if getattr(args, "instance", None):
         os.environ["ORCH_INSTANCE"] = args.instance
     settings = load_settings(getattr(args, "instance", None))

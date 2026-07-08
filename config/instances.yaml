@@ -1,27 +1,24 @@
 # Coordinators this dashboard can switch between via ?project=<key>.
-# One database == one coordinator (DB-per-project model). The dashboard reads
-# this file to build the project dropdown and to route each request to the right
-# DB; the daemon for each project must run against the same DATABASE_URL.
-#
-# Secrets stay in the environment: `database_url_env` names the env var holding
-# that coordinator's DATABASE_URL, so this file is safe to commit. (`database_url`
-# may be given literally for throwaway/local use, but prefer the env indirection.)
-# The dashboard process must have every referenced env var set.
+# Global defaults live in config/settings.yaml. Project-local overrides
+# live under each instance's settings: block below.
 
 default: cadencelms
-
 instances:
   cadencelms:
     label: CadenceLMS
-    database_url_env: DATABASE_URL          # reuses the instance .env
+    database_url: postgresql://orchestrator:orchestrator@localhost:5432/orchestrator
     roster_file: config/roster.monorepo.yaml
-
   tendcharting:
     label: TendCharting (EHR)
-    database_url_env: DATABASE_URL_TENDCHARTING
-    roster_file: config/roster.monorepo.yaml
+    database_url: postgresql://orchestrator:orchestrator@localhost:5432/tendcharting
+    roster_file: config/roster.tendcharting.yaml
     settings:
+      reasoner_base_url: http://10.100.90.132:8083/v1
+      reasoner_model: qwen-local
+      docs_reasoner_base_url: http://10.100.90.132:8083/v1
+      docs_reasoner_model: qwen-local
       promote_repo_path: /home/adam/github/tendcharting-ws/tendcharting
+      docs_path: /home/adam/github/tendcharting-ws/tendcharting/docs
 
   # Add another project by pointing at its own database + roster:
   # acme:
