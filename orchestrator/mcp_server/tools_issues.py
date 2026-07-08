@@ -4,6 +4,7 @@ create_subissue / append_log. Thin wrappers over repository.py."""
 from __future__ import annotations
 
 from dataclasses import asdict
+import re
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -13,6 +14,78 @@ from .. import repository as repo
 from ..config import load_settings
 from ..pipelines import load_pipelines
 from ..state_machine import apply_gate_decision
+
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{6,40}$")
+_STUB_MARKERS = (
+    "stub code provider",
+    "stub provider output",
+    "notimplementederror",
+    "placeholder output",
+    "placeholder implementation",
+)
+
+
+def _valid_issue_branch(issue_id: int, branch: str) -> bool:
+    return branch == f"issue-{issue_id}"
+
+
+def _looks_like_stub(payload: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(payload.get(k, ""))
+        for k in ("summary", "diff", "content", "provider", "model")
+    ).lower()
+    return any(marker in text for marker in _STUB_MARKERS)
+
+
+def _validate_report_work_payload(
+    issue_id: int,
+    gate_type: str | None,
+    sha: str,
+    branch: str,
+    tests_passed: Optional[bool],
+    payload: dict[str, Any],
+) -> None:
+    if gate_type != "implementation":
+        return
+    if not _valid_issue_branch(issue_id, branch):
+        raise ValueError(
+            f"implementation report for issue {issue_id} must use branch "
+            f"'issue-{issue_id}'"
+        )
+    if not sha or not _SHA_RE.match(sha):
+        raise ValueError(
+            f"implementation report for issue {issue_id} must include a commit sha"
+        )
+    if tests_passed is not True:
+        raise ValueError(
+            f"implementation report for issue {issue_id} must set tests_passed=true"
+        )
+    if _looks_like_stub(payload):
+        raise ValueError(
+            f"implementation report for issue {issue_id} appears to be stub output"
+        )
+
+
+def _has_valid_implementation_report(pool: ConnectionPool, issue_id: int) -> bool:
+    for event in repo.recent_events(pool, issue_id, limit=50):
+        if event.event_type == "directive":
+            break
+        if event.event_type != "code_committed":
+            continue
+        payload = event.payload or {}
+        try:
+            _validate_report_work_payload(
+                issue_id,
+                "implementation",
+                str(payload.get("sha", "")),
+                str(payload.get("branch", "")),
+                payload.get("tests_passed"),
+                payload,
+            )
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def register(mcp: FastMCP, pool: ConnectionPool) -> None:
@@ -50,6 +123,12 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         issue = repo.get_issue(pool, issue_id)
         if issue is None:
             raise ValueError(f"no issue {issue_id}")
+        if passed and issue.gate_type == "implementation":
+            if not _has_valid_implementation_report(pool, issue_id):
+                raise ValueError(
+                    f"issue {issue_id} cannot pass implementation without a valid "
+                    f"code_committed report on branch 'issue-{issue_id}'"
+                )
         pipeline = pipelines[issue.pipeline]
         gate = pipeline.gate(issue.gate_type)
         outcome = apply_gate_decision(
@@ -203,5 +282,11 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
             payload["tests_passed"] = tests_passed
         if summary:
             payload["summary"] = summary
+        issue = repo.get_issue(pool, issue_id)
+        if issue is None:
+            raise ValueError(f"no issue {issue_id}")
+        _validate_report_work_payload(
+            issue_id, issue.gate_type, sha, branch, tests_passed, payload,
+        )
         repo.append_log(pool, issue_id, "code_committed", payload)
         return {"status": "ok"}
