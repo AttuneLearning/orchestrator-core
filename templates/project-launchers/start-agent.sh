@@ -124,5 +124,23 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# SoT sync: re-render this worktree's CLAUDE.md/AGENTS.md/QWEN.md from the
+# orchestrator's accepted ADRs at every launch, so a worker can never boot on a
+# stale rules snapshot. Best-effort: an unreachable coordinator must not block
+# the launch (the live adr_for_issue MCP path still delivers current rules).
+DOC_FN="$FUNCTION"
+[ "$DOC_FN" = "dev-manager" ] && DOC_FN="dev"   # managers share the dev worktree/rules
+case "$DOC_FN" in
+  dev|qa|lead)
+    if [ -n "$AGENT_ID" ]; then
+      timeout 30 env PYTHONPATH="$ORCH" "$ORCH/.venv/bin/python" -m orchestrator.cli \
+        --instance "$PROJECT" render-agent-docs --team "$TEAM" --function "$DOC_FN" \
+        --agent-id "$AGENT_ID" --out-dir "$WORKTREE" >/dev/null 2>&1 \
+        && echo "== agent docs re-rendered from SoT ==" \
+        || echo "== WARNING: agent-doc SoT render failed (launching anyway; live adr_for_issue still current) ==" >&2
+    fi
+    ;;
+esac
+
 enable_agent_loop
 exec "$ADAPTER" "$@"
