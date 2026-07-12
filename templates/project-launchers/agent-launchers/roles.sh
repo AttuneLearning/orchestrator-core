@@ -59,7 +59,7 @@ resolve_role() {
       APP="apps/api"
       WORKTREE="$WORKSPACE_ROOT/wt-backend-dev"
       PROMPT_NAME="dev-worker"
-      DEFAULT_RUNTIME="qwen"
+      DEFAULT_RUNTIME="opencode"
       LOOP_AGENT=0
       ;;
     frontend-dev-worker|frontend-dev|fe-dev)
@@ -71,7 +71,7 @@ resolve_role() {
       APP="apps/web"
       WORKTREE="$WORKSPACE_ROOT/wt-frontend-dev"
       PROMPT_NAME="dev-worker"
-      DEFAULT_RUNTIME="qwen"
+      DEFAULT_RUNTIME="opencode"
       LOOP_AGENT=0
       ;;
     backend-qa-worker|backend-qa|be-qa)
@@ -83,7 +83,7 @@ resolve_role() {
       APP="apps/api"
       WORKTREE="$WORKSPACE_ROOT/wt-backend-qa"
       PROMPT_NAME="qa-worker"
-      DEFAULT_RUNTIME="codex"
+      DEFAULT_RUNTIME="opencode"
       LOOP_AGENT=1
       ;;
     frontend-qa-worker|frontend-qa|fe-qa)
@@ -95,7 +95,7 @@ resolve_role() {
       APP="apps/web"
       WORKTREE="$WORKSPACE_ROOT/wt-frontend-qa"
       PROMPT_NAME="qa-worker"
-      DEFAULT_RUNTIME="codex"
+      DEFAULT_RUNTIME="opencode"
       LOOP_AGENT=1
       ;;
     senior|senior-dev|escalation)

@@ -37,10 +37,7 @@ def _section(settings: Any, name: str) -> dict[str, Any]:
 
 
 def _wire_api(value: Any) -> str:
-    wire_api = str(value or "responses")
-    if wire_api == "chat":
-        return "responses"
-    return wire_api
+    return str(value or "responses")
 
 
 def resolve(section_name: str) -> dict[str, str]:

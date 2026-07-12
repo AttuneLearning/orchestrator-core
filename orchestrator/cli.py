@@ -4,6 +4,9 @@ Subcommands:
   migrate                         apply pending SQL migrations
   register-agent --team --function --runtime
   add-goal "<title>" [--description ...]
+  install-launchers --workspace PATH
+                                  install the parent-dir launcher kit
+  setup-project --workspace PATH   scaffold a project workspace and launchers
   run [--max-ticks N] [--daemon --interval S]
                                   drive the engine tick loop
   directive <issue-id> resume [--note ...]
@@ -29,6 +32,7 @@ from pathlib import Path
 from . import repository as repo
 from .config import REPO_ROOT, load_settings
 from .db import close_pool, get_pool, migrate
+from .roster import load_roster
 
 # Issues already terminal (won't be re-cancelled when bulk-cancelling a goal).
 _CANCEL_TERMINAL = {"done", "cancelled"}
@@ -89,6 +93,83 @@ def _contract_relevant_changed_files(
     changed: set[str], seed_rel: str = "contracts.seed.json"
 ) -> list[str]:
     return sorted(p for p in changed if _is_contract_relevant(p, seed_rel))
+
+
+def _launcher_template_root(orchestrator_path: str | None = None) -> Path:
+    base = Path(orchestrator_path).expanduser().resolve() if orchestrator_path else REPO_ROOT
+    return base / "templates" / "project-launchers"
+
+
+def _launcher_copy_plan(
+    src: Path,
+    workspace: Path,
+    replacements: dict[str, str],
+    *,
+    force: bool,
+) -> list[tuple[Path, Path]]:
+    if not src.exists():
+        raise FileNotFoundError(f"launcher templates missing: {src}")
+
+    planned: list[tuple[Path, Path]] = []
+    for path in src.rglob("*"):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(src)
+        if "__pycache__" in rel.parts or rel.suffix == ".pyc":
+            continue
+        dest = workspace / rel
+        if dest.exists() and not force:
+            raise FileExistsError(f"exists, not overwriting: {dest} (use --force)")
+        planned.append((path, dest))
+    return planned
+
+
+def _write_launcher_plan(
+    planned: list[tuple[Path, Path]],
+    replacements: dict[str, str],
+) -> None:
+    for path, dest in planned:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text()
+        for key, val in replacements.items():
+            text = text.replace(key, val)
+        dest.write_text(text)
+        subprocess.run(["chmod", "+x", str(dest)], check=False)
+        print("wrote", dest)
+
+
+def _workspace_launch_plan(
+    settings,
+    workspace: Path,
+    worktree_prefix: str = "wt-",
+    humantest_worktree: str = "humantest-wt",
+) -> list[Path]:
+    roster = load_roster(settings.roster)
+    planned: list[Path] = [workspace / humantest_worktree]
+    seen: set[str] = set()
+    for team in roster.teams.values():
+        for sub in team.sub_teams:
+            if sub.mode != "pull":
+                continue
+            worktree_name = f"{worktree_prefix}{sub.id}"
+            if worktree_name in seen:
+                continue
+            seen.add(worktree_name)
+            planned.append(workspace / worktree_name)
+    return planned
+
+
+def _print_setup_plan(
+    workspace: Path,
+    worktree_dirs: list[Path],
+    launcher_files: list[tuple[Path, Path]],
+) -> None:
+    print(f"workspace={workspace}")
+    for path in worktree_dirs:
+        print(f"worktree={path}")
+    print(f"launcher_files={len(launcher_files)}")
+    for _, dest in launcher_files:
+        print(f"launcher={dest}")
 
 
 def _cmd_migrate(args, settings) -> int:
@@ -569,14 +650,6 @@ def _cmd_self_update(args, settings) -> int:
 
 def _cmd_install_launchers(args, settings) -> int:
     """Install the parent-dir agent launcher kit into a project workspace."""
-    import shutil
-    from pathlib import Path
-
-    src = REPO_ROOT / "templates" / "project-launchers"
-    if not src.exists():
-        print(f"launcher templates missing: {src}", file=sys.stderr)
-        return 1
-
     workspace = Path(args.workspace).expanduser().resolve()
     project = args.project or getattr(args, "instance", None) or workspace.name
     replacements = {
@@ -585,17 +658,12 @@ def _cmd_install_launchers(args, settings) -> int:
         "__PROJECT_NAME__": project,
         "__DASHBOARD_URL__": args.dashboard_url,
     }
-
-    planned: list[tuple[Path, Path]] = []
-    for path in src.rglob("*"):
-        rel = path.relative_to(src)
-        dest = workspace / rel
-        if path.is_dir():
-            continue
-        if dest.exists() and not args.force:
-            print(f"exists, not overwriting: {dest} (use --force)")
-            return 1
-        planned.append((path, dest))
+    src = _launcher_template_root(args.orchestrator_path)
+    try:
+        planned = _launcher_copy_plan(src, workspace, replacements, force=args.force)
+    except (FileNotFoundError, FileExistsError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     if args.dry_run:
         print(f"would install {len(planned)} launcher file(s) into {workspace}")
@@ -604,14 +672,43 @@ def _cmd_install_launchers(args, settings) -> int:
         return 0
 
     workspace.mkdir(parents=True, exist_ok=True)
-    for path, dest in planned:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        text = path.read_text()
-        for key, val in replacements.items():
-            text = text.replace(key, val)
-        dest.write_text(text)
-        shutil.copymode(path, dest)
-        print("wrote", dest)
+    _write_launcher_plan(planned, replacements)
+    return 0
+
+
+def _cmd_setup_project(args, settings) -> int:
+    workspace = Path(args.workspace).expanduser().resolve()
+    project = args.project or getattr(args, "instance", None) or workspace.name
+    worktree_prefix = getattr(args, "worktree_prefix", "wt-")
+    humantest_worktree = getattr(args, "humantest_worktree", "humantest-wt")
+    replacements = {
+        "__WORKSPACE_ROOT__": str(workspace),
+        "__ORCH_PATH__": str(Path(args.orchestrator_path).expanduser().resolve()),
+        "__PROJECT_NAME__": project,
+        "__DASHBOARD_URL__": args.dashboard_url,
+    }
+    src = _launcher_template_root(args.orchestrator_path)
+    try:
+        planned_launchers = _launcher_copy_plan(src, workspace, replacements, force=args.force)
+    except (FileNotFoundError, FileExistsError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    planned_worktrees = _workspace_launch_plan(settings, workspace, worktree_prefix, humantest_worktree)
+
+    if args.dry_run:
+        print(f"would create workspace: {workspace}")
+        for path in planned_worktrees:
+            print(f"would create worktree: {path}")
+        print(f"would install {len(planned_launchers)} launcher file(s)")
+        for _, dest in planned_launchers:
+            print(f"  {dest}")
+        return 0
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    for path in planned_worktrees:
+        path.mkdir(parents=True, exist_ok=True)
+        print("created", path)
+    _write_launcher_plan(planned_launchers, replacements)
     return 0
 
 
@@ -804,6 +901,26 @@ def build_parser() -> argparse.ArgumentParser:
     il.add_argument("--dry-run", action="store_true",
                     help="show files that would be written")
     il.set_defaults(func=_cmd_install_launchers)
+
+    sp = sub.add_parser("setup-project",
+                        help="scaffold a workspace, child worktrees, and launcher scripts")
+    sp.add_argument("--workspace", required=True,
+                    help="workspace parent dir where launchers and worktrees should be written")
+    sp.add_argument("--project", default=None,
+                    help="orchestrator instance/project name (default: --instance or workspace basename)")
+    sp.add_argument("--orchestrator-path", default=str(REPO_ROOT),
+                    help="path to this orchestrator project (default: current install)")
+    sp.add_argument("--dashboard-url", default="http://127.0.0.1:8800",
+                    help="dashboard base URL")
+    sp.add_argument("--worktree-prefix", default="wt-",
+                    help="prefix for child worker worktree dirs (default: wt-)")
+    sp.add_argument("--humantest-worktree", default="humantest-wt",
+                    help="worktree dir used for human-test consolidation")
+    sp.add_argument("--force", action="store_true",
+                    help="overwrite existing launcher files")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="show files and worktrees that would be written")
+    sp.set_defaults(func=_cmd_setup_project)
 
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)
     return p

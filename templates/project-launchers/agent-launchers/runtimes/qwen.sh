@@ -9,6 +9,7 @@ if [ "${ROLE:-}" = "orch-manager" ]; then
     echo "missing qwen CLI on PATH" >&2
     exit 1
   fi
+  LAUNCH_MODE="$(resolve_agent_mode interactive)"
   PROMPT="$(render_prompt "$PROMPT_FILE")"
   cd "$WORKTREE"
   # Qwen Code stores MCP config separately from Claude/Codex. Keep this project-scoped
@@ -21,11 +22,15 @@ if [ "${ROLE:-}" = "orch-manager" ]; then
     -e "ORCH_INSTANCE=$PROJECT" \
     --trust \
     -- -m orchestrator.cli --instance "$PROJECT" serve >/dev/null
-  exec qwen -i "$PROMPT" "$@"
+  if [ "$LAUNCH_MODE" = "interactive" ]; then
+    exec qwen -i "$PROMPT" "$@"
+  else
+    exec qwen -p "$PROMPT" "$@"
+  fi
 fi
 
 if [ ! -x "$QWEN_VENV/bin/python" ]; then
-  echo "missing qwen-agent python: $QWEN_VENV/bin/python" >&2
+  echo "missing qwen worker python: $QWEN_VENV/bin/python" >&2
   exit 1
 fi
 if [ ! -f "$QWEN_WORKER" ]; then

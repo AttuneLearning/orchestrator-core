@@ -34,22 +34,22 @@ Monitor   : DATABASE_URL=<project DATABASE_URL> \\
             PYTHONPATH=$ORCH .venv/bin/python $WS/.orch-monitor-problems.py 0
 EOF
   cat > "$BAN/be-dev.txt" <<EOF
-════ BACKEND DEV — agent 1 (Qwen via qwen-agent) ════
+════ BACKEND DEV — agent 1 (Qwen Code) ════
 Worktree : wt-backend-dev   Coordinator: __PROJECT_NAME__ (serve --instance __PROJECT_NAME__)
 Launch   : $WS/start-dev-worker.sh backend  # add --issue <id> to pin a task
 EOF
   cat > "$BAN/be-qa.txt" <<EOF
-════ BACKEND QA — agent 2 (Codex gpt-5.5) ════
+════ BACKEND QA — agent 2 (Codex) ════
 Worktree : wt-backend-qa    Coordinator: __PROJECT_NAME__
 Launch   : $WS/start-qa-worker.sh backend
 EOF
   cat > "$BAN/fe-dev.txt" <<EOF
-════ FRONTEND DEV — agent 3 (Qwen via qwen-agent) ════
+════ FRONTEND DEV — agent 3 (Qwen Code) ════
 Worktree : wt-frontend-dev  Coordinator: __PROJECT_NAME__ (serve --instance __PROJECT_NAME__)
 Launch   : $WS/start-dev-worker.sh frontend # add --issue <id> to pin a task
 EOF
   cat > "$BAN/fe-qa.txt" <<EOF
-════ FRONTEND QA — agent 4 (Codex gpt-5.5) ════
+════ FRONTEND QA — agent 4 (Codex) ════
 Worktree : wt-frontend-qa   Coordinator: __PROJECT_NAME__
 Launch   : $WS/start-qa-worker.sh frontend
 EOF

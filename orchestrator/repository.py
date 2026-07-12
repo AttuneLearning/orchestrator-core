@@ -1040,6 +1040,49 @@ def update_adr(pool: ConnectionPool, adr_key: str, *, title: Optional[str] = Non
         return dict(zip(_ADR_COLS, row))
 
 
+# -- issue <-> ADR relevance links (migration 0020) ------------------------- #
+
+def set_issue_adrs(pool: ConnectionPool, issue_id: int, adr_keys: list[str],
+                   source: str = "reasoner") -> None:
+    """Record which accepted ADRs govern this issue (computed once at creation).
+    Idempotent per (issue, adr_key); re-tagging updates the source."""
+    with pool.connection() as conn, conn.transaction():
+        for key in dict.fromkeys(adr_keys):  # dedupe, preserve order
+            conn.execute(
+                "INSERT INTO issue_adrs (issue_id, adr_key, source) VALUES (%s, %s, %s) "
+                "ON CONFLICT (issue_id, adr_key) DO UPDATE SET source = EXCLUDED.source",
+                (issue_id, key, source),
+            )
+
+
+def list_issue_adrs(pool: ConnectionPool, issue_id: int) -> list[str]:
+    """The adr_keys previously related to this issue (reasoner/human tags)."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT adr_key FROM issue_adrs WHERE issue_id = %s ORDER BY adr_key",
+            (issue_id,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def adrs_for_issue(pool: ConnectionPool, issue_id: int,
+                   repos: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    """The precise ADR surface for one issue: selector matches (team + auto/stored
+    work_type + repos) UNION any reasoner-tagged keys, expanded via the full
+    backlink closure. Uncapped; empty selectors/no tags degrade to project-wide
+    rules only. This replaces `adr_list(status='accepted')` for pull workers."""
+    from . import adr_rules
+    issue = get_issue(pool, issue_id)
+    if issue is None:
+        return []
+    accepted = list_adrs(pool, status="accepted")
+    work_type = issue.work_type or adr_rules.detect_work_type(
+        f"{issue.title}\n{issue.description or ''}")
+    extra = list_issue_adrs(pool, issue_id)
+    return adr_rules.relevant(accepted, work_type=work_type, team=issue.team or "",
+                              repos=repos or [], extra_keys=extra)
+
+
 # -- docs: shared cross-agent development docs (migration 0018) ------------- #
 _DOC_COLS = ["id", "path", "title", "body", "format", "author",
              "created_at", "updated_at"]

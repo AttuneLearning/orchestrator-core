@@ -13,15 +13,28 @@ instances:
     database_url: postgresql://orchestrator:orchestrator@localhost:5432/tendcharting
     roster_file: config/roster.tendcharting.yaml
     settings:
-      reasoner_base_url: http://10.100.90.132:8083/v1
-      reasoner_model: qwen-local
+      reasoning_model: glm-5.1
+      # GLM-5.1 as the engine reasoner via the DigitalOcean profile (base_url +
+      # MODEL_ACCESS_KEY auto-resolved). On overload it retries GLM, falls back
+      # to deepseek-v4-pro, pauses, and retries the whole path before
+      # off-railing (see reasoner_path_* in config/settings.yaml).
+      engine_reasoner:
+        profile: digitalocean
+        model: glm-5.1
+        fallback_model: deepseek-v4-pro
+      reasoner_cli_cmd: cli
+      # Codex uses OpenAI (native auth) — open-source models run through
+      # opencode, not codex. (Engine reasoner above still uses GLM via DO.)
+      orch_manager_codex:
+        profile: ''
+        model: ''
+        reasoning_effort: high
+      # Open-source dev/qa workers run through opencode.
+      devqa_worker:
+        profile: ''
+        model: ''
+        runtime: opencode
       docs_reasoner_base_url: http://10.100.90.132:8083/v1
       docs_reasoner_model: qwen-local
       promote_repo_path: /home/adam/github/tendcharting-ws/tendcharting
       docs_path: /home/adam/github/tendcharting-ws/tendcharting/docs
-
-  # Add another project by pointing at its own database + roster:
-  # acme:
-  #   label: Acme LMS
-  #   database_url_env: DATABASE_URL_ACME
-  #   roster_file: config/roster.acme.yaml

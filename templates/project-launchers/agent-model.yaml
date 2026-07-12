@@ -1,0 +1,68 @@
+# agent-model.yaml — valid (harness × model) combinations for this workspace.
+#
+# This is the single source of truth for the launcher `-m/--model` switch.
+# `-m <shortcut>` resolves to the harness-specific model string below; you may
+# also pass a raw model string directly. Add/edit entries here to change what a
+# harness may run. List everything with:
+#
+#     agent-launchers/resolve-model.py --list
+#     agent-launchers/resolve-model.py opencode --list
+#
+# Usage (the -m switch goes BEFORE the runtime name):
+#     ./start-dev-worker.sh backend -m deepseek opencode
+#     ./start-qa-worker.sh  backend -m gpt-5.2   codex
+#     ./start-orch-manager.sh -m sonnet claude
+#     ./start-opencode.sh -m qwen-local
+#
+# Default designations (used when -m is omitted):
+#   claude   -> anthropic   (opus)
+#   codex    -> openai      (gpt-5.4-mini)
+#   opencode -> open source (glm-5.2)
+
+# OpenAI-compatible endpoints the gather process can query. `gather-models.sh`
+# GETs {base_url}/models using the key in api_key_env, filters to text models,
+# shortens the ids, and rewrites the matching harness model list below.
+# (claude/codex use native auth and are not gathered.)
+providers:
+  orch_model:
+    harness: opencode
+    base_url: https://inference.do-ai.run/v1
+    api_key_env: MODEL_ACCESS_KEY
+  qwen_local:
+    harness: opencode
+    base_url: http://10.100.90.132:8083/v1
+    api_key_env: QWEN_LOCAL_API_KEY
+
+harnesses:
+
+  claude:
+    provider: anthropic
+    default: opus
+    # Claude Code accepts the short alias directly as --model.
+    models:
+      opus:   { model: opus,   full: claude-opus-4-8,  note: "Claude Opus 4.8 (default)" }
+      sonnet: { model: sonnet, full: claude-sonnet-5,  note: "Claude Sonnet 5" }
+      haiku:  { model: haiku,  full: claude-haiku-4-5, note: "Claude Haiku 4.5" }
+
+  codex:
+    provider: openai
+    default: gpt-5.4-mini
+    # codex uses your OpenAI account; trim/extend to the models you can access.
+    models:
+      gpt-5.4-mini: { model: gpt-5.4-mini, note: "OpenAI GPT-5.4 mini (codex default)" }
+      gpt-5.4:      { model: gpt-5.4,      note: "OpenAI GPT-5.4" }
+      gpt-5.2:      { model: gpt-5.2,      note: "OpenAI GPT-5.2" }
+      o3:           { model: o3,           note: "OpenAI o3 (reasoning)" }
+
+  opencode:
+    provider: opensource
+    default: glm-5.2
+    # provider/model strings target the opencode providers defined by the shared
+    # config writer (orch_model = DigitalOcean, qwen_local = local qwen3-coder).
+    models:
+      glm-5.2:        { model: orch_model/glm-5.2,         note: "GLM 5.2 (DigitalOcean)" }
+      glm-5.1:        { model: orch_model/glm-5.1,         note: "GLM 5.1 (DigitalOcean)" }
+      glm-5:          { model: orch_model/glm-5,           note: "GLM 5 (DigitalOcean)" }
+      deepseek:       { model: orch_model/deepseek-v4-pro, note: "DeepSeek v4 Pro (DigitalOcean)" }
+      deepseek-flash: { model: orch_model/deepseek-4-flash, note: "DeepSeek 4 Flash (faster)" }
+      qwen-local:     { model: qwen_local/qwen-local,      note: "Local qwen3-coder (10.100.90.132:8083)" }

@@ -9,70 +9,109 @@ path. memory/adr live in Postgres here rather than the file vault.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 from psycopg_pool import ConnectionPool
 
+from .. import adr_rules
 from .. import repository as repo
+
+
+def _adr_tokens(text: str) -> set[str]:
+    return {w for w in re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).split()
+            if len(w) > 2}
+
+
+def _duplicate_adr(existing: list[dict[str, Any]], domain: str, title: str,
+                   decision: str) -> Optional[str]:
+    """adr_key of an accepted/proposed rule equivalent to the proposed one, else
+    None. Equivalence = same domain AND (near-identical title OR high decision
+    token-overlap). Deterministic, no LLM — the orch-manager's auto-reject test."""
+    nt, nd = _adr_tokens(title), _adr_tokens(decision)
+    for a in existing:
+        if a.get("status") not in ("accepted", "proposed"):
+            continue
+        if (a.get("domain") or "").upper() != (domain or "").upper():
+            continue
+        at, ad = _adr_tokens(a.get("title", "")), _adr_tokens(a.get("decision", ""))
+        title_j = len(nt & at) / max(1, len(nt | at))
+        dec_j = len(nd & ad) / max(1, len(nd | ad))
+        if title_j >= 0.6 or dec_j >= 0.55:
+            return a["adr_key"]
+    return None
 
 
 def register(mcp: FastMCP, pool: ConnectionPool) -> None:
 
     @mcp.tool()
-    def adr_create(domain: str, title: str, decision: str = "",
-                   context: str = "",
-                   work_types: Optional[list[str]] = None,
-                   teams: Optional[list[str]] = None,
-                   repos: Optional[list[str]] = None,
-                   related: Optional[list[str]] = None,
-                   supersedes: Optional[list[str]] = None,
-                   patterns: Optional[list[str]] = None,
-                   proposed_by: str = "agent") -> dict[str, Any]:
-        """Propose an ADR rule (ADR-{DOMAIN}-{NNN}). Mirror of /adr suggest.
+    def adr_for_issue(issue_id: int) -> dict[str, Any]:
+        """The ADRs that govern THIS issue — pull these, NOT the whole catalog.
 
-        decision = one compact imperative directive agents will receive.
-        Empty selector dimensions match everything; repos=[] = project-wide.
-        Proposals are inert until a human approves (adr_approve)."""
-        return repo.create_adr(
+        Returns only the accepted rules related to the issue: the reasoner's tags
+        UNION the team/work-type selector matches, expanded via the full backlink
+        closure (uncapped — nothing relevant is dropped). Call this each cycle in
+        place of adr_list; it keeps your context small and on-point. `rules_block`
+        is the ready-to-honor directive text (a gate review cites these ids)."""
+        rules = repo.adrs_for_issue(pool, issue_id)
+        return {
+            "issue_id": issue_id,
+            "count": len(rules),
+            "adrs": [{"adr_key": r["adr_key"], "decision": r["decision"],
+                      "domain": r["domain"]} for r in rules],
+            "rules_block": adr_rules.format_rules_block(rules),
+        }
+
+    @mcp.tool()
+    def adr_suggest(domain: str, title: str, decision: str, context: str = "",
+                    work_types: Optional[list[str]] = None,
+                    teams: Optional[list[str]] = None,
+                    repos: Optional[list[str]] = None,
+                    proposed_by: str = "agent",
+                    issue_id: Optional[int] = None) -> dict[str, Any]:
+        """Suggest a NEW architecture rule to the orch-manager. Workers CANNOT
+        create or approve ADRs directly — you suggest, a human decides.
+
+        Duplicates are auto-rejected (same domain + near-identical title/decision).
+        A novel suggestion is filed as a 'proposed' ADR (inert) AND flagged to the
+        human manager: it appears on the dashboard /adrs review queue and in the
+        orchestration inbox shown by `status`. Returns status 'duplicate' or
+        'suggested'."""
+        dup = _duplicate_adr(repo.list_adrs(pool), domain, title, decision)
+        if dup:
+            return {"status": "duplicate", "of": dup,
+                    "message": "an equivalent rule already exists or is pending — not filed"}
+        adr = repo.create_adr(
             pool, domain, title, decision, context,
             applies_to={"work_types": work_types or [], "teams": teams or [],
                         "repos": repos or []},
-            related=related, supersedes=supersedes, patterns=patterns,
-            status="proposed", proposed_by=proposed_by,
+            status="proposed", proposed_by=f"agent-suggest:{proposed_by}",
         )
+        # 'orchestration'-team messages are never auto-decomposed (loop.MONITOR_TEAMS):
+        # they stay pending for the human, surfacing on /orch/monitor and in `status`.
+        repo.create_message(
+            pool, from_team=(teams[0] if teams else "agent"), to_team="orchestration",
+            subject=f"ADR suggestion {adr['adr_key']}: {title}",
+            body=(f"decision: {decision}\ncontext: {context}\n"
+                  f"Review + approve/trash on the dashboard /adrs queue."),
+            priority="high", issue_id=issue_id,
+        )
+        return {"status": "suggested", "adr_key": adr["adr_key"],
+                "note": "filed as proposed + flagged to the human manager for review"}
 
     @mcp.tool()
     def adr_list(status: Optional[str] = None,
                  domain: Optional[str] = None) -> list[dict[str, Any]]:
-        """List ADR rules, optionally by status/domain. Mirror of /adr status."""
+        """Browse ADR rules (read-only), optionally by status/domain. For the rules
+        that apply to YOUR issue use adr_for_issue(issue_id) instead of this — it is
+        scoped and far cheaper than pulling the whole catalog."""
         return repo.list_adrs(pool, status=status, domain=domain)
 
     @mcp.tool()
     def adr_get(adr_key: str) -> Optional[dict[str, Any]]:
         """Fetch one ADR rule by key. Mirror of /adr review."""
         return repo.get_adr(pool, adr_key)
-
-    @mcp.tool()
-    def adr_approve(adr_key: str, actor: str = "human") -> dict[str, Any]:
-        """Promote a proposed ADR to accepted (it becomes live for agents)."""
-        return repo.approve_adr(pool, adr_key, actor=actor)
-
-    @mcp.tool()
-    def adr_update(adr_key: str, title: Optional[str] = None,
-                   decision: Optional[str] = None, context: Optional[str] = None,
-                   work_types: Optional[list[str]] = None,
-                   teams: Optional[list[str]] = None,
-                   repos: Optional[list[str]] = None) -> dict[str, Any]:
-        """Edit an ADR's content (decision/context/title/selectors). Only provided
-        fields change; status is preserved (an accepted rule stays live with the
-        corrected text). This is the single-source-of-truth edit path."""
-        applies_to = None
-        if work_types is not None or teams is not None or repos is not None:
-            applies_to = {"work_types": work_types or [], "teams": teams or [],
-                          "repos": repos or []}
-        return repo.update_adr(pool, adr_key, title=title, decision=decision,
-                               context=context, applies_to=applies_to)
 
     @mcp.tool()
     def comms_send(from_team: str, to_team: str, subject: str, body: str = "",

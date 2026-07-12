@@ -33,7 +33,7 @@ from ..roster import load_roster
 from ..state_machine import apply_gate_decision, validate_transition
 from ..agents.api_worker import ApiWorker
 from ..agents.cli_session import CliSessionWorker
-from ..agents.reasoning import Reasoner, make_reasoner
+from ..agents.reasoning import Reasoner, ReasonerExhausted, make_reasoner
 from . import focus, offrails, reengagement
 
 _ACTIVE_STATES = [
@@ -351,6 +351,22 @@ class Engine:
                                               spec.description, team=team_id, pipeline=pid)
                     created.append((issue.id, team_id))
                     summary.decomposed += 1
+                # Relate the governing ADRs to each new issue ONCE, here at creation
+                # (cached in issue_adrs). adr_for_issue unions these reasoner tags with
+                # the deterministic selector match + full backlink closure at pull time,
+                # so a worker pulls only its issue's ADRs — never the whole catalog.
+                # Best-effort and fully isolated: an ADR-tagging failure must never
+                # pause decomposition (that path belongs to ReasonerExhausted below).
+                try:
+                    catalog = [{"adr_key": r["adr_key"], "decision": r["decision"]}
+                               for r in repo.list_adrs(self.pool, status="accepted")]
+                    for issue_id, _team in created:
+                        iss = repo.get_issue(self.pool, issue_id)
+                        keys = self.reasoner.relevant_adrs(iss, catalog) if (catalog and iss) else []
+                        if keys:
+                            repo.set_issue_adrs(self.pool, issue_id, keys, source="reasoner")
+                except Exception:  # noqa: BLE001 — ADR tagging never blocks decomposition
+                    pass
                 # Routing invariant: every child must resolve to a known team, and
                 # match the pipeline team when one is declared. A violation alerts +
                 # holds the goal rather than emitting misrouted/unpullable work.
@@ -361,6 +377,13 @@ class Engine:
                                 invariant="routing", violations=violations)
                     continue
                 repo.set_goal_state(self.pool, goal.id, GoalState.ACTIVE.value)
+            except ReasonerExhausted as exc:
+                # No issue exists yet to off-rails; pause the goal (it stays in
+                # PLANNING) so it resumes decomposition once the model recovers or
+                # a human intervenes, rather than retrying every tick.
+                repo.set_goal_state(self.pool, goal.id, GoalState.PAUSED.value)
+                summary.errors.append(
+                    f"decompose goal {goal.id}: reasoner exhausted — goal paused: {exc}")
             except Exception as exc:  # noqa: BLE001 - isolate goal failures
                 summary.errors.append(f"decompose goal {goal.id}: {exc}")
 
@@ -547,6 +570,8 @@ class Engine:
                 if self._maybe_decompose(issue, summary):
                     continue
                 issue = self._transition(issue, IssueState.READY.value)
+            except ReasonerExhausted as exc:
+                self._quarantine_exhausted(issue, "plan", exc, summary)
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"plan issue {issue.id}: {exc}")
 
@@ -750,9 +775,27 @@ class Engine:
                 elif outcome.state == IssueState.FAILED.value:
                     self._release_agent(issue)
                     summary.failed += 1
+            except ReasonerExhausted as exc:
+                self._quarantine_exhausted(issue, "review", exc, summary)
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"review issue {issue.id}: {exc}")
                 self._safe_log(issue.id, {"phase": "review", "error": str(exc)})
+
+    def _quarantine_exhausted(self, issue: Issue, phase: str,
+                              exc: Exception, summary: TickSummary) -> None:
+        """The reasoner endpoint stayed overloaded/unavailable through the whole
+        retry+fallback+pause policy (ReasonerExhausted). Quarantine the issue to
+        off_rails and pause its goal — the same latch the drift sweep uses — so a
+        sustained provider outage parks work for a human directive instead of
+        crash-looping or silently stalling. Distinct from a transient blip, which
+        the reasoner already absorbs without raising."""
+        self._transition(issue, IssueState.OFF_RAILS.value,
+                         gate_type=issue.gate_type, event_type="state_change",
+                         payload={"reason": "reasoner exhausted (model overloaded)",
+                                  "phase": phase, "error": str(exc)})
+        self._release_agent(issue)
+        repo.set_goal_state(self.pool, issue.goal_id, GoalState.PAUSED.value)
+        summary.quarantined += 1
 
     def _safe_log(self, issue_id: int, payload: dict) -> None:
         """Best-effort error logging that NEVER propagates. An issue can be
@@ -785,6 +828,11 @@ class Engine:
                     self._release_agent(issue)
                     repo.set_goal_state(self.pool, issue.goal_id, GoalState.PAUSED.value)
                     summary.quarantined += 1
+            except ReasonerExhausted:
+                # Drift scoring is advisory; if the model is down we simply skip
+                # the drift check this tick rather than quarantining on a signal
+                # we couldn't compute. Real work (plan/review) off-rails on its own.
+                continue
             except Exception as exc:  # noqa: BLE001
                 summary.errors.append(f"sweep issue {issue.id}: {exc}")
 

@@ -89,15 +89,16 @@ Your identity is fixed:
 - **You own the {owned_gates} gate(s)** — {owned_desc}.
 
 The orchestrator is the **single source of truth**. The rules below are generated
-from its accepted ADRs; the authoritative live copy reaches you over MCP
-(`adr_list` / `context_load`) every cycle. Do **not** hand-edit this file — it is
-regenerated from the orchestrator, and a drift check will reject manual edits.
+from its accepted ADRs; the authoritative, per-issue-scoped live copy reaches you
+over MCP (`adr_for_issue` / `context_load`) every cycle. Do **not** hand-edit this
+file — it is regenerated from the orchestrator, and a drift check will reject
+manual edits.
 
 ## Loop (each cycle)
 1. `mcp__orchestrator__heartbeat(agent_id={agent_id})` — liveness + cadence (`next_poll_seconds`).
 2. {sync_step}
 3. `mcp__orchestrator__list_my_work(agent_id={agent_id})` — your assigned in-progress issues. Act ONLY on your gate(s): **{owned_gates}**. (If an assigned issue is at a different gate, it's not yours to work — leave it.)
-4. `mcp__orchestrator__adr_list(status="accepted")` — the live rules (authoritative; honor every cycle).
+4. `mcp__orchestrator__adr_for_issue(<issue id>)` — the ADRs that govern THIS issue (scoped to it, not the whole catalog; honor every returned rule — a gate review cites these ids). You cannot create/approve ADRs; `adr_suggest(...)` a genuinely reusable new decision to the orch-manager.
 5. Process your assigned issues **one at a time** (do NOT batch-claim and run silently). For each: {work_step}
 6. **Heartbeat WHILE you work — this is mandatory, not optional.** Call `mcp__orchestrator__heartbeat(agent_id={agent_id})` at the start of every issue and **again at least every ~2 minutes during any long-running step** (test suite, build, e2e). A worker that goes silent past the stale window is treated as dead: its issue is reclaimed mid-run and, after a few reclaims, quarantined (off_rails). Frequent heartbeats are what keep your work yours.
 7. When the queue is empty, obey `next_poll_seconds` (loop enabled → keep polling at that cadence and pick up newly-assigned work; disabled → slow-poll, never fully stop).

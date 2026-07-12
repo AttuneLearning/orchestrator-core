@@ -1,79 +1,95 @@
-# =============================================================================
-# Orchestrator settings. This file is the canonical local configuration.
-# Process environment variables still override matching values at runtime
-# (orchestrator/config.py), but the app no longer auto-loads a repo .env file.
-# =============================================================================
+# Orchestrator global defaults. Project-local overrides live in
+# config/instances.yaml under instances.<project>.settings.
+# Process environment variables still win at runtime.
 
 reasoning_model: claude-opus-4-8
 database_url: postgresql://orchestrator:orchestrator@localhost:5432/orchestrator
-anthropic_api_key: ""
-
-# Engine reasoner (decomposition, gate review, drift scoring).
+anthropic_api_key: ''
 reasoner: openai
 reasoner_base_url: http://10.100.90.132:8081/v1
-reasoner_model: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL
-reasoner_api_key: ""
-reasoner_cli_cmd: claude -p "{prompt}"
-
-# Docs AI-edit reasoner (dashboard Docs tab only) — isolated from the engine
-# reasoner so it can be repointed independently, but here it targets the SAME
-# on-prem network model server the engine uses (10.100.90.132:8081, Qwen3-Coder-30B).
-# `cli` stays available here for a future DB-capable "hypervisor" editor.
-# Set docs_reasoner: "" to reuse the engine reasoner above.
+reasoner_model: qwen-local
+reasoner_api_key: blank
+reasoner_cli_cmd: cli
+# Overload resilience for reasoner=openai: retry primary, fall back to
+# reasoner_fallback_model, pause reasoner_path_pause_s, retry the whole path
+# reasoner_path_cycles times, then raise ReasonerExhausted (engine off-rails +
+# pauses the goal). Empty fallback = primary only.
+reasoner_fallback_model: ''
+reasoner_retries: 3
+reasoner_backoff_base: 1.0
+reasoner_backoff_max: 30.0
+reasoner_path_pause_s: 60.0
+reasoner_path_cycles: 2
+reasoner_request_timeout_s: 60.0
 docs_reasoner: openai
 docs_reasoner_base_url: http://10.100.90.132:8081/v1
-docs_reasoner_model: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL
-docs_reasoner_api_key: ""                # network server needs no key
-
-code_provider: stub        # stub | openai | anthropic
-code_base_url: ""
-code_model: ""
-code_api_key: ""
-
-# Engine thresholds / caps
+docs_reasoner_model: qwen-local
+docs_reasoner_api_key: blank
+code_provider: stub
+code_base_url: ''
+code_model: ''
+code_api_key: ''
 thresholds:
-  drift_threshold: 0.5     # off_rails latches only when a signal fires AND drift < this
-  retry_cap: 3             # gate declines before an issue lands in failed
-  step_budget: 25          # max gate-advances per issue before exhaustion
-  # Liveness: a pull worker is reclaimed if its last_seen exceeds this. Must be
-  # LONGER than the slowest legitimate gate run — QA verification/e2e runs full
-  # suites (typecheck+test+build+playwright) that exceed 300s, so a busy agent
-  # was being falsely reclaimed mid-suite. 900s (15m) gives headroom. Workers
-  # poll at 60s, so a genuinely dead worker is still detected well within this.
+  drift_threshold: 0.5
+  retry_cap: 3
+  step_budget: 25
   agent_stale_seconds: 900
-  reclaim_cap: 3           # reclaims before a pull issue lands in off_rails
-  # Decomposition guardrails (spec: prevent the 24-issue blowout). Backstops, not
-  # the primary fix — breaching one alerts + holds the goal (never silent truncation).
-  max_depth: 2                 # sub-issue nesting depth
-  max_subissues: 5             # children per decomposition
-  max_issues_per_goal: 8       # hard cap on issues created for one goal
-  max_children_per_parent: 5   # refuse to fan one parent wider than this
-
-# Contract-first gate. OFF by default. When true, pull-fe's contract_check gate
-# blocks new-endpoint frontend issues until their consumed endpoints have an
-# agreed/live contract (see migration 0011). Override live with CONTRACT_GATE_ENABLED.
+  reclaim_cap: 3
+  max_depth: 2
+  max_subissues: 5
+  max_issues_per_goal: 8
+  max_children_per_parent: 5
 contract_gate_enabled: false
-
-# Auto-promote on completion. When an issue passes its final gate, the engine merges
-# its committed branch (resolved from the code_committed event) into promote_branch in
-# a dedicated worktree of promote_repo_path, so the next team sees the work. LOCAL merge
-# only — never pushes; downstream teams pull the integration branch. A merge conflict
-# bounces the issue back to implementation (rebase & resolve). promote_branch must NOT be
-# checked out in any other worktree (the integrator needs it free).
 auto_promote_enabled: true
 promote_repo_path: /home/adam/github/cadencelms-working/cadencelms
 promote_branch: main
 auto_rebase_downstream: true
-
-# Shared development-docs browser (dashboard "Docs" tab). Read-only: lists + renders
-# files under this dir and its subdirs so agents and humans share dev docs in one place.
-# Empty = tab hidden.
 docs_path: /home/adam/github/cadencelms-working/docs
-
-embed_api_key: ""
-
-# Default pipeline for new goals. pull-1 routes work to live external coders
-# (intake → implementation[pull] → verification[pull] → qa_gate/completion[verdict])
-# rather than the in-process reasoner. NOTE: pull-1 has team:backend; create
-# frontend goals explicitly on pull-fe.
+embed_api_key: ''
 default_pipeline: pull-1
+docs_reasoner_cli_cmd: ''
+embed_provider: stub
+embed_base_url: ''
+embed_model: ''
+apply_enabled: false
+apply_repo_path: ''
+verify_cmd: ''
+database_backup_enabled: true
+database_backup_dir: backups/orchestrator-db
+model_profiles:
+  digitalocean:
+    base_url: https://inference.do-ai.run/v1
+    model: deepseek-v4-pro
+    api_key: ''
+    api_key_env: MODEL_ACCESS_KEY
+    wire_api: chat
+  qwen-local:
+    base_url: ''
+    model: ''
+    api_key: ''
+    api_key_env: ''
+    wire_api: chat
+  openai-custom:
+    base_url: ''
+    model: ''
+    api_key: ''
+    api_key_env: ''
+    wire_api: chat
+# Codex defaults to OpenAI (native auth). Empty profile = no open-source
+# provider override injected; open-source models run through opencode instead.
+orch_manager_codex:
+  profile: ''
+  model: ''
+  reasoning_effort: high
+orch_manager_claude:
+  account_label: ''
+  model: ''
+engine_reasoner:
+  profile: ''
+  model: ''
+# Open-source dev/qa workers run through opencode (menu: glm-5.1, glm-5.2,
+# deepseek-v4-pro, qwen-local). Model picked per launch via ORCH_OPENCODE_MODEL.
+devqa_worker:
+  profile: ''
+  model: ''
+  runtime: opencode

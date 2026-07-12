@@ -69,6 +69,17 @@ class Settings:
     reasoner_model: str = ""      # model name for openai/cli (falls back to reasoning_model)
     reasoner_api_key: str = ""
     reasoner_cli_cmd: str = ""    # reasoner=cli command, e.g. 'claude -p "{prompt}"'
+    # Overload resilience for reasoner=openai (see OpenAIReasoner). The call
+    # retries the primary model, falls back to reasoner_fallback_model, pauses,
+    # and retries the whole path before raising ReasonerExhausted.
+    reasoner_fallback_model: str = ""   # second model tried when primary is overloaded
+    reasoner_retries: int = 3           # attempts per model per whole-path cycle
+    reasoner_backoff_base: float = 1.0  # seconds; exponential backoff base
+    reasoner_backoff_max: float = 30.0  # seconds; backoff cap
+    reasoner_path_pause_s: float = 60.0 # pause between whole-path cycles
+    reasoner_path_cycles: int = 2       # whole-path attempts before giving up
+    reasoner_request_timeout_s: float = 60.0  # per-request timeout; a hung/overloaded
+                                              # endpoint raises (retryable) instead of blocking
 
     # Docs AI-edit reasoner (dashboard Docs tab only). Isolated from the engine
     # reasoner above so document editing can run on a local model while engine
@@ -174,6 +185,7 @@ class Settings:
     engine_reasoner: dict[str, Any] = field(default_factory=lambda: {
         "profile": "",
         "model": "",
+        "fallback_model": "",
     })
     devqa_worker: dict[str, Any] = field(default_factory=lambda: {
         "profile": "",
@@ -290,6 +302,7 @@ def load_settings(instance: str | None = None) -> Settings:
     reasoner_base_url = pick("REASONER_BASE_URL", "reasoner_base_url", "")
     reasoner_model = pick("REASONER_MODEL", "reasoner_model", "")
     reasoner_api_key = pick("REASONER_API_KEY", "reasoner_api_key", "")
+    reasoner_fallback_model = pick("REASONER_FALLBACK_MODEL", "reasoner_fallback_model", "")
     profile_name = str(engine_reasoner.get("profile") or "")
     profile = model_profiles.get(profile_name) if profile_name else None
     if isinstance(profile, dict):
@@ -299,6 +312,9 @@ def load_settings(instance: str | None = None) -> Settings:
             reasoner_base_url = str(profile.get("base_url") or "")
         if os.getenv("REASONER_MODEL") in (None, ""):
             reasoner_model = str(engine_reasoner.get("model") or profile.get("model") or "")
+        if os.getenv("REASONER_FALLBACK_MODEL") in (None, "") \
+                and engine_reasoner.get("fallback_model"):
+            reasoner_fallback_model = str(engine_reasoner["fallback_model"])
         if os.getenv("REASONER_API_KEY") in (None, ""):
             api_key_env = str(profile.get("api_key_env") or "")
             reasoner_api_key = (
@@ -313,6 +329,13 @@ def load_settings(instance: str | None = None) -> Settings:
         reasoner_base_url=reasoner_base_url,
         reasoner_model=reasoner_model,
         reasoner_api_key=reasoner_api_key,
+        reasoner_fallback_model=reasoner_fallback_model,
+        reasoner_retries=int(pick("REASONER_RETRIES", "reasoner_retries", "3")),
+        reasoner_backoff_base=float(pick("REASONER_BACKOFF_BASE", "reasoner_backoff_base", "1.0")),
+        reasoner_backoff_max=float(pick("REASONER_BACKOFF_MAX", "reasoner_backoff_max", "30.0")),
+        reasoner_path_pause_s=float(pick("REASONER_PATH_PAUSE_S", "reasoner_path_pause_s", "60.0")),
+        reasoner_path_cycles=int(pick("REASONER_PATH_CYCLES", "reasoner_path_cycles", "2")),
+        reasoner_request_timeout_s=float(pick("REASONER_REQUEST_TIMEOUT_S", "reasoner_request_timeout_s", "60.0")),
         reasoner_cli_cmd=pick("REASONER_CLI_CMD", "reasoner_cli_cmd", ""),
         docs_reasoner=pick("DOCS_REASONER", "docs_reasoner", ""),
         docs_reasoner_base_url=pick("DOCS_REASONER_BASE_URL", "docs_reasoner_base_url", ""),

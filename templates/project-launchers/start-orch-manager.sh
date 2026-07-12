@@ -4,7 +4,9 @@ WS="$(cd "$(dirname "$0")" && pwd)"
 LAUNCH_FLAGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run|--no-enable-loop) LAUNCH_FLAGS+=("$1"); shift ;;
+    --dry-run|--no-enable-loop|--interactive|--non-interactive) LAUNCH_FLAGS+=("$1"); shift ;;
+    -m|--model) LAUNCH_FLAGS+=("$1" "${2:?-m/--model requires a value}"); shift 2 ;;
+    --model=*) LAUNCH_FLAGS+=("$1"); shift ;;
     *) break ;;
   esac
 done

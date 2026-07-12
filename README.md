@@ -11,6 +11,22 @@ This is the **phases 1–4 orchestration core**. Deferred to follow-ups: the
 FastAPI ops dashboard, Directus admin, pgvector semantic search, the `cli`
 (`--resume`) agent runtime, Metabase, and additional pipelines/teams.
 
+## Workspace Topology
+
+This repository is the orchestrator source of truth. The sibling
+`tendcharting-ws` directory is a coordination root for workspace layout and
+launcher state, not the primary git history for the project implementation.
+
+- The root `tendcharting-ws/` path is used to store coordination files, shared
+  launcher scaffolding, and workspace guidance.
+- The `wt-*` subdirectories inside `tendcharting-ws/` are the actual git
+  worktrees for agent-owned implementation work.
+- The designated human validation and CI/CD consolidation worktree is
+  `humantest-wt` (some older checkouts may still use the name
+  `wt-human-test` until normalized).
+- Agent work should move through the planned worktrees and consolidate into the
+  human-test worktree before being treated as ready for broader review.
+
 ## Architecture
 
 ```

@@ -24,10 +24,12 @@ older reasoners keep working.
 from __future__ import annotations
 
 import json
+import random
 import re
 import shlex
 import subprocess
 import tempfile
+import time
 from typing import Any, Optional, Protocol
 
 # METHOD /path tokens in free text, e.g. "GET /system/status". Used by the
@@ -64,6 +66,55 @@ from .base import (ComplexityAssessment, GateReview, IssueSpec, TriageDecision,
                    extract_json)
 
 
+class ReasonerExhausted(RuntimeError):
+    """A model-backed reasoner call failed after exhausting every retry, model
+    fallback, and whole-path cycle — the endpoint is sustained-overloaded or
+    unreachable. The engine treats this specially (quarantine the issue to
+    off_rails and pause its goal) rather than logging a generic error, so a
+    flaky provider cannot silently stall the pipeline. Recovery is a human
+    directive once the model is healthy again."""
+
+
+# Injection point for tests: monkeypatch reasoning._sleep to a no-op so the
+# retry/backoff/pause policy runs instantly.
+_sleep = time.sleep
+
+# HTTP statuses that signal a transient overload/availability blip worth
+# retrying. 429 (rate limit) and 5xx are retryable; 529 is the "overloaded"
+# code some gateways (incl. DO/Anthropic) return. Deterministic 4xx client
+# errors (400 bad request, 401 auth, 404) are NOT retried.
+_TRANSIENT_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+_TRANSIENT_MARKERS = (
+    "overload", "capacity", "temporarily", "timeout", "timed out",
+    "too many requests", "rate limit", "service unavailable", "unavailable",
+    "connect", "connection", "reset by peer", "econnreset", "read timed out",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True if an exception looks like a retryable overload/availability blip
+    rather than a permanent error. Works without importing the openai SDK: it
+    matches on a ``status_code``/``status`` attribute and the message text, so
+    RateLimitError, APITimeoutError, APIConnectionError, and 5xx/529
+    APIStatusError all classify as transient."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        if status in _TRANSIENT_STATUS:
+            return True
+        if 400 <= status < 500:
+            return False  # deterministic client error — don't burn retries
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _backoff_delay(base: float, attempt: int, cap: float) -> float:
+    """Exponential backoff (base * 2**attempt, capped) with 50–100% jitter."""
+    delay = min(cap, base * (2 ** attempt))
+    return delay * (0.5 + random.random() * 0.5)
+
+
 class Reasoner(Protocol):
     def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]: ...
     def plan_issue(self, issue: Issue, rules: str = "") -> str: ...
@@ -75,6 +126,7 @@ class Reasoner(Protocol):
     def triage_message(self, message: dict[str, Any]) -> TriageDecision: ...
     def assess_complexity(self, issue: Issue) -> ComplexityAssessment: ...
     def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]: ...
+    def relevant_adrs(self, issue: Issue, catalog: list[dict[str, Any]]) -> list[str]: ...
     def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]: ...
     def draft_reply(self, message: dict[str, Any]) -> str: ...
     def review_reply(self, message: dict[str, Any], context: str, draft: str) -> str: ...
@@ -113,6 +165,11 @@ class StubReasoner:
     def suggest_adr(self, issue: Issue) -> Optional[dict[str, Any]]:
         # Stub never proposes rules; gap-detection paths are test-injected.
         return None
+
+    def relevant_adrs(self, issue: Issue, catalog: list[dict[str, Any]]) -> list[str]:
+        # Stub tags nothing; adr_for_issue still returns the deterministic
+        # selector match + backlink closure, so the surface is never empty by fiat.
+        return []
 
     def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]:
         # Deterministic: pull "METHOD /path" tokens out of the issue text.
@@ -295,6 +352,29 @@ class _LLMReasoner:
             return None
         return data
 
+    def relevant_adrs(self, issue: Issue, catalog: list[dict[str, Any]]) -> list[str]:
+        """Pick the adr_keys from `catalog` (each {adr_key, decision}) that ACTUALLY
+        govern this issue's work. Precise, not generous: omit unrelated rules so the
+        worker's ADR surface stays small. Called once at issue creation; the result
+        is cached and unioned with deterministic selector matches downstream."""
+        if not catalog:
+            return []
+        system = (
+            "From the ADR catalog, return ONLY the adr_keys whose decision actually "
+            "governs THIS issue's implementation. Be precise — exclude rules that are "
+            'merely adjacent. Output JSON: {"adr_keys": [str]}.'
+        )
+        lines = "\n".join(f'{a["adr_key"]}: {a.get("decision", "")}' for a in catalog)
+        user = (f"Issue: {issue.title}\nTeam: {issue.team}\n"
+                f"Work type: {issue.work_type}\n\n{issue.description}\n\nCatalog:\n{lines}")
+        try:
+            data = extract_json(self._ask(system, user))
+        except Exception:  # noqa: BLE001 — degrade to deterministic selectors on failure
+            return []
+        keys = data.get("adr_keys", []) if isinstance(data, dict) else []
+        valid = {a["adr_key"] for a in catalog}
+        return [k for k in keys if k in valid]
+
     def extract_endpoint_deps(self, issue: Issue) -> list[dict[str, str]]:
         system = (
             "List the backend API endpoints this frontend issue must CONSUME "
@@ -373,24 +453,79 @@ class AnthropicReasoner(_LLMReasoner):
 
 class OpenAIReasoner(_LLMReasoner):
     """Structured decisions via any OpenAI-compatible endpoint (e.g. a locally
-    hosted model). Configure REASONER_BASE_URL / REASONER_MODEL / REASONER_API_KEY."""
+    hosted model, or GLM/DeepSeek on DigitalOcean). Configure REASONER_BASE_URL
+    / REASONER_MODEL / REASONER_API_KEY.
+
+    Overload-resilient. Each call runs a policy that survives a flaky/overloaded
+    endpoint before giving up (defaults shown; all tunable via settings/env):
+
+      for each whole-path cycle (reasoner_path_cycles = 2):
+        try the primary model  (reasoner_retries = 3, exponential backoff+jitter)
+        else try the fallback model (reasoner_fallback_model, same attempts)
+        if the whole path failed and cycles remain: pause reasoner_path_pause_s (60s)
+      still failing after all cycles -> raise ReasonerExhausted
+
+    Only *transient* errors (429/5xx/overloaded/timeout/connection) are retried;
+    a deterministic 4xx (bad request/auth) raises immediately. ReasonerExhausted
+    is what the engine turns into an off_rails quarantine + goal pause."""
 
     def __init__(self, settings: Settings):
         from openai import OpenAI
 
         self._model = settings.reasoner_model or settings.reasoning_model
+        self._fallback_model = (settings.reasoner_fallback_model or "").strip()
+        self._retries = max(1, int(settings.reasoner_retries))
+        self._backoff_base = float(settings.reasoner_backoff_base)
+        self._backoff_max = float(settings.reasoner_backoff_max)
+        self._path_pause_s = float(settings.reasoner_path_pause_s)
+        self._path_cycles = max(1, int(settings.reasoner_path_cycles))
         self._client = OpenAI(
             base_url=settings.reasoner_base_url or None,
             api_key=settings.reasoner_api_key or "not-needed",
+            max_retries=0,  # we own the retry policy below
+            # Bound each request so a hung/overloaded endpoint raises
+            # APITimeoutError (classified transient) instead of blocking the tick
+            # forever — a silent hang is the common overload failure mode.
+            timeout=float(settings.reasoner_request_timeout_s),
         )
 
-    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
+    def _models(self) -> list[str]:
+        models = [self._model]
+        if self._fallback_model and self._fallback_model != self._model:
+            models.append(self._fallback_model)
+        return models
+
+    def _call(self, model: str, system: str, user: str, max_tokens: int) -> str:
         resp = self._client.chat.completions.create(
-            model=self._model, max_tokens=max_tokens,
+            model=model, max_tokens=max_tokens,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
         )
         return resp.choices[0].message.content or ""
+
+    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        models = self._models()
+        last: Optional[Exception] = None
+        for cycle in range(self._path_cycles):
+            for model in models:
+                for attempt in range(self._retries):
+                    try:
+                        return self._call(model, system, user, max_tokens)
+                    except Exception as exc:  # noqa: BLE001
+                        if not _is_transient(exc):
+                            raise  # permanent error — don't retry or fall back
+                        last = exc
+                        if attempt < self._retries - 1:
+                            _sleep(_backoff_delay(
+                                self._backoff_base, attempt, self._backoff_max))
+                # this model exhausted its attempts — fall through to the next
+            # whole path (all models) failed this cycle
+            if cycle < self._path_cycles - 1:
+                _sleep(self._path_pause_s)
+        raise ReasonerExhausted(
+            f"reasoner exhausted: {self._path_cycles} cycle(s) over {models} "
+            f"all overloaded/unavailable; last error: {last}"
+        ) from last
 
 
 class CliReasoner(_LLMReasoner):

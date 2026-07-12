@@ -94,3 +94,73 @@ def reverse_links(rules: list[dict[str, Any]]) -> dict[str, list[str]]:
         for target in list(rule.get("related") or []) + list(rule.get("supersedes") or []):
             incoming.setdefault(target, []).append(rule["adr_key"])
     return incoming
+
+
+def closure(seed_keys: Any, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every rule reachable from `seed_keys` by following each ADR's OWN curated
+    `related`/`supersedes` edges forward, plus the seeds themselves.
+
+    NO depth cap: an ADR is never dropped for being "too far" — the full forward
+    chain is walked. Traversal is forward-only ON PURPOSE: an ADR names the other
+    rules relevant to it, so we pull those; we do NOT reverse-pull every rule that
+    merely points AT a seed (that leaks unrelated rules in through shared nodes).
+    Efficiency comes from a small, precise seed (selector match + reasoner tags)
+    and a sparse, curated edge set — not from truncation.
+    """
+    by_key = {r["adr_key"]: r for r in rules}
+    adj: dict[str, set[str]] = {}
+    for r in rules:
+        k = r["adr_key"]
+        edges = list(r.get("related") or []) + list(r.get("supersedes") or [])
+        adj[k] = {t for t in edges}  # forward edges only (curated intent)
+    seen: set[str] = set()
+    stack = [k for k in seed_keys if k in by_key]
+    while stack:
+        k = stack.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        for nb in adj.get(k, ()):  # noqa: SIM118
+            if nb in by_key and nb not in seen:
+                stack.append(nb)
+    return [by_key[k] for k in sorted(seen)]
+
+
+def _universal_keys(accepted: list[dict[str, Any]]) -> set[str]:
+    """Project-wide governance: rules with no team AND no work_type selector, i.e.
+    they apply to every issue (contracts-first, testing, verification, HIPAA, PHI
+    minimization…). Always present so precise reasoner tagging never drops them."""
+    out = set()
+    for r in accepted:
+        sel = r.get("applies_to") or {}
+        if not sel.get("teams") and not sel.get("work_types"):
+            out.add(r["adr_key"])
+    return out
+
+
+def relevant(
+    rules: list[dict[str, Any]],
+    *,
+    work_type: Optional[str],
+    team: str,
+    repos: Optional[list[str]] = None,
+    extra_keys: Any = (),
+) -> list[dict[str, Any]]:
+    """The ADR surface for one issue, uncapped and deterministic:
+
+    * If the reasoner tagged this issue (`extra_keys`), TRUST those precise tags
+      plus the universal project-wide floor — a small, on-point surface.
+    * Otherwise fall back to the deterministic team/work_type selector match.
+
+    Either seed is then expanded via the full forward backlink `closure` (no depth
+    cap). Efficiency = a precise seed + a sparse curated graph; completeness = the
+    universal floor + closure, so nothing relevant is ignored."""
+    accepted = [r for r in rules if r.get("status") == "accepted"]
+    valid = {r["adr_key"] for r in accepted}
+    tags = {k for k in (extra_keys or ()) if k in valid}
+    if tags:
+        seed = tags | _universal_keys(accepted)
+    else:
+        seed = {r["adr_key"] for r in applicable(accepted, work_type=work_type,
+                                                 team=team, repos=repos)}
+    return closure(seed, accepted)

@@ -8,3 +8,5 @@ backups/
 *.bak
 .launch-dash.sh
 setup_agent.py
+templates/project-launchers/agent-launchers/secrets.env
+**/agent-launchers/secrets.env

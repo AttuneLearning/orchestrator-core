@@ -5,6 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib.sh"
 
 PROMPT="$(render_prompt "$PROMPT_FILE")"
+DEFAULT_AGENT_MODE="non-interactive"
+if [ "${ROLE:-}" = "orch-manager" ]; then
+  DEFAULT_AGENT_MODE="interactive"
+fi
+LAUNCH_MODE="$(resolve_agent_mode "$DEFAULT_AGENT_MODE")"
 
 INFERENCE_PROFILE="${CODEX_INFERENCE_PROFILE:-}"
 INFERENCE_EXPLICIT=0
@@ -55,16 +60,13 @@ case "$INFERENCE_PROFILE" in
     if [ "$INFERENCE_EXPLICIT" = "1" ]; then
       model="deepseek-v4-pro"
       base_url="https://inference.do-ai.run/v1"
-      wire_api="responses"
+      wire_api="chat"
       reasoning_effort="high"
     else
       model="${ORCH_MODEL_NAME:-deepseek-v4-pro}"
       base_url="${ORCH_MODEL_BASE_URL:-https://inference.do-ai.run/v1}"
-      wire_api="${ORCH_MODEL_WIRE_API:-responses}"
+      wire_api="${ORCH_MODEL_WIRE_API:-chat}"
       reasoning_effort="${ORCH_MODEL_REASONING_EFFORT:-high}"
-    fi
-    if [ "$wire_api" = "chat" ]; then
-      wire_api="responses"
     fi
     if [ "$INFERENCE_EXPLICIT" = "0" ] && [ -n "${ORCH_MODEL_API_KEY:-}" ]; then
       export MODEL_ACCESS_KEY="$ORCH_MODEL_API_KEY"
@@ -151,6 +153,12 @@ case "$INFERENCE_PROFILE" in
     ;;
 esac
 
+# Explicit -m/--model on the OpenAI (native) path: no provider override is set,
+# so just pin the model. (Profile paths already set their own model above.)
+if [ -z "$INFERENCE_PROFILE" ] && [ -n "${ORCH_CODEX_MODEL:-}" ]; then
+  CODEX_PROVIDER_CONFIG+=( -c "model=\"$ORCH_CODEX_MODEL\"" )
+fi
+
 MCP_CONFIG=(
   -c "mcp_servers.orchestrator.args=[\"-m\",\"orchestrator.cli\",\"--instance\",\"$PROJECT\",\"serve\"]"
   -c "mcp_servers.orchestrator.command=\"$ORCH/.venv/bin/python\""
@@ -158,10 +166,19 @@ MCP_CONFIG=(
 )
 
 if [ "${ROLE:-}" = "orch-manager" ]; then
-  cmd=(codex --yolo -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
+  if [ "$LAUNCH_MODE" = "interactive" ]; then
+    cmd=(codex --yolo -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
+  else
+    cmd=(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox
+      -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
+  fi
 else
-  cmd=(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox
-    -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
+  if [ "$LAUNCH_MODE" = "interactive" ]; then
+    cmd=(codex --yolo -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
+  else
+    cmd=(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox
+      -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
+  fi
 fi
 
 if [ "${ORCH_LAUNCH_DRY_RUN:-0}" = "1" ]; then
@@ -177,7 +194,8 @@ if [ "${ORCH_LAUNCH_DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
-if [ "${LOOP_AGENT:-0}" = "1" ] && [ -n "${AGENT_ID:-}" ]; then
+# Interactive mode drives a TUI by hand, so it skips the headless poll loop.
+if [ "${LOOP_AGENT:-0}" = "1" ] && [ -n "${AGENT_ID:-}" ] && [ "$LAUNCH_MODE" != "interactive" ]; then
   export ORCH_DASHBOARD="$DASHBOARD"
   export AGENT_POLL="${AGENT_POLL:-${AGENT_POLL_DEFAULT:-90}}"
   if [ "${IDLE_STOP:-0}" -gt 0 ]; then

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Refresh agent-model.yaml from live provider /v1/models endpoints.
+
+For each provider in agent-model.yaml `providers:` (that you have a key for),
+GET {base_url}/models, keep the text-generation models, auto-shorten the ids to
+convenient shortcuts, and rewrite the matching harness's model list so `-m
+<shortcut>` stays in sync with what the endpoint actually serves.
+
+Usage:
+    gather-models.py                 # all providers with a resolvable key
+    gather-models.py orch_model      # one provider id
+    gather-models.py opencode        # all providers for a harness
+    gather-models.py --dry-run ...   # show what would change, do not write
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import urllib.request
+
+# Non-text model ids to drop (embeddings, rerank, tts, image, routers, ...).
+_SKIP = re.compile(
+    r"(embed|rerank|tts|voicedesign|whisper|image|stable-diffusion|wan2|"
+    r"mini-lm|mpnet|^bge|^e5-|^gte-|^all-|^router:|reranker)",
+    re.IGNORECASE,
+)
+_VENDOR_PREFIX = re.compile(r"^(openai-|anthropic-|alibaba-|nvidia-|meta-)")
+
+
+def _find_yaml() -> str:
+    for c in [
+        os.environ.get("AGENT_MODEL_YAML"),
+        os.path.join(os.environ["WORKSPACE_ROOT"], "agent-model.yaml")
+        if os.environ.get("WORKSPACE_ROOT") else None,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "agent-model.yaml"),
+    ]:
+        if c and os.path.isfile(c):
+            return os.path.abspath(c)
+    raise SystemExit("agent-model.yaml not found (set AGENT_MODEL_YAML or WORKSPACE_ROOT)")
+
+
+def _fetch_models(base_url: str, api_key: str) -> list[str]:
+    url = base_url.rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+    return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+
+
+def _shorten(model_id: str, taken: set[str]) -> str:
+    short = _VENDOR_PREFIX.sub("", model_id)
+    if short in taken or not short:
+        short = model_id  # collision or empty -> keep full id
+    return short
+
+
+def main(argv: list[str]) -> int:
+    import yaml
+
+    dry = "--dry-run" in argv
+    targets = [a for a in argv if a != "--dry-run"]
+
+    path = _find_yaml()
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    providers = data.get("providers", {}) or {}
+    harnesses = data.setdefault("harnesses", {})
+
+    # Resolve which provider ids to gather.
+    selected = {}
+    for pid, pdef in providers.items():
+        pdef = pdef or {}
+        if not targets or pid in targets or pdef.get("harness") in targets:
+            selected[pid] = pdef
+    if not selected:
+        print(f"no matching providers (known: {', '.join(providers)})", file=sys.stderr)
+        return 2
+
+    changed = False
+    for pid, pdef in selected.items():
+        harness = pdef.get("harness")
+        base_url = pdef.get("base_url")
+        key_env = pdef.get("api_key_env", "")
+        key = os.environ.get(key_env, "")
+        if not base_url or not harness:
+            print(f"skip {pid}: missing base_url/harness", file=sys.stderr)
+            continue
+        if not key:
+            print(f"skip {pid}: {key_env} not set in environment", file=sys.stderr)
+            continue
+        try:
+            ids = _fetch_models(base_url, key)
+        except Exception as exc:  # noqa: BLE001
+            print(f"skip {pid}: fetch failed ({exc})", file=sys.stderr)
+            continue
+
+        text_ids = sorted(i for i in ids if not _SKIP.search(i))
+        hz = harnesses.setdefault(harness, {"provider": "opensource", "models": {}})
+        models = hz.setdefault("models", {})
+
+        # Drop existing entries that belong to this provider, keep others.
+        prefix = f"{pid}/"
+        models = {k: v for k, v in models.items()
+                  if not str((v or {}).get("model", "")).startswith(prefix)}
+
+        taken = set(models.keys())
+        added = []
+        for mid in text_ids:
+            short = _shorten(mid, taken)
+            taken.add(short)
+            models[short] = {"model": f"{pid}/{mid}", "note": f"{mid} via {pid}"}
+            added.append(short)
+
+        hz["models"] = dict(sorted(models.items()))
+        # keep a valid default
+        if hz.get("default") not in hz["models"]:
+            hz["default"] = next(iter(hz["models"]), "")
+        changed = True
+        print(f"{pid} ({harness}): {len(added)} models -> {', '.join(added)}")
+
+    if not changed:
+        print("nothing gathered (no providers with keys reachable).", file=sys.stderr)
+        return 1
+
+    if dry:
+        print("\n--dry-run: no file written.")
+        return 0
+
+    header = (
+        "# agent-model.yaml — valid (harness x model) combinations.\n"
+        "# The `opencode` model lists are auto-generated by gather-models.py from\n"
+        "# live provider /v1/models; edit `providers:` or re-run gather to refresh.\n"
+        "# claude/codex use native auth and are hand-maintained.\n"
+        "# List all combos:  agent-launchers/resolve-model.py --list\n"
+        "# -m goes BEFORE the runtime:  ./start-dev-worker.sh backend -m deepseek opencode\n\n"
+    )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(header)
+        yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False, width=100)
+    print(f"\nwrote {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

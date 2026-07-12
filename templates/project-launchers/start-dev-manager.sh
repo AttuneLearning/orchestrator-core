@@ -6,7 +6,7 @@ shift
 LAUNCH_FLAGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run|--no-enable-loop) LAUNCH_FLAGS+=("$1"); shift ;;
+    --dry-run|--no-enable-loop|--interactive|--non-interactive) LAUNCH_FLAGS+=("$1"); shift ;;
     *) break ;;
   esac
 done

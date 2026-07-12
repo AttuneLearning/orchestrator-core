@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 WS="$(cd "$(dirname "$0")" && pwd)"
+
+TEAM="${1:-}"
+if [ -z "$TEAM" ]; then
+  echo "usage: start-opencode-worker.sh <backend|frontend> [args...]" >&2
+  exit 1
+fi
+shift
+
 LAUNCH_FLAGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -8,9 +17,5 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
-RUNTIME=claude
-if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
-  RUNTIME="$1"
-  shift
-fi
-exec "$WS/start-agent.sh" "${LAUNCH_FLAGS[@]}" senior-dev "$RUNTIME" "$@"
+
+exec "$WS/start-dev-worker.sh" "$TEAM" "${LAUNCH_FLAGS[@]}" opencode "$@"
