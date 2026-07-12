@@ -495,6 +495,14 @@ def _cmd_status(args, settings) -> int:
         for m in pending:
             print(f"  [{m['id']}] {m['from_team']} → {m['to_team']} "
                   f"({m['priority']}): {m['subject']}")
+    tiers = repo.worker_tier_stats(pool)
+    if tiers:
+        print("== worker tiers (GAP-5 stamps; see /tiers) ==")
+        for t in tiers:
+            print(f"  {t['team']}/{t['runtime']}: commits={t['commits']} "
+                  f"verify={t['verify_green']}/{t['verifies']} "
+                  f"(avg {t['avg_verify_s'] or '—'}s) "
+                  f"gates +{t['gate_pass']}/-{t['gate_decline']}")
     return 0
 
 

@@ -869,6 +869,10 @@ def create_app(pool: Optional[ConnectionPool] = None,
                              "paused_until": pu.isoformat() if pu else None,
                              "pause_seconds": secs})
 
+    @app.get("/tiers", response_class=HTMLResponse)
+    def tiers() -> str:
+        return templates.tiers_page(repo.worker_tier_stats(pool))
+
     @app.get("/adrs", response_class=HTMLResponse)
     def adrs() -> str:
         return templates.adrs_page(repo.list_adrs(pool))

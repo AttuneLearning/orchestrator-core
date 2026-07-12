@@ -179,6 +179,7 @@ def page(title: str, body: str) -> str:
         "<a href='/orch/monitor'>Monitor</a>"
         "<a href='/contracts'>Contracts</a>"
         "<a href='/adrs'>ADRs</a>"
+        "<a href='/tiers'>Tiers</a>"
         "<a href='/docs'>Docs</a>"
         "<a href='/settings'>Settings</a>"
         "<a href='/api/state'>JSON</a>"
@@ -188,6 +189,29 @@ def page(title: str, body: str) -> str:
         "</main></body></html>"
     )
     return _with_project(html)
+
+
+def tiers_page(rows: list[dict[str, Any]]) -> str:
+    """GAP-5 / ADR-PROC-003: per (runtime, team) worker performance — the evidence
+    for promoting/demoting a model tier on a lane."""
+    if not rows:
+        body = ("<p>No stamped work events yet — stats accumulate as workers "
+                "report through report_work / verify_run / gate_decision.</p>")
+    else:
+        trs = "".join(
+            f"<tr><td>{escape(str(r['team']))}</td><td>{escape(str(r['runtime']))}</td>"
+            f"<td>{r['commits']}</td>"
+            f"<td>{r['verify_green']}/{r['verifies']}</td>"
+            f"<td>{r['avg_verify_s'] if r['avg_verify_s'] is not None else '—'}</td>"
+            f"<td>{r['gate_pass']}</td><td>{r['gate_decline']}</td></tr>"
+            for r in rows)
+        body = ("<table><thead><tr><th>team</th><th>runtime</th><th>commits</th>"
+                "<th>verify green</th><th>avg verify s</th><th>gate pass</th>"
+                "<th>gate decline</th></tr></thead>"
+                f"<tbody>{trs}</tbody></table>"
+                "<p style='opacity:.7'>Server-side stamps (unspoofable). Use this to "
+                "promote/demote model tiers per lane — ADR-PROC-003.</p>")
+    return page("Worker tiers", f"<h1>Worker tiers</h1>{body}")
 
 
 def workers_page(agents: list[dict[str, Any]], project: str) -> str:

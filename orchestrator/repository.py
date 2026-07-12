@@ -980,6 +980,34 @@ def get_adr(pool: ConnectionPool, adr_key: str) -> Optional[dict[str, Any]]:
     return dict(zip(_ADR_COLS, row)) if row else None
 
 
+def worker_tier_stats(pool: ConnectionPool) -> list[dict[str, Any]]:
+    """GAP-5: per (runtime, team) performance from the server-side stamps on work
+    events — commits, machine verify runs (pass rate + avg duration), gate outcomes.
+    Feeds the ADR-PROC-003 capability-ladder promotion/demotion decisions."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(payload->>'agent_runtime','?') AS runtime, "
+            "       COALESCE(payload->>'agent_team','?') AS team, "
+            "       COUNT(*) FILTER (WHERE event_type = 'code_committed') AS commits, "
+            "       COUNT(*) FILTER (WHERE event_type = 'tests_run' "
+            "                        AND (payload->>'machine')::bool) AS verifies, "
+            "       COUNT(*) FILTER (WHERE event_type = 'tests_run' "
+            "                        AND (payload->>'machine')::bool "
+            "                        AND (payload->>'returncode')::int = 0) AS verify_green, "
+            "       ROUND(AVG((payload->>'duration_s')::float) FILTER "
+            "             (WHERE payload ? 'duration_s')::numeric, 1) AS avg_verify_s, "
+            "       COUNT(*) FILTER (WHERE event_type = 'gate_pass') AS gate_pass, "
+            "       COUNT(*) FILTER (WHERE event_type = 'gate_decline') AS gate_decline "
+            "FROM issue_events "
+            "WHERE payload ? 'agent_runtime' "
+            "  AND event_type IN ('code_committed','tests_run','gate_pass','gate_decline') "
+            "GROUP BY 1, 2 ORDER BY 2, 1"
+        ).fetchall()
+    cols = ["runtime", "team", "commits", "verifies", "verify_green",
+            "avg_verify_s", "gate_pass", "gate_decline"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def recent_adr_proposal_count(pool: ConnectionPool, proposed_by: str,
                               within_minutes: int = 60) -> int:
     """How many ADRs this proposer filed in the last `within_minutes`. Powers the

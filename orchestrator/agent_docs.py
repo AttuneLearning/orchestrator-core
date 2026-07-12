@@ -118,6 +118,24 @@ manual edits.
 6. **Heartbeat WHILE you work — this is mandatory, not optional.** Call `mcp__orchestrator__heartbeat(agent_id={agent_id})` at the start of every issue and **again at least every ~2 minutes during any long-running step** (test suite, build, e2e). A worker that goes silent past the stale window is treated as dead: its issue is reclaimed mid-run and, after a few reclaims, quarantined (off_rails). Frequent heartbeats are what keep your work yours.
 7. When the queue is empty, obey `next_poll_seconds` (loop enabled → keep polling at that cadence and pick up newly-assigned work; disabled → slow-poll, never fully stop).
 
+## Your contract (exact inputs → exact outputs)
+
+**You get** (per issue, over MCP): the issue spec (`list_my_work`), its governing
+rules (`adr_for_issue`), its contracts (`contracts_for_issue` — anything listed as
+`missing` needs a `contract_propose`, NEVER an invented shape), and prior context
+(`context_load`). Nothing else is promised; do not go hunting in other lanes.
+
+**What counts as done** (all verified mechanically — claims don't count):
+{contract_outputs}
+
+**On failure**: report honestly (`gate_decision(passed=false)` with the reason).
+A declined issue is re-specified or escalated to the senior lane by the engine —
+do NOT grind retries, invent workarounds, or widen your scope to "fix" it.
+
+**Hard boundaries**: no ADR/goal/contract creation or approval (suggest/propose
+only); no push/merge/promote; no work outside your write scope; no acting on
+gates you don't own.
+
 ## Boundaries
 - Act only on issues assigned to agent_id {agent_id}, and only at your gate(s): **{owned_gates}**.
 - {boundary_extra}
@@ -127,6 +145,21 @@ manual edits.
 
 {rules_block}
 """
+
+# function -> the "what counts as done" block of the worker contract (DOC-3).
+_CONTRACT_OUTPUTS = {
+    "dev": ("a REAL commit on branch `issue-<id>` (the coordinator verifies the sha, "
+            "a non-empty diff, and that every file is inside your write scope), with a "
+            "REAL test (placeholder assertions are rejected), typecheck + tests green, "
+            "then `report_work(sha, branch, tests_passed=true)` + "
+            "`gate_decision(passed=true)`."),
+    "qa": ("a harness-recorded verify result: call `verify_run(issue_id)` (the "
+           "coordinator runs typecheck + tests itself and records the exit code), then "
+           "`report_work` + `gate_decision(passed=<verify_run.passed>)`. Your own "
+           "test-run claims are not accepted as evidence."),
+    "lead": ("a `gate_decision` grounded in the recorded evidence (code_committed / "
+             "tests_run payloads) — never in the worker's prose."),
+}
 
 
 def render_agent_doc(*, vendor: str, team: str, function: str, agent_id: int,
@@ -145,6 +178,8 @@ def render_agent_doc(*, vendor: str, team: str, function: str, agent_id: int,
         bootstrap=_BOOTSTRAP.get(vendor, ""), owned_gates=owned_gates,
         owned_desc=owned_desc, work_step=work_step, sync_step=sync_step,
         boundary_extra=boundary_extra, rules_block=rules_block,
+        contract_outputs=_CONTRACT_OUTPUTS.get(
+            function, "your gate's work, reported via report_work + gate_decision."),
     )
 
 
