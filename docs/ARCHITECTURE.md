@@ -127,6 +127,26 @@ CLI `adr approve`.
 | G9 reasoner resilience | `CliReasoner._ask` retries → `ReasonerExhausted` | transport errors becoming gate declines (was 972 events) |
 | GAP-5 stamps | report/gate/verify payloads | untraceable per-tier performance (agent_id/runtime stamped server-side) |
 
+## 6b. ADR graph rules (authoring new ADRs)
+
+The per-issue pull (`adr_for_issue`) is: reasoner tags ∪ universal floor (no-team,
+no-work_type rules) — or the team-selector fallback when untagged — expanded via
+**forward-only** closure over `related` edges. Keep the graph healthy:
+
+1. **`decision` is the only field agents ever see** — write it as a token-minimal
+   directive; rationale/examples/history go in `context` (human-side, free).
+2. **Every team-scoped ADR must be reachable** from its flow hub
+   (`ADR-FLOW-BE/FE/SEC/BILL-001` star graphs: hub → members; exclusive members →
+   hub). An unlinked team-scoped ADR can silently vanish on tagged issues.
+3. **Universal ADRs must NOT forward-link into team-scoped clusters** — a
+   universal rule is in every floor, so such an edge drags a whole cluster into
+   every surface (found live: DEV-001→DEV-002 pulled the entire FE cluster into
+   backend pulls).
+4. **Shared cluster members (in >1 hub) get NO backedge** — a backedge from a
+   shared member would union its clusters on every tag of it.
+5. Keep `work_types` selectors empty unless certain: selectors intersect, so a
+   work_type restriction silently excludes the rule from adjacent work.
+
 ## 7. Invariants (never violate)
 
 1. Workers never push, merge, or promote; the engine owns integration.
