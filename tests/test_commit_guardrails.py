@@ -88,6 +88,42 @@ def test_g7_allows_fetch_in_shared_api_client(gitrepo):
     _verify_commit_real(_settings(gitrepo), 1, "")  # shared/api is the allowed place
 
 
+# --- GAP-1: lane enforcement on the diff ------------------------------------ #
+
+def test_lane_backend_rejects_frontend_files(gitrepo):
+    _commit_on_issue(gitrepo, "apps/web/src/pages/Foo.tsx", "export const x = 1;\n")
+    with pytest.raises(ValueError, match="outside the backend lane"):
+        _verify_commit_real(_settings(gitrepo), 1, "", team="backend")
+
+
+def test_lane_backend_allows_api_and_contracts(gitrepo):
+    _commit_on_issue(gitrepo, "apps/api/src/x.ts", "export const x = 1;\n")
+    (gitrepo / "packages/contracts/src").mkdir(parents=True)
+    (gitrepo / "packages/contracts/src/y.ts").write_text("export const y = 2;\n")
+    (gitrepo / "contracts.seed.json").write_text("[]\n")
+    _git(gitrepo, "add", "-A")
+    _git(gitrepo, "commit", "-qm", "more")
+    _verify_commit_real(_settings(gitrepo), 1, "", team="backend")  # must not raise
+
+
+def test_lane_frontend_rejects_contracts_edit(gitrepo):
+    _commit_on_issue(gitrepo, "packages/contracts/src/shares.ts", "export const s = 1;\n")
+    with pytest.raises(ValueError, match="outside the frontend lane"):
+        _verify_commit_real(_settings(gitrepo), 1, "", team="frontend")
+
+
+def test_lane_frontend_rejects_root_toolchain(gitrepo):
+    _commit_on_issue(gitrepo, "package.json", '{"name": "x"}\n')
+    with pytest.raises(ValueError, match="outside the frontend lane"):
+        _verify_commit_real(_settings(gitrepo), 1, "", team="frontend")
+
+
+def test_lane_senior_and_unknown_teams_unrestricted(gitrepo):
+    _commit_on_issue(gitrepo, "package.json", '{"name": "x"}\n')
+    _verify_commit_real(_settings(gitrepo), 1, "", team="senior")  # must not raise
+    _verify_commit_real(_settings(gitrepo), 1, "", team="")        # legacy callers
+
+
 # --- G4: issue readiness ---------------------------------------------------- #
 
 def test_g4_ready_when_actionable():

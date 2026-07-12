@@ -72,6 +72,21 @@ _BOUNDARY = {
     "qa": "You run verify commands and report results — never edit application code or act on another gate.",
     "lead": "You render verdicts only — never edit the repo.",
 }
+# team -> hard write-scope line for dev workers (GAP-1). Enforced mechanically:
+# a pre-commit hook in this worktree AND the coordinator's report_work/
+# gate_decision gate both reject out-of-lane diffs. Senior/unlisted teams are
+# unrestricted (cross-cutting escalation lane).
+_LANE_BOUNDARY = {
+    "backend": ("**Write scope (enforced):** commit ONLY under `apps/api/`, "
+                "`packages/contracts/`, or `contracts.seed.json`. Frontend files and "
+                "root/toolchain configs are out of your lane — out-of-lane commits are "
+                "rejected by the pre-commit hook and again at report_work."),
+    "frontend": ("**Write scope (enforced):** commit ONLY under `apps/web/`. "
+                 "`packages/contracts` is backend-owned and READ-ONLY here — request a "
+                 "contract change via `contract_propose`/comms (ADR-DEV-002), never edit it. "
+                 "Out-of-lane commits are rejected by the pre-commit hook and again at "
+                 "report_work."),
+}
 _BOOTSTRAP = {
     "claude": "Claude Code loads this file as project instructions.",
     "codex": "Codex / AGENTS-aware tools load this file.",
@@ -121,6 +136,8 @@ def render_agent_doc(*, vendor: str, team: str, function: str, agent_id: int,
     work_step = _WORK_STEP.get(function, "do your gate's work, then report_work + gate_decision.")
     sync_step = _SYNC_STEP.get(function, _SYNC_STEP["dev"])
     boundary_extra = _BOUNDARY.get(function, "Keep changes minimal and in-lane.")
+    if function == "dev" and team in _LANE_BOUNDARY:
+        boundary_extra = f"{boundary_extra}\n- {_LANE_BOUNDARY[team]}"
     rules_block = adr_rules.format_rules_block(rules) or \
         "## Applicable rules (from the orchestrator SoT)\n\n_(no accepted ADRs apply yet)_"
     return _TEMPLATE.format(

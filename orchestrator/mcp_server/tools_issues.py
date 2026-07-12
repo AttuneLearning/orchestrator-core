@@ -31,6 +31,23 @@ _WEB_COMPONENT_RE = re.compile(r"^\+\+\+ b/apps/web/src/(pages|widgets|features|
 _GIT_ID = ["-c", "user.email=orchestrator@local", "-c", "user.name=orchestrator",
            "-c", "commit.gpgsign=false"]
 
+# GAP-1 lane enforcement: which paths each team's diff may touch. Contracts are
+# backend-owned (ADR-DEV-001); frontend consumes them read-only and requests
+# changes via contract_propose/comms (ADR-DEV-002). Root/toolchain files are
+# senior-only. Teams not listed (senior, cloud, ...) are unrestricted.
+_TEAM_LANES: dict[str, tuple[str, ...]] = {
+    "backend": ("apps/api/", "packages/contracts/", "contracts.seed.json"),
+    "frontend": ("apps/web/",),
+}
+
+
+def _out_of_lane(team: str, files: list[str]) -> list[str]:
+    lanes = _TEAM_LANES.get(team or "")
+    if not lanes:
+        return []
+    return [f for f in files
+            if not any(f == lane or f.startswith(lane) for lane in lanes)]
+
 
 def _valid_issue_branch(issue_id: int, branch: str) -> bool:
     return branch == f"issue-{issue_id}"
@@ -60,16 +77,19 @@ def _git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=30)
 
 
-def _verify_commit_real(settings, issue_id: int, sha: str) -> None:
-    """G1/G7 harness gate: prove an implementation report points at REAL code the
-    model actually committed — not a hallucinated sha or an empty/placeholder diff.
+def _verify_commit_real(settings, issue_id: int, sha: str, team: str = "") -> None:
+    """G1/G7/GAP-1 harness gate: prove an implementation report points at REAL,
+    IN-LANE code the model actually committed — not a hallucinated sha, an
+    empty/placeholder diff, or work smeared outside the team's write scope.
 
     Checks, against the shared git dir (promote/apply repo): the `issue-<id>`
-    branch exists, the reported sha is on it, and the diff vs the base branch is
-    non-empty. Then lints the ADDED lines: rejects placeholder tests
-    (`expect(true).toBe(true)`) and raw `fetch(` in a web component (must go
-    through the contract http client). Skipped only when no repo is configured
-    (hermetic unit tests). Raises ValueError with a machine-actionable reason."""
+    branch exists, the reported sha is on it, the diff vs the base branch is
+    non-empty, and every changed file is inside the team's lane (_TEAM_LANES;
+    senior/unlisted teams unrestricted). Then lints the ADDED lines: rejects
+    placeholder tests (`expect(true).toBe(true)`) and raw `fetch(` in a web
+    component (must go through the contract http client). Skipped only when no
+    repo is configured (hermetic unit tests). Raises ValueError with a
+    machine-actionable reason."""
     base = settings.promote_repo_path or settings.apply_repo_path
     if not base:
         return  # unconfigured (hermetic tests) — nothing to verify against
@@ -85,6 +105,15 @@ def _verify_commit_real(settings, issue_id: int, sha: str) -> None:
     if not diff.strip():
         raise ValueError(
             f"issue {issue_id}: '{branch}' has no diff vs '{target}' — empty/no real code")
+    files = _git(base, "diff", "--name-only", f"{target}...{branch}").stdout.split()
+    stray = _out_of_lane(team, files)
+    if stray:
+        lanes = ", ".join(_TEAM_LANES.get(team, ()))
+        raise ValueError(
+            f"issue {issue_id}: diff touches files outside the {team} lane "
+            f"({lanes}): {', '.join(stray[:8])} — revert them; if the change is "
+            f"genuinely needed there, it belongs to another team's issue "
+            f"(contracts: use contract_propose) or the senior lane")
     added, cur_web = [], False
     for line in diff.splitlines():
         if line.startswith("+++ "):
@@ -214,7 +243,8 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
                     f"issue {issue_id} cannot pass implementation without a valid "
                     f"code_committed report on branch 'issue-{issue_id}'"
                 )
-            _verify_commit_real(settings, issue_id, "")  # G1/G7: branch/diff/lints must hold
+            # G1/G7/GAP-1: branch/diff/lints/lane must all hold
+            _verify_commit_real(settings, issue_id, "", team=issue.team or "")
         pipeline = pipelines[issue.pipeline]
         gate = pipeline.gate(issue.gate_type)
         outcome = apply_gate_decision(
@@ -375,6 +405,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
             issue_id, issue.gate_type, sha, branch, tests_passed, payload,
         )
         if issue.gate_type == "implementation":
-            _verify_commit_real(settings, issue_id, sha)  # G1/G7: real commit + lints
+            # G1/G7/GAP-1: real commit + lints + in-lane
+            _verify_commit_real(settings, issue_id, sha, team=issue.team or "")
         repo.append_log(pool, issue_id, "code_committed", payload)
         return {"status": "ok"}
