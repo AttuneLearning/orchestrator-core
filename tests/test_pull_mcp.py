@@ -7,6 +7,7 @@ import pytest
 
 from orchestrator import repository as repo
 from orchestrator.agents.reasoning import StubReasoner
+from orchestrator.config import load_settings
 from orchestrator.engine.loop import Engine, TickSummary
 from orchestrator.mcp_server import tools_issues
 
@@ -26,7 +27,13 @@ class _Recorder:
 
 def _tools(pool):
     rec = _Recorder()
-    tools_issues.register(rec, pool)
+    # No repo configured → the G1 real-commit check is skipped, so these tests
+    # exercise the payload-validation + gate-advance layer (G1's git layer has its
+    # own coverage in test_commit_guardrails.py).
+    s = load_settings()
+    s.promote_repo_path = ""
+    s.apply_repo_path = ""
+    tools_issues.register(rec, pool, s)
     return rec.tools
 
 

@@ -78,6 +78,13 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         human manager: it appears on the dashboard /adrs review queue and in the
         orchestration inbox shown by `status`. Returns status 'duplicate' or
         'suggested'."""
+        proposer = f"agent-suggest:{proposed_by}"
+        # G2 loop-breaker: a wedged worker cannot spam governance. Cap suggestions
+        # per proposer per hour; over the cap, refuse and tell it to do its work.
+        if repo.recent_adr_proposal_count(pool, proposer, 60) >= 5:
+            return {"status": "rate_limited",
+                    "message": "too many ADR suggestions in the last hour — stop "
+                               "suggesting and work your assigned issue"}
         dup = _duplicate_adr(repo.list_adrs(pool), domain, title, decision)
         if dup:
             return {"status": "duplicate", "of": dup,
@@ -86,7 +93,7 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
             pool, domain, title, decision, context,
             applies_to={"work_types": work_types or [], "teams": teams or [],
                         "repos": repos or []},
-            status="proposed", proposed_by=f"agent-suggest:{proposed_by}",
+            status="proposed", proposed_by=proposer,
         )
         # 'orchestration'-team messages are never auto-decomposed (loop.MONITOR_TEAMS):
         # they stay pending for the human, surfacing on /orch/monitor and in `status`.

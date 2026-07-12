@@ -16,6 +16,7 @@ complete. Postgres MVCC keeps a single-threaded loop consistent.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -57,6 +58,15 @@ CONTRACT_WORK_TYPES = {"new-endpoint"}
 # Teams whose inbound messages are NOT auto-decomposed into worker issues — they
 # queue pending for the human-reviewed /orch/monitor dashboard instead.
 MONITOR_TEAMS = {"orchestration"}
+
+# G6: architecture/security-defining work goes to the senior lane up front
+# (ADR-PROC-002) rather than after a weak worker exhausts its retries.
+_ARCH_HEAVY_RE = re.compile(
+    r"\b(architect\w*|encrypt\w*|crypto\w*|key custody|kms|shamir|security model|"
+    r"authoriz\w*|authentic\w*|rbac|threat model|schema design|data model|"
+    r"migration|envelope encryption|master key)\b", re.I)
+# G5: a heuristic that a spec bundles multiple deliverables (should have been split).
+_OVERSIZED_RE = re.compile(r"(\band\b.*\band\b)|(;.*;)|(\balso\b)", re.I)
 
 
 @dataclass
@@ -351,6 +361,15 @@ class Engine:
                                               spec.description, team=team_id, pipeline=pid)
                     created.append((issue.id, team_id))
                     summary.decomposed += 1
+                    spec_text = f"{spec.title}\n{spec.description}"
+                    if team_id != "senior" and _ARCH_HEAVY_RE.search(spec_text):
+                        # G6: route architecture/security-heavy work to senior up front.
+                        repo.escalate_to_senior(self.pool, issue.id)
+                    if _OVERSIZED_RE.search(spec_text):
+                        # G5: flag a likely multi-deliverable issue (should be split).
+                        self._alert(summary, goal_id=goal.id, issue_id=issue.id,
+                                    sizing="likely-multi-deliverable",
+                                    hint="one deliverable per issue (ADR-PROC-001)")
                 # Relate the governing ADRs to each new issue ONCE, here at creation
                 # (cached in issue_adrs). adr_for_issue unions these reasoner tags with
                 # the deterministic selector match + full backlink closure at pull time,
@@ -775,6 +794,16 @@ class Engine:
                 elif outcome.state == IssueState.FAILED.value:
                     self._release_agent(issue)
                     summary.failed += 1
+                elif (outcome.event_type == "gate_decline"
+                      and outcome.retry_count >= self.t.escalate_to_senior_at
+                      and (issue.team or "") != "senior"):
+                    # G8: don't let a weak worker blindly re-run to exhaustion — after
+                    # the escalation threshold, hand the issue to the senior lane.
+                    aid = repo.escalate_to_senior(self.pool, issue.id)
+                    self._alert(summary, goal_id=issue.goal_id, issue_id=issue.id,
+                                escalated_to=(f"senior#{aid}" if aid else "unassigned"),
+                                reason=(f"declined {outcome.retry_count}x — routed to "
+                                        f"senior (ADR-PROC-002)"))
             except ReasonerExhausted as exc:
                 self._quarantine_exhausted(issue, "review", exc, summary)
             except Exception as exc:  # noqa: BLE001

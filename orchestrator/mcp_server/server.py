@@ -29,7 +29,7 @@ def build_server() -> FastMCP:
     # Set at the logger level so it holds regardless of FastMCP's root logging config.
     import logging
     logging.getLogger("mcp").setLevel(logging.WARNING)
-    tools_issues.register(mcp, pool)
+    tools_issues.register(mcp, pool, settings)
     tools_memory.register(mcp, pool)
     tools_skills.register(mcp, pool)
     tools_status.register(mcp, pool, settings)

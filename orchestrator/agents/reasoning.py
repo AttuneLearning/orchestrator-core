@@ -540,15 +540,36 @@ class CliReasoner(_LLMReasoner):
     def __init__(self, settings: Settings):
         self._cmd = settings.reasoner_cli_cmd or 'claude -p "{prompt}"'
         self._cwd = tempfile.mkdtemp(prefix="orch-reasoner-")
+        # G9: a local CLI (codex/claude) hiccups — non-zero exit, timeout, empty
+        # output. Retry with backoff; only after all attempts fail do we raise
+        # ReasonerExhausted, which the engine treats as PAUSE, never a gate decline.
+        self._retries = max(1, int(settings.reasoner_retries))
+        self._backoff_base = float(settings.reasoner_backoff_base)
+        self._backoff_max = float(settings.reasoner_backoff_max)
 
-    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
-        prompt = f"{system}\n\n{user}\n\nReturn only the requested output."
+    def _run_once(self, prompt: str) -> str:
         argv = [part.format(prompt=prompt) for part in shlex.split(self._cmd)]
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=self._TIMEOUT_S, cwd=self._cwd, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"cli reasoner exited {proc.returncode}: {proc.stderr[:300]}")
-        return proc.stdout.strip()
+        out = proc.stdout.strip()
+        if not out:
+            raise RuntimeError("cli reasoner returned empty output")
+        return out
+
+    def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:
+        prompt = f"{system}\n\n{user}\n\nReturn only the requested output."
+        last: Optional[Exception] = None
+        for attempt in range(self._retries):
+            try:
+                return self._run_once(prompt)
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                last = exc
+                if attempt < self._retries - 1:
+                    time.sleep(min(self._backoff_max, self._backoff_base * (2 ** attempt)))
+        raise ReasonerExhausted(
+            f"cli reasoner failed after {self._retries} attempts: {last}") from last
 
 
 def make_reasoner(settings: Settings) -> Reasoner:

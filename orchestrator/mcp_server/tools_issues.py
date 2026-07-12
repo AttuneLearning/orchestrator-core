@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import re
+import subprocess
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -23,10 +24,81 @@ _STUB_MARKERS = (
     "placeholder output",
     "placeholder implementation",
 )
+# G7 output-quality lints on the implementation diff.
+_PLACEHOLDER_TEST_RE = re.compile(r"expect\(\s*true\s*\)\s*\.\s*toBe\(\s*true\s*\)")
+_RAW_FETCH_RE = re.compile(r"(?<![\w.])fetch\(")
+_WEB_COMPONENT_RE = re.compile(r"^\+\+\+ b/apps/web/src/(pages|widgets|features|entities|processes)/")
+_GIT_ID = ["-c", "user.email=orchestrator@local", "-c", "user.name=orchestrator",
+           "-c", "commit.gpgsign=false"]
 
 
 def _valid_issue_branch(issue_id: int, branch: str) -> bool:
     return branch == f"issue-{issue_id}"
+
+
+# G4: an issue is "ready" (claimable at the implementation gate) only if its spec
+# is actionable — it names a target lane/file, a contract/ADR, or acceptance
+# criteria. A weak model can't recover a vague issue; catch it before the claim.
+_READY_SIGNAL_RE = re.compile(
+    r"(apps/|packages/|[\w./-]+\.[a-z]{2,4}\b|accept|criteria|should |must |verify|"
+    r"\btest\b|endpoint|route|contract|ADR-|component|schema|migration)", re.I)
+
+
+def _issue_ready(title: str, description: str) -> tuple[bool, str]:
+    desc = (description or "").strip()
+    if len(desc) < 30:
+        return False, ("description too thin to be actionable — state the ONE "
+                       "deliverable, target file(s), and acceptance criteria")
+    if not _READY_SIGNAL_RE.search(f"{title or ''} {desc}"):
+        return False, ("no actionable signal (target file/lane, contract/ADR, or "
+                       "acceptance criteria) — sharpen the spec before working it")
+    return True, ""
+
+
+def _git(repo_path: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", repo_path, *_GIT_ID, *args],
+                          capture_output=True, text=True, timeout=30)
+
+
+def _verify_commit_real(settings, issue_id: int, sha: str) -> None:
+    """G1/G7 harness gate: prove an implementation report points at REAL code the
+    model actually committed — not a hallucinated sha or an empty/placeholder diff.
+
+    Checks, against the shared git dir (promote/apply repo): the `issue-<id>`
+    branch exists, the reported sha is on it, and the diff vs the base branch is
+    non-empty. Then lints the ADDED lines: rejects placeholder tests
+    (`expect(true).toBe(true)`) and raw `fetch(` in a web component (must go
+    through the contract http client). Skipped only when no repo is configured
+    (hermetic unit tests). Raises ValueError with a machine-actionable reason."""
+    base = settings.promote_repo_path or settings.apply_repo_path
+    if not base:
+        return  # unconfigured (hermetic tests) — nothing to verify against
+    branch = f"issue-{issue_id}"
+    target = settings.promote_branch or "main"
+    if _git(base, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
+        raise ValueError(
+            f"issue {issue_id}: branch '{branch}' does not exist — no real commit to verify")
+    if sha and _git(base, "merge-base", "--is-ancestor", sha, branch).returncode != 0:
+        raise ValueError(
+            f"issue {issue_id}: reported sha {sha[:10]} is not on '{branch}' — bogus report")
+    diff = _git(base, "diff", f"{target}...{branch}").stdout
+    if not diff.strip():
+        raise ValueError(
+            f"issue {issue_id}: '{branch}' has no diff vs '{target}' — empty/no real code")
+    added, cur_web = [], False
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            cur_web = bool(_WEB_COMPONENT_RE.match(line)) and "shared/api" not in line
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append(line)
+            if cur_web and _RAW_FETCH_RE.search(line):
+                raise ValueError(
+                    f"issue {issue_id}: web component uses raw fetch() — call the contract "
+                    f"http client (shared/api/*Api.ts → apiRequest), per ADR-DEV-002")
+    if _PLACEHOLDER_TEST_RE.search("\n".join(added)):
+        raise ValueError(
+            f"issue {issue_id}: diff adds a placeholder test (expect(true).toBe(true)) — "
+            f"write a real assertion against the unit under test (ADR-DEV-003)")
 
 
 def _looks_like_stub(payload: dict[str, Any]) -> bool:
@@ -88,8 +160,10 @@ def _has_valid_implementation_report(pool: ConnectionPool, issue_id: int) -> boo
     return False
 
 
-def register(mcp: FastMCP, pool: ConnectionPool) -> None:
-    settings = load_settings()
+def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
+    # Accept the caller's (instance-resolved) settings so the G1 commit check runs
+    # against the RIGHT repo; fall back to load_settings() for standalone use.
+    settings = settings if settings is not None else load_settings()
     pipelines = load_pipelines(settings.pipelines)
 
     @mcp.tool()
@@ -107,7 +181,18 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
 
     @mcp.tool()
     def claim_issue(issue_id: int, agent_id: int) -> dict[str, Any]:
-        """Assign an issue to an agent (marks the agent busy)."""
+        """Assign an issue to an agent (marks the agent busy). G4: an under-specified
+        implementation issue is FLAGGED for the lead to sharpen (a 'readiness_warning'
+        event) but not hard-blocked — mechanical readiness over-fires on valid prose
+        specs, so a block would stall real work. The flag is the signal; the real
+        safety net is the G1 commit gate + G8 escalation downstream."""
+        issue = repo.get_issue(pool, issue_id)
+        if issue is None:
+            raise ValueError(f"no issue {issue_id}")
+        if issue.gate_type == "implementation":
+            ready, why = _issue_ready(issue.title, issue.description)
+            if not ready:
+                repo.append_log(pool, issue_id, "readiness_warning", {"reason": why})
         repo.claim_issue(pool, issue_id, agent_id)
         return asdict(repo.get_issue(pool, issue_id))
 
@@ -129,6 +214,7 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
                     f"issue {issue_id} cannot pass implementation without a valid "
                     f"code_committed report on branch 'issue-{issue_id}'"
                 )
+            _verify_commit_real(settings, issue_id, "")  # G1/G7: branch/diff/lints must hold
         pipeline = pipelines[issue.pipeline]
         gate = pipeline.gate(issue.gate_type)
         outcome = apply_gate_decision(
@@ -288,5 +374,7 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         _validate_report_work_payload(
             issue_id, issue.gate_type, sha, branch, tests_passed, payload,
         )
+        if issue.gate_type == "implementation":
+            _verify_commit_real(settings, issue_id, sha)  # G1/G7: real commit + lints
         repo.append_log(pool, issue_id, "code_committed", payload)
         return {"status": "ok"}

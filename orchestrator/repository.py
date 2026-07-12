@@ -370,6 +370,31 @@ def unassign_issue(pool: ConnectionPool, issue_id: int) -> None:
         )
 
 
+def escalate_to_senior(pool: ConnectionPool, issue_id: int) -> Optional[int]:
+    """G8/G6 (ADR-PROC-002): hand an issue to the senior dev lane. Assigns it to a
+    registered senior/dev agent (the issue KEEPS its own team, so the senior worker
+    still derives the code lane: backend→apps/api, frontend→apps/web). Returns the
+    senior agent id assigned, or None if none is registered (then just unassign so
+    the failing worker doesn't immediately re-grab it)."""
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "SELECT id FROM agents WHERE team = 'senior' AND function = 'dev' "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "UPDATE issues SET assigned_agent = NULL, updated_at = now() WHERE id = %s",
+                (issue_id,))
+            return None
+        agent_id = row[0]
+        conn.execute(
+            "UPDATE issues SET assigned_agent = %s, updated_at = now() WHERE id = %s",
+            (agent_id, issue_id))
+        _append_event(conn, issue_id, "escalated_to_senior", None, None,
+                      {"agent": agent_id})
+        return agent_id
+
+
 def update_state(
     pool: ConnectionPool,
     issue_id: int,
@@ -953,6 +978,19 @@ def get_adr(pool: ConnectionPool, adr_key: str) -> Optional[dict[str, Any]]:
     with pool.connection() as conn:
         row = conn.execute(_ADR_SELECT + " WHERE adr_key = %s", (adr_key,)).fetchone()
     return dict(zip(_ADR_COLS, row)) if row else None
+
+
+def recent_adr_proposal_count(pool: ConnectionPool, proposed_by: str,
+                              within_minutes: int = 60) -> int:
+    """How many ADRs this proposer filed in the last `within_minutes`. Powers the
+    G2 loop-breaker rate limit on adr_suggest — a wedged worker cannot spam the
+    governance table (the ~1000 junk-ADR failure mode)."""
+    with pool.connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM adrs WHERE proposed_by = %s "
+            "AND created_at > now() - make_interval(mins => %s)",
+            (proposed_by, within_minutes),
+        ).fetchone()[0]
 
 
 def approve_adr(pool: ConnectionPool, adr_key: str, actor: str = "human") -> dict[str, Any]:

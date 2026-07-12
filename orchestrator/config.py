@@ -42,6 +42,10 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
 class Thresholds:
     drift_threshold: float = 0.5
     retry_cap: int = 3
+    # G8: after this many gate declines, hand the issue to the senior lane instead
+    # of letting the same (weak) worker blindly re-run it to the retry_cap. Must be
+    # < retry_cap to fire before failure.
+    escalate_to_senior_at: int = 2
     step_budget: int = 25
     max_depth: int = 3
     max_subissues: int = 8
@@ -257,6 +261,7 @@ def load_settings(instance: str | None = None) -> Settings:
     thresholds = Thresholds(
         drift_threshold=_env_float("DRIFT_THRESHOLD", t_yaml.get("drift_threshold", 0.5)),
         retry_cap=_env_int("RETRY_CAP", t_yaml.get("retry_cap", 3)),
+        escalate_to_senior_at=_env_int("ESCALATE_TO_SENIOR_AT", t_yaml.get("escalate_to_senior_at", 2)),
         step_budget=_env_int("STEP_BUDGET", t_yaml.get("step_budget", 25)),
         max_depth=_env_int("MAX_DEPTH", t_yaml.get("max_depth", 3)),
         max_subissues=_env_int("MAX_SUBISSUES", t_yaml.get("max_subissues", 8)),
