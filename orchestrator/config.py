@@ -196,6 +196,10 @@ class Settings:
         "model": "",
         "runtime": "",
     })
+    # GAP-4: team -> checkout where the harness-owned verify_run executes the
+    # verification commands (typecheck + tests) itself and records the exit code
+    # as machine evidence. Empty = verify_run unavailable for that team.
+    verify_worktrees: dict[str, Any] = field(default_factory=dict)
 
     # Raw parsed YAML for the pipeline/roster modules to consume.
     pipelines: dict[str, Any] = field(default_factory=dict)
@@ -302,6 +306,7 @@ def load_settings(instance: str | None = None) -> Settings:
     orch_manager_claude = pick_dict("orch_manager_claude", defaults.orch_manager_claude)
     engine_reasoner = pick_dict("engine_reasoner", defaults.engine_reasoner)
     devqa_worker = pick_dict("devqa_worker", defaults.devqa_worker)
+    verify_worktrees = pick_dict("verify_worktrees", defaults.verify_worktrees)
 
     reasoner = pick("REASONER", "reasoner", "")
     reasoner_base_url = pick("REASONER_BASE_URL", "reasoner_base_url", "")
@@ -377,4 +382,5 @@ def load_settings(instance: str | None = None) -> Settings:
         orch_manager_claude=orch_manager_claude,
         engine_reasoner=engine_reasoner,
         devqa_worker=devqa_worker,
+        verify_worktrees=verify_worktrees,
     )

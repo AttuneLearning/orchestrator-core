@@ -97,20 +97,37 @@ def test_issue_contract_deps_roundtrip(pool):
 
 # --- MCP tools -------------------------------------------------------------- #
 
-def test_mcp_propose_agree_get_list(pool):
+def test_mcp_propose_get_list_and_human_agree(pool):
     tools = _tools(pool)
     created = tools["contract_propose"](method="GET", path="/system/status",
                                         response_dto="SystemStatusDTO")
     assert created["status"] == "proposed" and created["method"] == "GET"
-    agreed = tools["contract_agree"](method="GET", path="/system/status")
+    # GAP-2: agreeing is human-gated (dashboard/CLI -> repo), not a worker tool.
+    assert "contract_agree" not in tools and "contract_upsert" not in tools
+    agreed = repo.set_contract_status(pool, "GET", "/system/status", "agreed")
     assert agreed["status"] == "agreed"
     assert tools["contract_get"](method="get", path="/system/status")["status"] == "agreed"
     assert [c["path"] for c in tools["contract_list"](status="agreed")] == ["/system/status"]
 
 
-def test_mcp_upsert_registers_live(pool):
+def test_mcp_propose_rate_limited(pool):
     tools = _tools(pool)
-    row = tools["contract_upsert"](method="GET", path="/health", status="live",
-                                   owner_team="backend")
-    assert row["status"] == "live"
-    assert tools["contract_list"](owner_team="backend")[0]["path"] == "/health"
+    for i in range(8):
+        tools["contract_propose"](method="GET", path=f"/rl/{i}", proposed_by="w1")
+    out = tools["contract_propose"](method="GET", path="/rl/8", proposed_by="w1")
+    assert out["status"] == "rate_limited"
+    # a different proposer is unaffected
+    ok = tools["contract_propose"](method="GET", path="/rl/9", proposed_by="w2")
+    assert ok["status"] == "proposed"
+
+
+def test_mcp_contracts_for_issue_scoped(pool):
+    tools = _tools(pool)
+    goal = repo.create_goal(pool, "g", pipeline="pull-1")
+    issue = repo.create_issue(pool, goal.id, "Consume GET /clients rows",
+                              "The page calls GET /clients and POST /notes.",
+                              team="frontend", pipeline="pull-fe")
+    repo.upsert_contract(pool, "GET", "/clients", status="live", owner_team="backend")
+    out = tools["contracts_for_issue"](issue.id)
+    assert [c["path"] for c in out["contracts"]] == ["/clients"]
+    assert out["missing"] == ["POST /notes"]

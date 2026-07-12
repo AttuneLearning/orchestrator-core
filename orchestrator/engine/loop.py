@@ -557,9 +557,10 @@ class Engine:
         repo.create_message(
             self.pool, from_team=issue.team, to_team="backend",
             subject=f"Contract(s) needed for issue #{issue.id}",
-            body=(f"Issue #{issue.id} ({issue.title}) consumes: {listing}. Please "
-                  "agree each contract (contract_agree) so the frontend can build "
-                  "against the shape, then implement the endpoint(s)."),
+            body=(f"Issue #{issue.id} ({issue.title}) consumes: {listing}. The shapes "
+                  "have been filed as proposed contracts — a human agrees them on the "
+                  "dashboard /contracts page (workers cannot agree contracts, GAP-2); "
+                  "backend then implements the endpoint(s) against the agreed shape."),
             priority="high", issue_id=issue.id, kind="request",
         )
         repo.add_issue_contract_deps(self.pool, issue.id, missing)

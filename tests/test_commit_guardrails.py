@@ -1,11 +1,30 @@
-"""qwen3-coder guardrails: G1/G7 real-commit + diff lints, G4 readiness, G8 escalate."""
+"""qwen3-coder guardrails: G1/G7 real-commit + diff lints, G4 readiness, G8 escalate,
+GAP-1 lanes, GAP-4 harness-run verification."""
 import subprocess
 
 import pytest
 
 from orchestrator import repository as repo
 from orchestrator.config import load_settings
+from orchestrator.mcp_server import tools_issues
 from orchestrator.mcp_server.tools_issues import _verify_commit_real, _issue_ready
+
+
+class _Recorder:
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self):
+        def deco(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+        return deco
+
+
+def _issue_tools(pool, settings):
+    rec = _Recorder()
+    tools_issues.register(rec, pool, settings)
+    return rec.tools
 
 
 def _git(d, *a):
@@ -141,6 +160,70 @@ def test_g4_not_ready_without_actionable_signal():
     ok, why = _issue_ready("Improve things",
                            "please make the whole thing feel better and nicer overall")
     assert not ok and "actionable signal" in why
+
+
+# --- GAP-4: harness-run verification ---------------------------------------- #
+
+def _verification_issue(pool, team="backend"):
+    goal = repo.create_goal(pool, "g", pipeline="pull-1")
+    issue = repo.create_issue(pool, goal.id, "Implement GET /x in apps/api",
+                              "Add GET /x endpoint in apps/api with a test.",
+                              team=team, pipeline="pull-1")
+    repo.update_state(pool, issue.id, "in_progress", gate_type="verification")
+    return issue
+
+
+def test_gap4_verify_run_records_machine_pass_and_gate_accepts(gitrepo, pool):
+    _commit_on_issue(gitrepo, "apps/api/x.ts", "export const x = 1;\n")
+    issue = _verification_issue(pool)
+    s = _settings(gitrepo)
+    s.verify_worktrees = {"backend": str(gitrepo)}
+    s.verify_cmd = "exit 0"
+    tools = _issue_tools(pool, s)
+    # rename the branch to match the real issue id
+    _git(gitrepo, "branch", "-m", "issue-1", f"issue-{issue.id}")
+
+    out = tools["verify_run"](issue.id)
+    assert out["passed"] is True and out["returncode"] == 0
+    ev = [e for e in repo.recent_events(pool, issue.id, limit=10)
+          if e.event_type == "tests_run"][0]
+    assert ev.payload["machine"] is True and ev.payload["returncode"] == 0
+
+    updated = tools["gate_decision"](issue.id, passed=True)
+    assert updated["gate_type"] != "verification"  # advanced past the gate
+
+
+def test_gap4_gate_rejects_selfreported_pass_without_machine_evidence(gitrepo, pool):
+    issue = _verification_issue(pool)
+    s = _settings(gitrepo)
+    s.verify_worktrees = {"backend": str(gitrepo)}
+    tools = _issue_tools(pool, s)
+    with pytest.raises(ValueError, match="machine-recorded"):
+        tools["gate_decision"](issue.id, passed=True)
+
+
+def test_gap4_red_verify_run_blocks_pass(gitrepo, pool):
+    _commit_on_issue(gitrepo, "apps/api/x.ts", "export const x = 1;\n")
+    issue = _verification_issue(pool)
+    s = _settings(gitrepo)
+    s.verify_worktrees = {"backend": str(gitrepo)}
+    s.verify_cmd = "exit 1"
+    tools = _issue_tools(pool, s)
+    _git(gitrepo, "branch", "-m", "issue-1", f"issue-{issue.id}")
+
+    out = tools["verify_run"](issue.id)
+    assert out["passed"] is False and out["returncode"] == 1
+    with pytest.raises(ValueError, match="machine-recorded"):
+        tools["gate_decision"](issue.id, passed=True)  # red evidence can't pass
+
+
+def test_gap4_unconfigured_team_keeps_legacy_flow(gitrepo, pool):
+    issue = _verification_issue(pool, team="cloud")  # no verify worktree mapped
+    s = _settings(gitrepo)
+    s.verify_worktrees = {"backend": str(gitrepo)}
+    tools = _issue_tools(pool, s)
+    updated = tools["gate_decision"](issue.id, passed=True)  # must not raise
+    assert updated["gate_type"] != "verification"
 
 
 # --- G8/G6: escalate to senior --------------------------------------------- #

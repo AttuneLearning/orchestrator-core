@@ -38,3 +38,11 @@ instances:
       docs_reasoner_model: qwen-local
       promote_repo_path: /home/adam/github/tendcharting-ws/tendcharting
       docs_path: /home/adam/github/tendcharting-ws/tendcharting/docs
+      # GAP-4: harness-owned verification — verify_run executes typecheck+tests
+      # in these checkouts and records the exit code as machine evidence; the
+      # verification gate no longer trusts a worker's self-reported pass.
+      verify_worktrees:
+        backend: /home/adam/github/tendcharting-ws/wt-backend-qa
+        frontend: /home/adam/github/tendcharting-ws/wt-frontend-qa
+        senior: /home/adam/github/tendcharting-ws/wt-senior-qa
+      verify_cmd: npm run typecheck && npm test

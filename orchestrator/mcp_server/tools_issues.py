@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import re
 import subprocess
+import time
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -128,6 +129,35 @@ def _verify_commit_real(settings, issue_id: int, sha: str, team: str = "") -> No
         raise ValueError(
             f"issue {issue_id}: diff adds a placeholder test (expect(true).toBe(true)) — "
             f"write a real assertion against the unit under test (ADR-DEV-003)")
+    return files
+
+
+def _agent_stamp(pool: ConnectionPool, issue) -> dict[str, Any]:
+    """GAP-5 telemetry: which agent/runtime produced this event — stamped
+    server-side from the issue's assignment so it cannot be spoofed or omitted."""
+    stamp: dict[str, Any] = {}
+    if issue.assigned_agent is not None:
+        stamp["agent_id"] = issue.assigned_agent
+        agent = repo.get_agent(pool, issue.assigned_agent)
+        if agent is not None:
+            stamp["agent_runtime"] = agent.runtime
+            stamp["agent_team"] = agent.team
+    return stamp
+
+
+def _has_machine_verification(pool: ConnectionPool, issue_id: int) -> bool:
+    """GAP-4: newest harness-recorded verify result since the last directive.
+    True only if verify_run itself recorded returncode==0 — a worker's
+    self-reported tests_passed does not count."""
+    for event in repo.recent_events(pool, issue_id, limit=50):
+        if event.event_type == "directive":
+            break
+        if event.event_type != "tests_run":
+            continue
+        payload = event.payload or {}
+        if payload.get("machine"):
+            return payload.get("returncode") == 0
+    return False
 
 
 def _looks_like_stub(payload: dict[str, Any]) -> bool:
@@ -245,6 +275,15 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
                 )
             # G1/G7/GAP-1: branch/diff/lints/lane must all hold
             _verify_commit_real(settings, issue_id, "", team=issue.team or "")
+        if (passed and issue.gate_type == "verification"
+                and settings.verify_worktrees.get(issue.team or "")):
+            # GAP-4: where a verify worktree is configured, a pass requires the
+            # HARNESS to have run the checks (verify_run, machine-recorded exit 0);
+            # a QA worker's self-reported pass is not evidence.
+            if not _has_machine_verification(pool, issue_id):
+                raise ValueError(
+                    f"issue {issue_id} cannot pass verification without a machine-"
+                    f"recorded green verify_run — call verify_run({issue_id}) first")
         pipeline = pipelines[issue.pipeline]
         gate = pipeline.gate(issue.gate_type)
         outcome = apply_gate_decision(
@@ -253,6 +292,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
             triggered_by_message=issue.triggered_by_message,
         )
         payload = {"reasons": reasons or []}
+        payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
         if issue.gate_type == "e2e" and passed:
             from ..backup import record_backup
             payload["database_backup"] = record_backup(
@@ -404,8 +444,63 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         _validate_report_work_payload(
             issue_id, issue.gate_type, sha, branch, tests_passed, payload,
         )
+        payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
         if issue.gate_type == "implementation":
             # G1/G7/GAP-1: real commit + lints + in-lane
-            _verify_commit_real(settings, issue_id, sha, team=issue.team or "")
+            files = _verify_commit_real(settings, issue_id, sha, team=issue.team or "")
+            # GAP-6 (soft): contract sources changed without the review seed —
+            # flag for the lead; the in-repo contracts:sync guard is advisory only.
+            if files and any(f.startswith("packages/contracts/") for f in files) \
+                    and "contracts.seed.json" not in files:
+                repo.append_log(pool, issue_id, "contract_sync_warning", {
+                    "reason": "packages/contracts changed but contracts.seed.json did "
+                              "not — run `npm run contracts:sync` if the API surface "
+                              "changed (ADR-DEV-001)"})
         repo.append_log(pool, issue_id, "code_committed", payload)
         return {"status": "ok"}
+
+    @mcp.tool()
+    def verify_run(issue_id: int) -> dict[str, Any]:
+        """GAP-4: the HARNESS runs verification for this issue and records the
+        machine result — call this instead of running typecheck/tests yourself.
+
+        Checks out `_verify-<id>` from `issue-<id>` in the team's configured verify
+        worktree, executes the verify command (typecheck + tests), and appends a
+        machine-stamped `tests_run` event with the real exit code. The verification
+        gate only accepts a pass backed by this evidence. May take a few minutes —
+        wait for it. Then call gate_decision(issue_id, passed=<returned passed>)."""
+        issue = repo.get_issue(pool, issue_id)
+        if issue is None:
+            raise ValueError(f"no issue {issue_id}")
+        wt = settings.verify_worktrees.get(issue.team or "")
+        if not wt:
+            raise ValueError(
+                f"no verify worktree configured for team '{issue.team}' — "
+                f"set settings.verify_worktrees.{issue.team}")
+        branch, verify_branch = f"issue-{issue_id}", f"_verify-{issue_id}"
+        if _git(wt, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
+            raise ValueError(f"issue {issue_id}: branch '{branch}' does not exist — "
+                             f"nothing to verify")
+        co = _git(wt, "checkout", "-B", verify_branch, branch)
+        if co.returncode != 0:
+            raise ValueError(f"verify checkout failed: {co.stderr[:300]}")
+        cmd = settings.verify_cmd or "npm run typecheck && npm test"
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True,
+                                  text=True, timeout=900)
+            returncode, out, err = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            returncode = 124
+            out = (exc.stdout or b"").decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err = f"verify timed out after 900s"
+        duration = round(time.monotonic() - started, 1)
+        payload = {
+            "machine": True, "cmd": cmd, "returncode": returncode,
+            "duration_s": duration, "branch": verify_branch,
+            "stdout_tail": out[-1200:], "stderr_tail": err[-800:],
+        }
+        payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
+        repo.append_log(pool, issue_id, "tests_run", payload)
+        return {"passed": returncode == 0, "returncode": returncode,
+                "duration_s": duration, "tail": out[-600:] or err[-600:]}

@@ -1404,6 +1404,7 @@ def propose_contract(
     auth: str = "none",
     source_ref: Optional[str] = None,
     type_ref: Optional[str] = None,
+    proposed_by: str = "human",
 ) -> dict[str, Any]:
     """Record a 'proposed' contract a consumer needs. If one already exists it is
     left untouched (never downgrades an agreed/live contract) and returned as-is."""
@@ -1412,13 +1413,25 @@ def propose_contract(
     with pool.connection() as conn:
         conn.execute(
             "INSERT INTO contracts (method, path, request_ref, response_dto, auth, "
-            "owner_team, status, content_hash, source_ref, type_ref) "
-            "VALUES (%s, %s, %s, %s, %s, %s, 'proposed', %s, %s, %s) "
+            "owner_team, status, content_hash, source_ref, type_ref, proposed_by) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'proposed', %s, %s, %s, %s) "
             "ON CONFLICT (method, path) DO NOTHING",
             (method, path, request_ref, response_dto, auth, owner_team,
-             content_hash, source_ref, type_ref),
+             content_hash, source_ref, type_ref, proposed_by),
         )
     return get_contract(pool, method, path)  # type: ignore[return-value]
+
+
+def recent_contract_proposal_count(pool: ConnectionPool, proposed_by: str,
+                                   within_minutes: int = 60) -> int:
+    """How many contracts this proposer filed recently — powers the GAP-2 rate
+    limit on contract_propose (mirror of recent_adr_proposal_count)."""
+    with pool.connection() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM contracts WHERE proposed_by = %s "
+            "AND created_at > now() - make_interval(mins => %s)",
+            (proposed_by, within_minutes),
+        ).fetchone()[0]
 
 
 def set_contract_status(pool: ConnectionPool, method: str, path: str,

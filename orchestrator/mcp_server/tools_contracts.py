@@ -2,18 +2,20 @@
 
 One row per endpoint, keyed (method, path). The orchestrator's contract_check
 gate blocks frontend work until the endpoints it consumes have an *agreed* (or
-live) contract; backend agents drive contracts through these tools:
+live) contract.
 
-  - contract_propose — a consumer records an endpoint it needs (status 'proposed')
-  - contract_agree   — the owner agrees the shape (status 'agreed' → unblocks FE)
-  - contract_upsert  — register/seed a contract in full (idempotent; e.g. 'live')
-  - contract_get / contract_list — read the store
+GAP-2 (2026-07-12): the contract store is the SSOT (ADR-DEV-001) and gets the
+same protection ADRs got — workers can READ (scoped via contracts_for_issue,
+or browse) and PROPOSE (rate-limited), but cannot mutate: contract_agree /
+contract_upsert are human-gated (dashboard /contracts, import-contracts CLI)
+and are no longer on the worker MCP surface.
 
 Thin wrappers over orchestrator.repository (the single write path).
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -21,40 +23,64 @@ from psycopg_pool import ConnectionPool
 
 from .. import repository as repo
 
+# "METHOD /path" tokens in issue text, e.g. "GET /clients/:id/notes".
+_ENDPOINT_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[\w:{}./-]*)")
+
 
 def register(mcp: FastMCP, pool: ConnectionPool) -> None:
+
+    @mcp.tool()
+    def contracts_for_issue(issue_id: int) -> dict[str, Any]:
+        """The contracts that govern THIS issue — pull these, NOT the whole store.
+
+        Union of (a) the issue's recorded endpoint dependencies
+        (issue_contract_deps) and (b) endpoints named as `METHOD /path` in the
+        issue text, each resolved against the contract store. Missing entries are
+        listed so a consumer knows what to contract_propose. Use this instead of
+        contract_list — it keeps your context small and on-point."""
+        issue = repo.get_issue(pool, issue_id)
+        if issue is None:
+            raise ValueError(f"no issue {issue_id}")
+        wanted: list[tuple[str, str]] = []
+        for d in repo.list_issue_contract_deps(pool, issue_id):
+            wanted.append((d["method"], d["path"]))
+        for m, p in _ENDPOINT_RE.findall(f"{issue.title}\n{issue.description or ''}"):
+            p = p.rstrip(".,;:")  # sentence punctuation is not part of the path
+            if p != "/" and (m, p) not in wanted:
+                wanted.append((m, p))
+        found, missing = [], []
+        for method, path in wanted:
+            c = repo.get_contract(pool, method, path)
+            (found.append(c) if c else missing.append(f"{method} {path}"))
+        return {
+            "issue_id": issue_id,
+            "contracts": found,
+            "missing": missing,
+            "note": ("missing endpoints have no contract yet — a consumer should "
+                     "contract_propose them; never invent a shape (ADR-DEV-001/002)"),
+        }
 
     @mcp.tool()
     def contract_propose(method: str, path: str, request_ref: str = "",
                          response_dto: str = "", owner_team: str = "backend",
                          auth: str = "none", source_ref: Optional[str] = None,
-                         type_ref: Optional[str] = None) -> dict[str, Any]:
+                         type_ref: Optional[str] = None,
+                         proposed_by: str = "agent") -> dict[str, Any]:
         """Record a contract a consumer needs (status 'proposed'). No-op if one
-        already exists (never downgrades an agreed/live contract). type_ref points
-        at the type document in packages/contracts."""
+        already exists (never downgrades an agreed/live contract). A human reviews
+        and agrees it on the dashboard /contracts page — workers cannot agree or
+        upsert contracts directly. Rate-limited per proposer."""
+        # GAP-2/G2 loop-breaker: cap proposals per proposer per hour, same guard
+        # as adr_suggest (the junk-ADR failure mode, aimed at the contracts SSOT).
+        proposer = f"agent:{proposed_by}"
+        if repo.recent_contract_proposal_count(pool, proposer, 60) >= 8:
+            return {"status": "rate_limited",
+                    "message": "too many contract proposals in the last hour — stop "
+                               "proposing and work your assigned issue"}
         return repo.propose_contract(pool, method, path, request_ref, response_dto,
                                      owner_team=owner_team, auth=auth,
-                                     source_ref=source_ref, type_ref=type_ref)
-
-    @mcp.tool()
-    def contract_agree(method: str, path: str) -> dict[str, Any]:
-        """Owner agrees the endpoint's shape (status 'agreed'). This is the signal
-        that unblocks a frontend issue waiting on the contract."""
-        return repo.set_contract_status(pool, method, path, "agreed")
-
-    @mcp.tool()
-    def contract_upsert(method: str, path: str, request_ref: str = "",
-                       response_dto: str = "", auth: str = "none",
-                       owner_team: str = "backend", status: str = "proposed",
-                       version: str = "1.0", source_ref: Optional[str] = None,
-                       type_ref: Optional[str] = None) -> dict[str, Any]:
-        """Insert or fully update a contract (idempotent on method+path). Used to
-        register live endpoints / bulk-seed from the API repo assessment. type_ref
-        points at the type document in packages/contracts."""
-        return repo.upsert_contract(pool, method, path, request_ref, response_dto,
-                                    auth=auth, owner_team=owner_team, status=status,
-                                    version=version, source_ref=source_ref,
-                                    type_ref=type_ref)
+                                     source_ref=source_ref, type_ref=type_ref,
+                                     proposed_by=proposer)
 
     @mcp.tool()
     def contract_get(method: str, path: str) -> Optional[dict[str, Any]]:
@@ -64,5 +90,7 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
     @mcp.tool()
     def contract_list(status: Optional[str] = None,
                      owner_team: Optional[str] = None) -> list[dict[str, Any]]:
-        """List contracts, optionally filtered by status and/or owner_team."""
+        """Browse contracts (read-only), optionally by status/owner_team. For the
+        contracts that apply to YOUR issue use contracts_for_issue(issue_id) —
+        it is scoped and far cheaper than pulling the whole store."""
         return repo.list_contracts(pool, status=status, owner_team=owner_team)
