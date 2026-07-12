@@ -89,9 +89,11 @@ _LANE_BOUNDARY = {
 }
 _BOOTSTRAP = {
     "claude": "Claude Code loads this file as project instructions.",
-    "codex": "Codex / AGENTS-aware tools load this file.",
+    "codex": "Codex / AGENTS-aware tools (incl. opencode) load this file.",
+    "qwen": "Qwen Code loads this file as project instructions.",
 }
-_FILENAME = {"claude": "CLAUDE.md", "codex": "AGENTS.md"}
+# opencode reads AGENTS.md natively (the codex file); qwen-code reads QWEN.md.
+_FILENAME = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "qwen": "QWEN.md"}
 
 _TEMPLATE = """{header}
 # Orchestrator worker — {team}_{function}
@@ -188,7 +190,7 @@ def filename_for(vendor: str) -> str:
 
 
 def render_for(pool, roster, team: str, function: str, agent_id: int,
-               vendors=("claude", "codex")) -> dict[str, str]:
+               vendors=("claude", "codex", "qwen")) -> dict[str, str]:
     """Fetch the applicable accepted ADRs for (team, its repos) and render each
     vendor's file. Returns {filename: content}. (The thin DB-backed entry point.)"""
     from . import repository as repo
