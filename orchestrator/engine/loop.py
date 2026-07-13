@@ -149,6 +149,20 @@ class Engine:
         if issue.assigned_agent is not None:
             repo.set_agent_status(self.pool, issue.assigned_agent, "idle")
 
+    def _awaiting_manual_merge(self, issue: Issue) -> bool:
+        """A completion issue whose most recent promote outcome was a CONFLICT (with no
+        later 'promoted' or human 'directive') is parked awaiting a manual merge. The
+        _advance work-step skips it so the engine does not re-review/re-promote (which
+        would re-attempt the merge and re-alert every tick). A human merges the branch
+        and issues `directive` to release it; the next completion re-promote then finds
+        the branch already in the target and closes the issue cleanly."""
+        latest: Optional[tuple[int, str]] = None
+        for e in repo.recent_events(self.pool, issue.id, limit=100):
+            if e.event_type in ("promote_conflict", "promoted", "directive"):
+                if latest is None or e.seq > latest[0]:
+                    latest = (e.seq, e.event_type)
+        return latest is not None and latest[1] == "promote_conflict"
+
     def _alert(self, summary: TickSummary, *, goal_id: int,
                issue_id: Optional[int] = None, hold: bool = False, **detail) -> None:
         """Raise an operator alert (decomposition cap / routing-invariant breach).
@@ -673,6 +687,8 @@ class Engine:
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
             try:
                 gate = self._pipeline(issue).gate(issue.gate_type or "")
+                if issue.gate_type == "completion" and self._awaiting_manual_merge(issue):
+                    continue  # held: promote conflicted; awaiting manual merge (no churn)
                 if issue.gate_type == "contract_check":
                     # Mechanical, contract-first triage: pass through to review when
                     # every consumed endpoint has an agreed/live contract; otherwise
@@ -794,7 +810,35 @@ class Engine:
                 if (outcome.state == IssueState.DONE.value
                         and self.settings.auto_promote_enabled):
                     from ..apply.worktree import auto_promote_on_done
-                    payload["promote"] = auto_promote_on_done(self.pool, issue, self.settings)
+                    promo = auto_promote_on_done(self.pool, issue, self.settings)
+                    payload["promote"] = promo
+                    if isinstance(promo, dict) and promo.get("conflict"):
+                        # Promote CONFLICT: the work passed qa_gate but did NOT merge into
+                        # the integration branch. Completing it here (the old
+                        # complete-and-log path) HIDES unmerged work — the coordinator shows
+                        # 'done' while the branch never reached main, so the code is silently
+                        # lost (only a buried promote_conflict event flags it). Instead HOLD
+                        # the issue at the completion gate (in_progress) and raise an operator
+                        # alert. It is NOT re-implemented (the work is good) and NOT churned
+                        # (_awaiting_manual_merge parks it in _advance until a human merges +
+                        # `directive`s it; the re-promote then finds it already in target and
+                        # closes it). in_review→blocked is illegal, so we hold at in_progress.
+                        self._transition(
+                            issue, IssueState.IN_PROGRESS.value, gate_type="completion",
+                            event_type="promote_conflict",  # engine-owned marker: _awaiting_manual_merge keys off this
+                            payload={"reason": "promote_conflict: QA-passed work did not merge "
+                                     f"into '{self.settings.promote_branch or 'main'}' — held "
+                                     "for manual merge (not lost, not re-implemented)",
+                                     "promote": promo},
+                        )
+                        self._alert(
+                            summary, goal_id=issue.goal_id, issue_id=issue.id,
+                            reason="promote_conflict", branch=promo.get("branch"),
+                            target=promo.get("target"),
+                            note="QA-passed work blocked on a merge conflict — merge the branch "
+                                 "manually, then `directive <id> resume` to close it")
+                        self._release_agent(issue)
+                        continue
 
                 self._transition(
                     issue, outcome.state, gate_type=outcome.gate_type,

@@ -315,3 +315,59 @@ def test_reengagement(settings, pool):
             f"issue {issue.id}: reengaged count={etypes.count('reengaged')}"
         assert etypes.count("context_snapshot") == 1, \
             f"issue {issue.id}: context_snapshot count={etypes.count('context_snapshot')}"
+
+
+# --------------------------------------------------------------------------- #
+# Promote-conflict handling: hold + alert, never silently complete (loop.py)
+# --------------------------------------------------------------------------- #
+
+def _at_completion(pool, pipeline="pull-1"):
+    goal = repo.create_goal(pool, "promote goal", "x", pipeline=pipeline)
+    repo.set_goal_state(pool, goal.id, "active")
+    issue = repo.create_issue(pool, goal.id, "i", pipeline=pipeline, team="backend")
+    repo.update_state(pool, issue.id, "in_review", gate_type="completion")
+    return goal, issue
+
+
+def test_promote_conflict_holds_issue_not_done(settings, pool, monkeypatch):
+    calls = {"n": 0}
+    def fake_promote(pool_, issue_, settings_):
+        calls["n"] += 1
+        return {"promoted": False, "conflict": True,
+                "branch": f"issue-{issue_.id}", "target": "main"}
+    import orchestrator.apply.worktree as wt
+    monkeypatch.setattr(wt, "auto_promote_on_done", fake_promote)
+
+    eng = _make_engine(settings, pool)
+    eng.settings.auto_promote_enabled = True
+    eng.settings.promote_repo_path = "/tmp/does-not-matter-mocked"
+    eng.settings.promote_branch = "main"
+    goal, issue = _at_completion(pool)
+
+    eng.tick()
+    r = repo.get_issue(pool, issue.id)
+    assert r.state == "in_progress"          # HELD, not done
+    assert r.gate_type == "completion"
+    evs = _event_types(pool, issue.id)
+    assert "promoted" not in evs             # nothing falsely promoted
+    alerts = [e for e in repo.recent_events(pool, issue.id, limit=200)
+              if e.event_type == "alert" and e.payload.get("reason") == "promote_conflict"]
+    assert len(alerts) == 1
+
+    # guard: a held issue is NOT re-promoted every tick (no churn, no re-alert)
+    eng.tick(); eng.tick()
+    assert calls["n"] == 1
+    assert repo.get_issue(pool, issue.id).state == "in_progress"
+
+
+def test_clean_promote_still_completes(settings, pool, monkeypatch):
+    import orchestrator.apply.worktree as wt
+    monkeypatch.setattr(wt, "auto_promote_on_done",
+                        lambda pool_, i_, s_: {"promoted": True, "branch": f"issue-{i_.id}",
+                                               "target": "main", "merge_commit": "abc123"})
+    eng = _make_engine(settings, pool)
+    eng.settings.auto_promote_enabled = True
+    eng.settings.promote_repo_path = "/tmp/mocked"
+    goal, issue = _at_completion(pool)
+    eng.tick()
+    assert repo.get_issue(pool, issue.id).state == "done"   # clean promote → completes
