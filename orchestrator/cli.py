@@ -717,7 +717,32 @@ def _cmd_setup_project(args, settings) -> int:
         path.mkdir(parents=True, exist_ok=True)
         print("created", path)
     _write_launcher_plan(planned_launchers, replacements)
+    _offer_watchdog(workspace)
     return 0
+
+
+def _offer_watchdog(workspace: Path) -> None:
+    """Opt-in: the worker watchdog auto-restarts a stalled worker ONCE (only when its
+    heartbeat has stopped and work is waiting). Because it kills/relaunches processes
+    it is never enabled silently — we ASK when interactive, and print the manual
+    command otherwise. install-watchdog.sh itself also prompts before installing."""
+    installer = workspace / "install-watchdog.sh"
+    if not installer.exists():
+        return
+    manual = f"{installer}          # enable the worker-watchdog cron (asks first)"
+    if not sys.stdin.isatty():
+        print(f"\nOptional: a worker-watchdog cron can auto-restart a stalled worker once.\n"
+              f"Enable it when you want with:\n  {manual}")
+        return
+    try:
+        ans = input("\nEnable the worker-watchdog cron now? It hard-restarts a stalled worker "
+                    "ONCE when work is waiting (opt-in) [y/N]: ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans in ("y", "yes"):
+        subprocess.run([str(installer), "--install", "--yes"], cwd=str(workspace))
+    else:
+        print(f"Skipped. Enable later with:\n  {manual}")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -256,6 +256,31 @@ cd /abs/path/to/your/workspace
 
 The dashboard is multi-project: switch coordinators with `?project=<key>`.
 
+### Optional: worker watchdog (auto-restart a stalled worker, once)
+
+Live coding-agent workers can wedge (a hung model call, a leaked process, memory
+pressure) and stop heartbeating while work is still queued. `setup-project` stamps
+a **watchdog** into your workspace for this — and, because it kills/relaunches
+processes, it is **opt-in**: `setup-project` *asks* before enabling it, and you
+can enable/disable it any time:
+
+```bash
+./install-watchdog.sh            # asks, then installs a cron (every 5 min)
+./install-watchdog.sh --status   # is it enabled?
+./install-watchdog.sh --uninstall
+./qwen-worker-watchdog.sh --dry-run   # show decisions without acting
+```
+
+It hard-restarts a dev worker **only** when all hold: its heartbeat stopped
+(`> WATCHDOG_STALE_SEC`, default 2100s), implementation work is waiting for its
+lane, it isn't paused / loop is enabled, and it hasn't **already** been restarted
+for this stall. The restart is **one-shot per stall** — if the worker doesn't come
+back it raises a coordinator alert for a human instead of restarting again (no
+storms); the state resets when the worker heartbeats. Monitored workers are derived
+from the coordinator (`function='dev'`, `runtime='external'`), so it follows your
+roster. Set `WATCHDOG_MODEL=<model>` in the crontab line to relaunch the dev lanes
+on a different (e.g. hosted, more stable) model than the default.
+
 ---
 
 ## 9. Verify a healthy install
