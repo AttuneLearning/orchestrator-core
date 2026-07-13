@@ -13,18 +13,20 @@ instances:
     database_url: postgresql://orchestrator:orchestrator@localhost:5432/tendcharting
     roster_file: config/roster.tendcharting.yaml
     settings:
-      reasoning_model: glm-5.1
-      # GLM-5.1 as the engine reasoner via the DigitalOcean profile (base_url +
-      # MODEL_ACCESS_KEY auto-resolved). On overload it retries GLM, falls back
-      # to deepseek-v4-pro, pauses, and retries the whole path before
-      # off-railing (see reasoner_path_* in config/settings.yaml).
+      reasoning_model: deepseek-4-flash
+      # Engine reasoner = deepseek-4-flash via the DigitalOcean profile (base_url +
+      # MODEL_ACCESS_KEY auto-resolved), reached as a DIRECT OpenAI-compatible API
+      # (REASONER=openai), NOT the codex CLI — a chat call is ~1s vs the codex CLI's
+      # ~5-75s per-call boot tax. Chosen 2026-07-13 after a live A/B on this DO
+      # subscription tier: OpenAI models are 403-forbidden here; among the available
+      # open models deepseek-4-flash gave valid, concise JSON with the best
+      # convention-fidelity. On overload it retries, then falls back to
+      # deepseek-v4-pro (see reasoner_path_* in config/settings.yaml).
       engine_reasoner:
         profile: digitalocean
-        model: glm-5.1
+        model: deepseek-4-flash
         fallback_model: deepseek-v4-pro
-      reasoner_cli_cmd: cli
-      # Codex uses OpenAI (native auth) — open-source models run through
-      # opencode, not codex. (Engine reasoner above still uses GLM via DO.)
+      # Open-source dev/qa workers run through opencode; codex uses OpenAI native auth.
       orch_manager_codex:
         profile: ''
         model: ''

@@ -383,22 +383,13 @@ class Engine:
                         self._alert(summary, goal_id=goal.id, issue_id=issue.id,
                                     sizing="likely-multi-deliverable",
                                     hint="one deliverable per issue (ADR-PROC-001)")
-                # Relate the governing ADRs to each new issue ONCE, here at creation
-                # (cached in issue_adrs). adr_for_issue unions these reasoner tags with
-                # the deterministic selector match + full backlink closure at pull time,
-                # so a worker pulls only its issue's ADRs — never the whole catalog.
-                # Best-effort and fully isolated: an ADR-tagging failure must never
-                # pause decomposition (that path belongs to ReasonerExhausted below).
-                try:
-                    catalog = [{"adr_key": r["adr_key"], "decision": r["decision"]}
-                               for r in repo.list_adrs(self.pool, status="accepted")]
-                    for issue_id, _team in created:
-                        iss = repo.get_issue(self.pool, issue_id)
-                        keys = self.reasoner.relevant_adrs(iss, catalog) if (catalog and iss) else []
-                        if keys:
-                            repo.set_issue_adrs(self.pool, issue_id, keys, source="reasoner")
-                except Exception:  # noqa: BLE001 — ADR tagging never blocks decomposition
-                    pass
+                # ADR relevance is NOT tagged per-issue at decomposition (that added
+                # one reasoner call per issue — the dominant decompose cost). It is
+                # resolved deterministically at pull time: adr_for_issue applies the
+                # team/work_type selectors + full backlink closure over the flow-hub
+                # graph (ADR-FLOW-*, ADR-DEV-006), which already delivers the right
+                # per-issue surface. The reasoner-tag path (issue_adrs / relevant_adrs)
+                # stays available for a human/lead to pin extra ADRs on an issue.
                 # Routing invariant: every child must resolve to a known team, and
                 # match the pipeline team when one is declared. A violation alerts +
                 # holds the goal rather than emitting misrouted/unpullable work.
