@@ -5,10 +5,11 @@ state; FastAPI dashboard + CLI for humans; MCP tools for agents. Ported from
 the upstream `agent-workflow` spec (github.com/AttuneLearning/agent-workflow
 @ 555ff00; PROCESS_GUIDE.md 5-phase pipeline).
 
-**Read `docs/IMPLEMENTATION_SUMMARY.md` before non-trivial changes** — full
-architecture, data model, surfaces, and extension patterns live there.
-`docs/ORCHESTRATION_ROADMAP.md` has design rationale; `docs/INSTALL_LMS.md`
-is the user-facing setup guide.
+**Read `IMPLEMENTATION_SUMMARY.md` (repo root) before non-trivial changes** —
+architecture, data model, surfaces, and extension patterns (but it's a
+2026-06-12 snapshot; verify signatures/counts against code). `docs/ARCHITECTURE.md`
+is the current system-of-record; `docs/INSTALL.md` is the user-facing setup &
+adoption guide; `docs/ORCHESTRATION_ROADMAP.md` is historical design rationale.
 
 ## Hard invariants
 
@@ -31,14 +32,15 @@ is the user-facing setup guide.
 
 - Verify: `service postgresql start` (cloud) or podman/docker Postgres, then
   `.venv/bin/python -m orchestrator.cli migrate && .venv/bin/python -m pytest -q`
-  → expect ~141 passed (pgvector test skips without the pgvector image). Never
-  run two suites concurrently against one DB (truncation races → phantom failures).
+  → expect all green (pgvector test skips without the pgvector image; ignore the
+  drifted counts in older docs). Never run two suites concurrently against one DB
+  (truncation races → phantom failures).
 - End-to-end smoke (push/stub): register-agent (dev AND qa per team) → add-goal →
   `run --max-ticks 50` → status: all done, deterministic on stubs.
 - Pull mode: `config/roster.example.pull.yaml` + `pull-1` pipeline; register
   `--runtime external` workers; engine assigns + observes; workers drive gates
   via MCP (`list_my_work`/`report_work`/`gate_decision`/`heartbeat`). Pull-gate
   liveness reclaim uses `last_seen` (no new migration added).
-- New SQL = new numbered migration (next: 0009). New reasoner op = Protocol +
+- New SQL = new numbered migration (latest is 0021; next: 0022). New reasoner op = Protocol +
   stub + Anthropic + optional-capability call. Tests subclass StubReasoner,
   tweak thresholds via `copy.deepcopy(settings)`.

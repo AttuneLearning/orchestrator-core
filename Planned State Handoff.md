@@ -1,5 +1,11 @@
 # Plan State / Handoff: Autonomous Multi-Agent Orchestrator (python-orchestrator-v1)
 
+> 🗄️ **HISTORICAL / OBSOLETE.** This is the pre-implementation planning handoff
+> from before the repo existed (it was even written from the wrong repo). It is
+> fully superseded by the built system. **Do not use it for setup** — see
+> [`README.md`](README.md) and [`docs/INSTALL.md`](docs/INSTALL.md). Kept only as
+> a record of the original planning session.
+
 > **What this document is.** A planning *handoff*, not a finished implementation plan. It captures
 > everything established in the first planning session, corrects the draft plan's wrong assumptions
 > about the repo, records the environment facts that change the design, and tells the *next* session

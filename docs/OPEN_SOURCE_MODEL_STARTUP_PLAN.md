@@ -1,5 +1,10 @@
 # Open Source Model Startup Plan
 
+> 📋 **Planning/design doc, partially implemented.** The bootstrap flow it
+> envisions now largely exists as the `setup-project` / `install-launchers` CLI
+> commands. For runnable adoption steps use [`INSTALL.md`](INSTALL.md); read this
+> for the design rationale behind the launcher kit and multi-runtime model plumbing.
+
 This document defines the launcher work needed to make open-source or open-source-compatible models usable for simple orchestrator tasks without the current session stalling after a few tool calls.
 
 Scope:

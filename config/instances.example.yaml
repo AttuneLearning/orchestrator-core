@@ -1,0 +1,69 @@
+# =============================================================================
+# instances.example.yaml — annotated template for onboarding your own project.
+#
+# This file is documentation only; the app reads config/instances.yaml. To
+# adopt the orchestrator for a new project, copy the `myproject` block below
+# into config/instances.yaml (under `instances:`) and edit the values.
+#
+# An instance = a (database + roster + settings-overrides) triple, selected at
+# runtime with `--instance myproject` or ORCH_INSTANCE=myproject. One core
+# install serves many instances; you do NOT fork the repo per project.
+#
+# Resolution: values here under `settings:` are deep-merged onto the global
+# defaults in config/settings.yaml for this instance only. Process env vars
+# override everything. See docs/INSTALL.md.
+# =============================================================================
+
+# `default` selects the instance the DASHBOARD opens first. Note the bare CLI
+# (no --instance) uses config/settings.yaml, NOT this default — always pass
+# --instance for a specific project.
+default: myproject
+
+instances:
+  myproject:
+    label: My Project                     # human label shown in the dashboard
+
+    # Per-project database. Create it first (see docs/INSTALL.md §3). Use a
+    # literal URL, or `database_url_env: SOME_VAR` to read it from the env.
+    database_url: postgresql://orchestrator:orchestrator@localhost:5432/myproject
+
+    # Which roster declares this project's teams. Copy roster.example.pull.yaml
+    # to config/roster.myproject.yaml and point here. This wins over $ROSTER_FILE.
+    roster_file: config/roster.myproject.yaml
+
+    # Per-project overrides of config/settings.yaml. Everything below is optional
+    # but you almost certainly want promote/docs/verify set for real work.
+    settings:
+      # --- Auto-promote: where the engine merges VERIFIED branches -----------
+      # The global default points at the maintainer's checkout — you MUST
+      # override these or promotion targets the wrong repo.
+      promote_repo_path: /abs/path/to/your/product-checkout
+      promote_branch: main
+      # auto_promote_enabled: true
+
+      # --- Docs (dashboard Docs tab / docs reasoner) -------------------------
+      docs_path: /abs/path/to/your/docs
+
+      # --- Harness-owned verification (the QA gate runs THIS command) --------
+      verify_cmd: npm run typecheck && npm test
+      # Per-team checkouts where verify_cmd runs (machine evidence for the gate):
+      verify_worktrees:
+        backend: /abs/path/to/workspace/wt-backend-qa
+        frontend: /abs/path/to/workspace/wt-frontend-qa
+        senior: /abs/path/to/workspace/wt-senior-qa
+
+      # --- Engine reasoner ---------------------------------------------------
+      # Simplest: reference a profile defined under model_profiles in
+      # config/settings.yaml. Setting a profile auto-selects reasoner=openai and
+      # fills base_url/model/key from the profile.
+      engine_reasoner:
+        profile: digitalocean            # a model_profiles key in settings.yaml
+        model: <your-reasoner-model>
+        fallback_model: <your-fallback-model>
+      # reasoning_model: <your-reasoner-model>   # convenience alias
+
+      # --- Optional role/model settings for orch-manager & workers -----------
+      # orch_manager_codex: { profile: '', model: '', reasoning_effort: high }
+      # devqa_worker:       { profile: '', model: '', runtime: opencode }
+      # docs_reasoner_base_url: http://your-endpoint/v1
+      # docs_reasoner_model: <model>

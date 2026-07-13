@@ -1,5 +1,13 @@
 # Trying the Orchestrator on a Real LMS Project
 
+> **For the generic, current adoption guide, see [`INSTALL.md`](INSTALL.md)** —
+> it covers installing the core and registering *your own* project (any stack)
+> via the instance model and `setup-project`. This document is a
+> longer-form, LMS-flavored companion focused on the two integration *modes*
+> (observe/coordinate vs. apply/verify sandbox); some specifics below (env var
+> names, `.env` handling, test counts) predate the instance model and the
+> config layering described in `INSTALL.md` — trust `INSTALL.md` where they differ.
+
 A practical guide to running the orchestrator against one of your existing LMS
 codebases. Read §0 first — it sets honest expectations about what each mode
 actually does, so you point the right tool at the right job.

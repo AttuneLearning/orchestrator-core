@@ -1,5 +1,10 @@
 # Spec: Per-Agent Loop Cadence Control (dashboard switch + heartbeat-driven cadence)
 
+> ✅ **SHIPPED — historical spec.** This proposal was implemented (migration
+> `0009_agent_loop_cadence.sql`, `agents.loop_enabled`/`poll_interval_seconds`,
+> the `heartbeat` MCP tool, and the dashboard cadence control). Kept for design
+> rationale; the "proposed" framing below is historical.
+
 **Audience:** orchestrator dev agent (engine + dashboard codebase — NOT this UI repo).
 **Author:** agent-4 (frontend dev), on behalf of the operator.
 **Status:** proposed — implement in the orchestrator codebase.

@@ -7,25 +7,26 @@ advances each issue through the five-phase pipeline defined by the upstream
 [`agent-workflow`](https://github.com/AttuneLearning/agent-workflow) spec
 (ported from @ 555ff00; not vendored in this repo).
 
-This is the **phases 1–4 orchestration core**. Deferred to follow-ups: the
-FastAPI ops dashboard, Directus admin, pgvector semantic search, the `cli`
-(`--resume`) agent runtime, Metabase, and additional pipelines/teams.
+The FastAPI ops dashboard, Directus admin, pgvector semantic search, Metabase
+analytics, the contract-first gate, live pull-worker coding agents, and multiple
+pipelines/teams are all **shipped** — see the sections below.
 
-## Workspace Topology
+> **Adopting this for your own project?** Read **[`docs/INSTALL.md`](docs/INSTALL.md)** —
+> the end-to-end guide from a fresh clone to your project registered and workers
+> running. The Quickstart below is the throwaway smoke-test version.
 
-This repository is the orchestrator source of truth. The sibling
-`tendcharting-ws` directory is a coordination root for workspace layout and
-launcher state, not the primary git history for the project implementation.
+## Projects are "instances"
 
-- The root `tendcharting-ws/` path is used to store coordination files, shared
-  launcher scaffolding, and workspace guidance.
-- The `wt-*` subdirectories inside `tendcharting-ws/` are the actual git
-  worktrees for agent-owned implementation work.
-- The designated human validation and CI/CD consolidation worktree is
-  `humantest-wt` (some older checkouts may still use the name
-  `wt-human-test` until normalized).
-- Agent work should move through the planned worktrees and consolidate into the
-  human-test worktree before being treated as ready for broader review.
+One install serves many projects. A **project = an instance**: a
+`(database + roster + settings-overrides)` triple declared in
+`config/instances.yaml` and selected at runtime with `--instance <key>` (or the
+`ORCH_INSTANCE` env var). You don't fork the repo per project — you add an
+instance block (template: [`config/instances.example.yaml`](config/instances.example.yaml)).
+
+Workers do their coding in **git worktrees** of your product repo (one worktree
+per pull worker), scaffolded into your workspace by `setup-project`. Verified
+branches are auto-promoted to your product repo; nothing merges without passing
+the gates. Full walkthrough in [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Architecture
 
@@ -105,17 +106,18 @@ prefer a containerized database.
     `CODE_API_KEY`).
   - `anthropic` — reuse the Anthropic SDK for code generation.
 
-> The Qwen box `10.100.90.132:8081` is a **private LAN IP, unreachable from the
-> Anthropic cloud env**. To use it, point `CODE_PROVIDER=openai` at a publicly
-> reachable endpoint (added to the environment's Custom allowed domains) or run
-> via a teleported local session.
+> Model endpoints in the shipped config (e.g. `10.100.90.132:*`) are the
+> maintainer's **private LAN hosts** and are examples only. Any endpoint you
+> configure must be reachable from wherever the core runs — point
+> `CODE_PROVIDER=openai` (and the reasoner / worker configs) at endpoints you can
+> actually reach. See [`docs/INSTALL.md` §7](docs/INSTALL.md#7-point-the-reasoner-and-workers-at-your-models).
 
 ### Dashboard-managed model profiles
 
 The dashboard settings page can manage shared OpenAI-compatible model profiles:
 
 ```text
-http://10.100.55.87:8800/settings?project=tendcharting
+http://<dashboard-host>:8800/settings?project=<instance-key>
 ```
 
 Profiles live under `model_profiles` and are consumed by role settings such as
@@ -183,12 +185,18 @@ is a top-level sibling of `tools`:
 .venv/bin/python -m orchestrator.cli serve   # FastMCP over stdio
 ```
 
-Tools: issue (`list_issues`, `get_issue`, `claim_issue`, `update_state`,
-`gate_decision`, `create_subissue`, `append_log`), memory (`memory_write`,
-`memory_recall`, `memory_search`), skill tools ported from `agent-workflow`
-(`adr_create`, `comms_send`, `context_load`, `reflect`, `refine`), and status
+Tools: issue (`list_issues`, `get_issue`, `claim_issue`, `my_queue`,
+`report_work`, `gate_decision`, `verify_run`, `heartbeat`), memory
+(`memory_write`, `memory_recall`, `memory_search`), governance/skill tools
+(`adr_for_issue` to read the rules that apply to an issue, `adr_suggest` to
+*propose* a rule, `comms_send`, `context_load`, `reflect`, `refine`), and status
 tools for external monitors (`get_status`, `get_alerts`, `tail_events`,
 `propose_goal`).
+
+> Workers **cannot** create, approve, or edit ADRs directly — the old
+> `adr_create`/`adr_approve`/`adr_update` tools were removed (self-approval let a
+> looping agent mint ~1,500 junk rules). Workers `adr_suggest`; a human approves
+> via `cli adr approve` or the dashboard `/adrs` page.
 
 ### Plugin for external looping agents
 
@@ -210,17 +218,10 @@ Pure-function suites (`test_pipelines`, `test_state_machine`,
 `test_focus_offrails`) need no database; `test_repository` runs against the
 configured `DATABASE_URL`.
 
-## Contract Acceptance Error Handling
-
-Fixed 500 Internal Server Error when accepting contracts in the dashboard.
-Previously, attempting to accept a contract with no pending proposal would raise
-a ValueError that wasn't caught, causing a 500 error. Now, such errors are
-caught and return a user-friendly 400 error page instead.
-
 ## Layout
 
 ```
-config/            settings.yaml · pipelines.yaml · roster.yaml
+config/            settings.yaml · instances.yaml · pipelines.yaml · roster*.yaml
 migrations/        ordered .sql, applied by orchestrator/db.py
 orchestrator/
   config.py db.py models.py repository.py
@@ -310,17 +311,26 @@ be rejected with a permission error.
 > hatch** (e.g. manually unsticking an `off_rails` issue when the engine cannot
 > self-recover).
 
-## Command reference (post-roadmap slices)
+## Command reference
 
-| Command | Slice | What it does |
-| --- | --- | --- |
-| `run --daemon --interval 5` | A | tick forever; per-tick summaries; Ctrl-C stops |
-| `directive <issue-id> resume --note "..."` | B | un-quarantine an `off_rails` issue (audited) |
-| `goal-resume <goal-id>` | B | restart a `paused` goal |
-| `serve-dashboard --port 8000` | C | FastAPI ops dashboard (fleet, timelines, directives) |
-| `add-goal "..." --pipeline hotfix` | J | route a goal through an alternate pipeline |
-| `apply-promote <issue-id> --note "..."` | F | merge an issue's *verified* worktree branch (human gate; local only) |
-| `install-launchers --workspace /path/to/ws --project <name>` | Ops | install parent-dir Claude/Codex/Qwen launcher scripts for a project workspace |
+All commands accept the global `--instance <key>` flag to target a specific
+project's coordinator (or set `ORCH_INSTANCE`).
+
+| Command | What it does |
+| --- | --- |
+| `migrate` | apply pending SQL migrations (idempotent) + bootstrap the monitor KB |
+| `register-agent --team <t> --function <dev\|qa\|lead> [--runtime external]` | create a numbered agent |
+| `add-goal "..." [--pipeline pull-1\|hotfix]` | queue a goal (route through an alternate pipeline) |
+| `run [--max-ticks N]` / `run --daemon --interval 5` | drive the engine (bounded, or tick forever) |
+| `serve` | MCP server over stdio (the tool surface workers use) |
+| `serve-dashboard --host 0.0.0.0 --port 8800` | FastAPI ops dashboard (fleet, timelines, directives) |
+| `setup-project --workspace /path/to/ws --project <name>` | scaffold a workspace: launchers + per-worker worktrees |
+| `install-launchers --workspace /path/to/ws --project <name>` | install launcher scripts only (no worktrees) |
+| `render-agent-docs --team <t> --function <f> --agent-id <n> --out-dir <wt>` | (re)generate a worker's CLAUDE.md/AGENTS.md/QWEN.md |
+| `directive <issue-id> resume --note "..."` | un-quarantine an `off_rails` issue (audited) |
+| `goal-resume <goal-id>` | restart a `paused` goal |
+| `apply-promote <issue-id> --note "..."` | merge an issue's *verified* worktree branch (human gate; local only) |
+| `adr {list,show,approve} [key]` | inspect / approve governance rules |
 
 Cross-team messages ingest automatically each tick (slice D): a pending request
 to a rostered team is triaged into a local issue; its completion sends a
@@ -346,9 +356,10 @@ the most concise applicable list by construction, re-selected on every call.
 Gate reviewers verify each rule and cite violated ids in the decline payload
 (`violated_rules`), so chronic violations are visible in `issue_events`.
 
-Lifecycle: agents (or sessions, via the `adr_create` MCP tool) **propose**;
-proposals are inert until a human **approves** (`cli adr approve`, or the
-dashboard `/adrs` page) — approval also marks superseded rules. When an issue
+Lifecycle: agents **propose** via the `adr_suggest` MCP tool (rate-limited and
+de-duplicated); proposals are inert until a human **approves** (`cli adr
+approve`, or the dashboard `/adrs` page) — approval also marks superseded rules.
+Workers read the rules for an issue with `adr_for_issue`. When an issue
 completes with no governing rules, gap detection drafts a proposal for review.
 
 ```bash

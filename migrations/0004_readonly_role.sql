@@ -16,8 +16,17 @@ BEGIN
 END
 $$;
 
--- Allow the role to connect to the orchestrator database.
-GRANT CONNECT ON DATABASE orchestrator TO orchestrator_ro;
+-- Allow the role to connect to THIS database, whatever it is named. The DB name
+-- is not knowable statically (each instance in config/instances.yaml uses its own
+-- database, e.g. `tendcharting`, `myproject`), so grant against current_database()
+-- via dynamic SQL rather than a hardcoded name — a hardcoded name errors on any
+-- database not literally called `orchestrator`, which would break `migrate` for
+-- every adopter who names their DB after their own project.
+DO $$
+BEGIN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO orchestrator_ro', current_database());
+END
+$$;
 
 -- Allow the role to see objects in the public schema.
 GRANT USAGE ON SCHEMA public TO orchestrator_ro;

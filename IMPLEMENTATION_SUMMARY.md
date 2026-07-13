@@ -2,9 +2,13 @@
 
 > Context document for future Claude Code sessions. Dense and factual; trust it
 > over memory, verify against code when exact signatures matter.
-> State as of 2026-06-12: **feature-complete vs. docs/ORCHESTRATION_ROADMAP.md
-> + ADR governance. 117 tests passed, 1 skipped (pgvector ordering — needs the
-> pgvector Docker image).**
+>
+> ⚠️ **Snapshot as of 2026-06-12 — partially stale.** Written before contracts,
+> the `docs` table, the instance model, loop-cadence, and pull-mode maturity.
+> Its migration inventory ("0001..0007, next 0009") and test count ("117") have
+> drifted (the tree is at **0021**). Treat as historical architecture context;
+> `docs/ARCHITECTURE.md` is the current system-of-record and `docs/INSTALL.md`
+> the current setup guide.
 
 ## 1. What this is
 
