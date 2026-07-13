@@ -142,5 +142,25 @@ case "$DOC_FN" in
     ;;
 esac
 
+# Model tiering: when launching the CLAUDE runtime for a dev role, append the
+# lane's tiering policy (BE_DEV_CLAUDE.md / FE_DEV_CLAUDE.md) onto the freshly
+# rendered worktree CLAUDE.md, so the Claude session reads it as project
+# instructions (backend -> wt-backend-dev, frontend -> wt-frontend-dev). Appended
+# AFTER the SoT render so the render doesn't wipe it; the grep guard avoids a
+# double-append if the render was skipped (CLAUDE.md already carries the block).
+if [ "$RUNTIME" = "claude" ] && [ "${DOC_FN:-}" = "dev" ] \
+   && [ -n "${WORKTREE:-}" ] && [ -f "$WORKTREE/CLAUDE.md" ]; then
+  TIER_FILE=""
+  case "$TEAM" in
+    backend)  TIER_FILE="$WORKSPACE_ROOT/BE_DEV_CLAUDE.md" ;;
+    frontend) TIER_FILE="$WORKSPACE_ROOT/FE_DEV_CLAUDE.md" ;;
+  esac
+  if [ -n "$TIER_FILE" ] && [ -f "$TIER_FILE" ] \
+     && ! grep -q "Model Tiering" "$WORKTREE/CLAUDE.md"; then
+    { printf '\n\n---\n\n'; cat "$TIER_FILE"; } >> "$WORKTREE/CLAUDE.md"
+    echo "== injected $(basename "$TIER_FILE") model-tiering into $WORKTREE/CLAUDE.md =="
+  fi
+fi
+
 enable_agent_loop
 exec "$ADAPTER" "$@"
