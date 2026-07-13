@@ -94,6 +94,57 @@ def _pgids_for(pattern: str) -> set[int]:
     return pgids
 
 
+_CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def _descendants(roots: list[int]) -> set[int]:
+    ps = subprocess.run(["ps", "-eo", "pid=,ppid="], capture_output=True, text=True).stdout
+    children: dict[int, list[int]] = {}
+    for line in ps.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    seen: set[int] = set()
+    stack = list(roots)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, []))
+    return seen
+
+
+def _cpu_jiffies(pids: set[int]) -> int:
+    total = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                data = f.read()
+            after = data[data.rindex(")") + 1:].split()  # robust vs spaces in comm
+            total += int(after[11]) + int(after[12])       # utime + stime
+        except (OSError, IndexError, ValueError):
+            pass
+    return total
+
+
+def _cpu_busy(match_pattern: str, sample: float = 2.0, min_core_frac: float = 0.15) -> bool:
+    """True if the process tree matching `match_pattern` is actively burning CPU
+    right now (instantaneous sample over `sample` seconds). This is how we tell a
+    worker that is heads-down in a long blocking step (typecheck / npm test / build,
+    which cannot emit a heartbeat) from one that is genuinely wedged/idle — so the
+    watchdog never kills a worker that is actually making progress."""
+    roots = [int(x) for x in subprocess.run(
+        ["pgrep", "-f", match_pattern], capture_output=True, text=True).stdout.split()]
+    if not roots:
+        return False
+    j0 = _cpu_jiffies(_descendants(roots))
+    time.sleep(sample)
+    j1 = _cpu_jiffies(_descendants(roots))
+    frac = ((j1 - j0) / _CLK_TCK) / sample
+    return frac > min_core_frac
+
+
 def hard_restart(agent: dict) -> None:
     aid = agent["id"]
     wrapper_re = rf"run-agent-loop\.sh {aid}\b"
@@ -177,8 +228,13 @@ def main() -> int:
                             f"it back. Manual intervention needed (model endpoint / memory / logs).")
                 continue
 
-            log(f"agent {aid} ({team}): STALE ({int(age)}s) + {work} work + not-yet-restarted "
-                f"-> HARD RESTART{' [dry-run]' if DRY_RUN else ''} (model={MODEL})")
+            if _cpu_busy(f"cycle for agent {aid}"):
+                log(f"agent {aid} ({team}): stale ({int(age)}s) but process is CPU-BUSY — "
+                    f"heads-down in a long step (typecheck/test/build), NOT wedged; skip")
+                continue
+
+            log(f"agent {aid} ({team}): STALE ({int(age)}s) + {work} work + idle (not CPU-busy) "
+                f"+ not-yet-restarted -> HARD RESTART{' [dry-run]' if DRY_RUN else ''} (model={MODEL})")
             if DRY_RUN:
                 continue
             hard_restart(agent)

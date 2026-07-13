@@ -273,8 +273,11 @@ can enable/disable it any time:
 
 It hard-restarts a dev worker **only** when all hold: its heartbeat stopped
 (`> WATCHDOG_STALE_SEC`, default 2100s), implementation work is waiting for its
-lane, it isn't paused / loop is enabled, and it hasn't **already** been restarted
-for this stall. The restart is **one-shot per stall** — if the worker doesn't come
+lane, it isn't paused / loop is enabled, it hasn't **already** been restarted for
+this stall, **and its process tree is not actively burning CPU.** That last check
+is essential: a worker heads-down in a long blocking step (typecheck / `npm test`
+/ build) can't emit a heartbeat and looks identical to a wedge — the CPU sample
+tells them apart, so the watchdog never kills a worker that is genuinely working. The restart is **one-shot per stall** — if the worker doesn't come
 back it raises a coordinator alert for a human instead of restarting again (no
 storms); the state resets when the worker heartbeats. Monitored workers are derived
 from the coordinator (`function='dev'`, `runtime='external'`), so it follows your
