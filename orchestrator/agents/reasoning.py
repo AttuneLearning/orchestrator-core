@@ -116,7 +116,8 @@ def _backoff_delay(base: float, attempt: int, cap: float) -> float:
 
 
 class Reasoner(Protocol):
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]: ...
+    def decompose_goal(self, goal: Goal, max_subissues: int,
+                       rules: str = "") -> list[IssueSpec]: ...
     def plan_issue(self, issue: Issue, rules: str = "") -> str: ...
     def gate_review(self, issue: Issue, gate_type: str,
                     recent: Optional[list[dict[str, Any]]] = None,
@@ -135,7 +136,8 @@ class Reasoner(Protocol):
 class StubReasoner:
     """Deterministic, network-free reasoner for hermetic runs and tests."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int,
+                       rules: str = "") -> list[IssueSpec]:
         # One implementation issue. Verification (tests / typecheck / e2e) is an
         # acceptance criterion the QA runner clears at its gates — never its own
         # sub-issue (a separate "Test: …" issue just duplicates the QA gate).
@@ -195,14 +197,24 @@ class _LLMReasoner:
     def _ask(self, system: str, user: str, max_tokens: int = 1024) -> str:  # pragma: no cover
         raise NotImplementedError
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int,
+                       rules: str = "") -> list[IssueSpec]:
+        conventions = (
+            "\n\nPROJECT CONVENTIONS (authoritative) — every issue description MUST use "
+            "these exact file paths, route shapes, and tooling. Do NOT invent generic "
+            "MVC/Next.js/jest conventions; copy the project's:\n" + rules
+        ) if rules else ""
         system = (
             "You decompose a software goal into independent, well-scoped issues. "
             f"Return at most {max_subissues} issues as a JSON array of objects with "
             'keys "title", "description", "team". Teams: backend, frontend, qa, '
             "mobile, cloud, data-warehousing, platform. Choose the team that owns "
             "the work (a UI/frontend goal -> frontend, an API goal -> backend). "
-            "Output JSON only."
+            "Size each issue to ONE deliverable (one endpoint OR one component OR one "
+            "contract, ~1-3 files); each description names the exact target file(s) "
+            "(matching the conventions) and the acceptance commands."
+            + conventions +
+            "\nOutput JSON only."
         )
         user = f"Goal: {goal.title}\n\nDetails: {goal.description}"
         data = extract_json(self._ask(system, user))

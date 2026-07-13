@@ -333,7 +333,20 @@ class Engine:
                 pipeline = self.pipelines[pid]
                 mode = decomposition.decompose_mode(
                     goal.decompose, goal.title, goal.description)
-                specs = self.reasoner.decompose_goal(goal, self.t.max_subissues)
+                # Feed the owning team's accepted ADRs (conventions: routes, file
+                # paths, tooling, FSD/domain layout) into decomposition so issue
+                # specs match THIS codebase, not generic MVC/Next.js/jest defaults.
+                _team = pipeline.team or ""
+                _repos = []
+                if _team:
+                    _rt = self.roster.resolve(_team)
+                    _repos = list(_rt.repos) if _rt else []
+                _conv = adr_rules.applicable(
+                    repo.list_adrs(self.pool, status="accepted"),
+                    work_type=None, team=_team, repos=_repos)
+                specs = self.reasoner.decompose_goal(
+                    goal, self.t.max_subissues,
+                    rules=adr_rules.format_rules_block(_conv))
                 # Drop candidates that merely duplicate a QA gate — the runner owns
                 # verification; it is acceptance criteria on the impl issue, not its
                 # own issue (no standalone test/typecheck/e2e/bundle-output issues).

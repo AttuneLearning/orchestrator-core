@@ -374,7 +374,7 @@ def test_injection_content_non_matching(settings, pool):
 class _OldSignatureReasoner:
     """Mimics a pre-rules reasoner: no rules param on plan_issue or gate_review."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
         return [
             IssueSpec(title=f"Implement: {goal.title}"),
             IssueSpec(title=f"Test: {goal.title}"),

@@ -105,7 +105,7 @@ class _MisroutingReasoner(StubReasoner):
     """Returns the impl issue tagged with the WRONG team (backend) — the engine
     must override it with the pipeline's team."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
         return [IssueSpec(title=f"Implement: {goal.title}",
                           description=goal.description, team="backend")]
 
@@ -113,7 +113,7 @@ class _MisroutingReasoner(StubReasoner):
 class _NoisyReasoner(StubReasoner):
     """Emits an impl issue plus QA-gate duplicates the filter must drop."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
         return [IssueSpec(title=f"Implement: {goal.title}"),
                 IssueSpec(title="Run unit tests"),
                 IssueSpec(title="Typecheck"),
@@ -123,7 +123,7 @@ class _NoisyReasoner(StubReasoner):
 class _UnknownTeamReasoner(StubReasoner):
     """Pipeline has no team; reasoner emits an unknown team → routing violation."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
         return [IssueSpec(title=f"Implement: {goal.title}", team="nonsense")]
 
 

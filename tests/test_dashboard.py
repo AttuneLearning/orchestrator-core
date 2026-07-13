@@ -31,7 +31,7 @@ from orchestrator.models import Goal, Issue
 class _LowDriftDecliningReasoner:
     """Always declines gate reviews with drift 0.1 so off_rails latch fires."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int) -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
         return [
             IssueSpec(title=f"Implement: {goal.title}", description=goal.description),
             IssueSpec(title=f"Test: {goal.title}", description="Add tests and verify."),
