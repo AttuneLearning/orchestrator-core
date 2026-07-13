@@ -84,6 +84,14 @@ _LANE_BOUNDARY = {
     "frontend": ("**Write scope (enforced):** commit ONLY under `apps/web/`. "
                  "`packages/contracts` is backend-owned and READ-ONLY here — request a "
                  "contract change via `contract_propose`/comms (ADR-DEV-002), never edit it. "
+                 "**To CONSUME a contract, IMPORT it from the shared contracts package** "
+                 "(its source lives read-only at `packages/contracts/` in THIS worktree and "
+                 "arrives via the step-2 `git merge main`) — do NOT read contract files by "
+                 "path, and NEVER reach outside this worktree into a sibling checkout "
+                 "(e.g. `../<product-repo>/…`): that is out of bounds and will be blocked. "
+                 "If the type you need isn't present, the contract has not landed on `main` "
+                 "yet — `contracts_for_issue` will list it as `missing`; `contract_propose` it "
+                 "and block. NEVER invent the shape. "
                  "Out-of-lane commits are rejected by the pre-commit hook and again at "
                  "report_work."),
 }
