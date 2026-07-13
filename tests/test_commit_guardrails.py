@@ -245,3 +245,76 @@ def test_g8_escalate_unassigns_when_no_senior(pool):
     repo.claim_issue(pool, issue.id, agent.id)
     assert repo.escalate_to_senior(pool, issue.id) is None
     assert repo.get_issue(pool, issue.id).assigned_agent is None
+
+
+# --- G10 (ADR-DEV-007): one branch per issue, fresh off main --------------- #
+
+def _advance_main(d):
+    """Put a commit on main that the issue branch does not have (→ branch behind)."""
+    _git(d, "checkout", "-q", "main")
+    (d / "landed.txt").write_text("a contract landed on main\n")
+    _git(d, "add", "-A")
+    _git(d, "commit", "-qm", "advance main")
+
+
+def test_g10_rejects_behind_main_branch(gitrepo):
+    # issue-1 branched from main + committed, THEN main advanced → issue-1 is stale.
+    _commit_on_issue(gitrepo, "src/x.ts", "export const x = 1;\n")
+    _advance_main(gitrepo)
+    with pytest.raises(ValueError, match="behind"):
+        _verify_commit_real(_settings(gitrepo), 1, "")
+
+
+def test_g10_passes_when_branch_carries_main(gitrepo):
+    # advance main FIRST, then branch → issue-1 contains main's tip (fresh).
+    _advance_main(gitrepo)
+    _commit_on_issue(gitrepo, "src/x.ts", "export const x = 1;\n")  # -B issue-1 main
+    _verify_commit_real(_settings(gitrepo), 1, "")  # must not raise
+
+
+# --- confirm_branch: reservation-time fast-fail ---------------------------- #
+
+def _impl_issue(pool):
+    goal = repo.create_goal(pool, "g", pipeline="pull-1")
+    return repo.create_issue(pool, goal.id, "i", pipeline="pull-1", team="backend")
+
+
+def test_confirm_branch_ok_and_logs(pool, gitrepo):
+    issue = _impl_issue(pool)
+    _git(gitrepo, "checkout", "-q", "-B", f"issue-{issue.id}", "main")
+    (gitrepo / "x.txt").write_text("x\n"); _git(gitrepo, "add", "-A")
+    _git(gitrepo, "commit", "-qm", "w")
+    tools = _issue_tools(pool, _settings(gitrepo))
+    out = tools["confirm_branch"](issue.id)
+    assert out["ok"] is True and out["branch"] == f"issue-{issue.id}"
+    assert "branch_confirmed" in [e.event_type
+                                  for e in repo.recent_events(pool, issue.id, limit=50)]
+
+
+def test_confirm_branch_rejects_missing_branch(pool, gitrepo):
+    issue = _impl_issue(pool)  # no issue-<id> branch created
+    tools = _issue_tools(pool, _settings(gitrepo))
+    out = tools["confirm_branch"](issue.id)
+    assert out["ok"] is False and "does not exist" in out["reason"] and out["fix"]
+
+
+def test_confirm_branch_rejects_behind_main(pool, gitrepo):
+    issue = _impl_issue(pool)
+    _git(gitrepo, "checkout", "-q", "-B", f"issue-{issue.id}", "main")
+    (gitrepo / "x.txt").write_text("x\n"); _git(gitrepo, "add", "-A")
+    _git(gitrepo, "commit", "-qm", "w")
+    _advance_main(gitrepo)  # main moves ahead → issue branch stale
+    tools = _issue_tools(pool, _settings(gitrepo))
+    out = tools["confirm_branch"](issue.id)
+    assert out["ok"] is False and "behind" in out["reason"]
+
+
+def test_claim_issue_returns_branch_mandate(pool, gitrepo):
+    issue = _impl_issue(pool)
+    agent = repo.register_agent(pool, "backend", "dev", "external")
+    tools = _issue_tools(pool, _settings(gitrepo))
+    # force the implementation gate so the mandate is attached
+    repo.update_state(pool, issue.id, "in_progress", gate_type="implementation")
+    out = tools["claim_issue"](issue.id, agent.id)
+    assert out.get("branch") == f"issue-{issue.id}"
+    assert out.get("checkout") == f"git checkout -B issue-{issue.id} main"

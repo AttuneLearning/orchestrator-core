@@ -29,10 +29,13 @@ _OWNED = {
 }
 # function -> the concrete "do the work" step for the loop (gate-correct, not dev-default)
 _WORK_STEP = {
-    "dev": ("`context_load(topic=issue.title)`, then implement the issue (minimal, in-lane) AND "
-            "add a test. Commit ONLY the issue's own files on the branch (never push); capture the "
-            "sha. Then `report_work(issue_id, sha=…, branch=…, summary=…, tests_passed=true)` and "
-            "`gate_decision(issue_id, passed=true)`."),
+    "dev": ("**Create this issue's OWN branch first: `git checkout -B issue-<id> main` — one issue "
+            "per branch, never reuse/share/stale a branch (ADR-DEV-007) — then `confirm_branch(<id>)` "
+            "to fail fast if it's wrong or behind main.** `context_load(topic=issue.title)`, then "
+            "implement the issue (minimal, in-lane) AND add a test. Commit ONLY the issue's own files "
+            "on `issue-<id>` (never push); capture the sha. Then `report_work(issue_id, sha=…, "
+            "branch='issue-<id>', summary=…, tests_passed=true)` and `gate_decision(issue_id, "
+            "passed=true)`. report_work rejects a wrong-named or behind-main branch (G10)."),
     "qa": ("**FIRST build a clean slate — never reuse a previous cycle's tree:** "
            "`git checkout -B _verify-<issue_id> <issue_branch>` (force-reset a THROWAWAY branch to "
            "the issue's branch tip, which the dev has already synced with current `main`; `-B` also "

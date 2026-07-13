@@ -102,6 +102,18 @@ def _verify_commit_real(settings, issue_id: int, sha: str, team: str = "") -> No
     if sha and _git(base, "merge-base", "--is-ancestor", sha, branch).returncode != 0:
         raise ValueError(
             f"issue {issue_id}: reported sha {sha[:10]} is not on '{branch}' — bogus report")
+    # G10 (ADR-DEV-007): the issue branch must carry current `main`. A branch that
+    # is BEHIND main was forked from a stale main (or never merged main in) and is
+    # missing landed contracts/config — how workers build against gone-stale shapes
+    # and go off-rails (e.g. the stale issue-268 branch). Require main's tip to be an
+    # ancestor of the issue branch. (A fresh `git checkout -B issue-<id> main` passes;
+    # a diverged/stale branch fails until the worker merges main in.)
+    if _git(base, "merge-base", "--is-ancestor", target, branch).returncode != 0:
+        raise ValueError(
+            f"issue {issue_id}: branch '{branch}' is behind '{target}' — it was branched "
+            f"from a stale {target} (missing landed contracts/config). Run "
+            f"`git merge --no-edit {target}` (or rebranch: `git checkout -B {branch} "
+            f"{target}`), re-commit, and report again (ADR-DEV-007)")
     diff = _git(base, "diff", f"{target}...{branch}").stdout
     if not diff.strip():
         raise ValueError(
@@ -253,7 +265,49 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
             if not ready:
                 repo.append_log(pool, issue_id, "readiness_warning", {"reason": why})
         repo.claim_issue(pool, issue_id, agent_id)
-        return asdict(repo.get_issue(pool, issue_id))
+        result = asdict(repo.get_issue(pool, issue_id))
+        # Reservation-time branch mandate (ADR-DEV-007 / G10): tell the worker the
+        # one branch this issue may be built on, and how to create it, so it starts
+        # on a correct fresh branch instead of a shared/stale one.
+        if issue.gate_type == "implementation":
+            target = (settings.promote_branch if settings and settings.promote_branch
+                      else "main")
+            result["branch"] = f"issue-{issue_id}"
+            result["checkout"] = f"git checkout -B issue-{issue_id} {target}"
+            result["next"] = (f"check out issue-{issue_id} from {target}, then "
+                              f"confirm_branch({issue_id}) BEFORE implementing (one issue "
+                              f"per branch — ADR-DEV-007)")
+        return result
+
+    @mcp.tool()
+    def confirm_branch(issue_id: int) -> dict[str, Any]:
+        """Reservation-time branch check (ADR-DEV-007 / G10). Call this RIGHT AFTER
+        `git checkout -B issue-<id> <main>` and BEFORE implementing. The harness
+        verifies — from git metadata only, it never touches your worktree — that
+        branch `issue-<id>` exists AND carries current main, so you fail FAST if you're
+        on a stale/wrong branch instead of wasting a whole cycle. Records
+        `branch_confirmed`. Returns {ok:true, branch} or {ok:false, reason, fix}. This
+        is a fast-fail helper; the un-bypassable gate is still report_work (G10)."""
+        issue = repo.get_issue(pool, issue_id)
+        if issue is None:
+            raise ValueError(f"no issue {issue_id}")
+        branch = f"issue-{issue_id}"
+        base = (settings.promote_repo_path or settings.apply_repo_path) if settings else ""
+        target = (settings.promote_branch if settings and settings.promote_branch else "main")
+        recreate = f"git checkout -B {branch} {target}"
+        if not base:
+            return {"ok": True, "branch": branch, "note": "no repo configured — skipped"}
+        if _git(base, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
+            return {"ok": False, "branch": branch,
+                    "reason": f"branch '{branch}' does not exist — create it from {target}",
+                    "fix": recreate}
+        if _git(base, "merge-base", "--is-ancestor", target, branch).returncode != 0:
+            return {"ok": False, "branch": branch,
+                    "reason": (f"branch '{branch}' is behind '{target}' — you'd build on "
+                               f"stale contracts/config"),
+                    "fix": f"git merge --no-edit {target}   (or rebranch: {recreate})"}
+        repo.append_log(pool, issue_id, "branch_confirmed", {"branch": branch})
+        return {"ok": True, "branch": branch}
 
     @mcp.tool()
     def update_state(issue_id: int, to_state: str,
