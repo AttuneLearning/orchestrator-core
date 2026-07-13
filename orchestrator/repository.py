@@ -686,9 +686,19 @@ def set_agent_status(pool: ConnectionPool, agent_id: int, status: str) -> None:
 
 
 def touch_agent(pool: ConnectionPool, agent_id: int) -> None:
-    """Heartbeat: record that the agent did work just now."""
+    """Heartbeat: record that the agent did work — or merely polled — just now.
+    A worker that is talking to the coordinator is alive by definition, so this
+    also REVIVES an agent the reclaim sweep latched to 'offline' (back to 'idle').
+    Without the revive, a worker whose only activity is polling my_queue would be
+    marked offline once and never recovered, and the _assign scan would refuse to
+    route work to it — the pull-gate liveness deadlock."""
     with pool.connection() as conn:
-        conn.execute("UPDATE agents SET last_seen = now() WHERE id = %s", (agent_id,))
+        conn.execute(
+            "UPDATE agents SET last_seen = now(), "
+            "status = CASE WHEN status = 'offline' THEN 'idle' ELSE status END "
+            "WHERE id = %s",
+            (agent_id,),
+        )
 
 
 def agent_next_poll_seconds(agent: Agent) -> int:
@@ -730,13 +740,17 @@ def set_agent_pause(pool: ConnectionPool, agent_id: int,
 
 def find_idle_agent(
     pool: ConnectionPool, team: str, function: Optional[str] = None,
-    runtime: Optional[str] = None,
+    runtime: Optional[str] = None, include_offline: bool = False,
 ) -> Optional[Agent]:
     """Pick an available agent for a team. `function` (dev/qa/lead) and `runtime`
     (api/cli/external) narrow the search; idle agents rank ahead of busy ones.
-    Pull gates pass runtime='external' to require a live worker."""
-    clauses = ["team = %s", "status != 'offline'",
-               "(paused_until IS NULL OR paused_until <= now())"]
+    Pull gates pass runtime='external' to require a live worker. `include_offline`
+    drops the online filter so a caller can still find the (currently down)
+    owner-worker to PIN a queued issue to it rather than leave it unowned; most
+    recently-seen ranks first among otherwise-equal candidates."""
+    clauses = ["team = %s", "(paused_until IS NULL OR paused_until <= now())"]
+    if not include_offline:
+        clauses.append("status != 'offline'")
     params: list[Any] = [team]
     if function:
         clauses.append("function = %s")
@@ -748,7 +762,7 @@ def find_idle_agent(
         cur = conn.cursor(row_factory=class_row(Agent))
         return cur.execute(
             f"SELECT {_AGENT_COLS} FROM agents WHERE {' AND '.join(clauses)} "
-            "ORDER BY (status = 'idle') DESC, id LIMIT 1",
+            "ORDER BY (status = 'idle') DESC, last_seen DESC NULLS LAST, id LIMIT 1",
             params,
         ).fetchone()
 

@@ -642,13 +642,24 @@ class Engine:
                 worker = repo.find_idle_agent(self.pool, issue.team, gate.owner,
                                               runtime="external")
                 if worker is None:
-                    # No eligible external worker: release any carried-over agent
-                    # and leave the gate unassigned, waiting. (liveness handles a
-                    # worker that claims then dies.)
-                    if current is not None:
-                        self._release_agent(issue)
-                        repo.unassign_issue(self.pool, issue.id)
-                    continue
+                    # No LIVE worker of the gate's owner. Rather than nulling the
+                    # assignment — a queued issue with no owner is invisible to
+                    # every worker's my_queue poll (keyed on assigned_agent) and can
+                    # only be re-owned here, which itself needs a live worker: the
+                    # deadlock — PIN it to the registered owner-worker even while it
+                    # is offline. claim_issue gives it a fresh stale-window grace,
+                    # and the issue surfaces the moment that worker's process polls
+                    # again (touch_agent revives it from 'offline').
+                    worker = repo.find_idle_agent(self.pool, issue.team, gate.owner,
+                                                  runtime="external", include_offline=True)
+                    if worker is None:
+                        # No such worker registered at all — nothing to pin to.
+                        if current is not None:
+                            self._release_agent(issue)
+                            repo.unassign_issue(self.pool, issue.id)
+                        continue
+                    if current is not None and current.id == worker.id:
+                        continue  # already pinned to the (offline) owner
                 self._release_agent(issue)
                 repo.claim_issue(self.pool, issue.id, worker.id)
                 repo.append_log(self.pool, issue.id, "gate_enter",
@@ -894,9 +905,29 @@ class Engine:
                 _events = repo.recent_events(self.pool, issue.id, limit=200)
                 _since = max((e.seq for e in _events if e.event_type == "directive"),
                              default=0)
+                # Only reclaim (null + re-route) when there is a LIVE replacement of
+                # this gate's owner to fail over to. With no live alternative, nulling
+                # the assignment strands the issue: a null-owner issue is invisible to
+                # every worker's my_queue poll, and the _assign scan can only re-own it
+                # via a live worker it also cannot find. Instead HOLD it assigned to
+                # its (stale) worker — it resurfaces the instant that worker's process
+                # polls again (touch_agent revives it). Mark the worker offline for
+                # visibility and alert once per stale episode; do not churn every tick.
+                replacement = repo.find_idle_agent(
+                    self.pool, issue.team, gate.owner, runtime="external")
+                repo.set_agent_status(self.pool, dead, "offline")
+                if replacement is None or replacement.id == dead:
+                    held = sum(1 for e in _events
+                               if e.event_type == "worker_stale_hold" and e.seq > _since)
+                    if held == 0:
+                        repo.append_log(self.pool, issue.id, "worker_stale_hold",
+                                        {"agent": dead, "stale_seconds": age,
+                                         "note": "worker stale and no live replacement; "
+                                         "holding the issue assigned for it (not nulling) "
+                                         "— resumes on the worker's next poll"})
+                    continue
                 n = sum(1 for e in _events
                         if e.event_type == "reclaimed" and e.seq > _since) + 1
-                repo.set_agent_status(self.pool, dead, "offline")
                 repo.unassign_issue(self.pool, issue.id)
                 repo.append_log(self.pool, issue.id, "reclaimed",
                                 {"agent": dead, "count": n, "stale_seconds": age})

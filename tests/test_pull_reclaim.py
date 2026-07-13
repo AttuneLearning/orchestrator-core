@@ -58,7 +58,12 @@ def test_stale_worker_reclaimed_and_reassigned_to_fresh_worker(settings, pool):
                            for e in repo.recent_events(pool, issue.id, limit=200)]
 
 
-def test_reclaim_cap_alerts_without_quarantine(settings, pool):
+def test_stale_worker_without_replacement_is_held_not_nulled(settings, pool):
+    # A stale worker with NO live replacement must NOT be nulled: a null-owner
+    # issue is invisible to every worker's my_queue poll and would deadlock. The
+    # issue stays assigned to its (stale) worker so it resurfaces the moment that
+    # worker's process polls again; a one-shot worker_stale_hold event gives
+    # visibility, and the goal is never paused.
     goal, issue = _pull_issue(pool)
     dev1 = repo.register_agent(pool, "backend", "dev", "external")
     eng = _engine(settings, pool, agent_stale_seconds=60, reclaim_cap=1)
@@ -71,11 +76,29 @@ def test_reclaim_cap_alerts_without_quarantine(settings, pool):
 
     refreshed = repo.get_issue(pool, issue.id)
     assert refreshed.state == "in_progress"
+    assert refreshed.assigned_agent == dev1.id                # HELD, not nulled
+    assert repo.get_agent(pool, dev1.id).status == "offline"  # flagged for visibility
     paused_ids = [g.id for g in repo.list_goals_by_state(pool, "paused")]
     assert goal.id not in paused_ids
-    alerts = [
-        e for e in repo.recent_events(pool, issue.id, limit=200)
-        if e.event_type == "alert"
-        and e.payload.get("reason") == "reclaim_cap_exceeded"
-    ]
-    assert alerts
+    events = repo.recent_events(pool, issue.id, limit=200)
+    holds = [e for e in events if e.event_type == "worker_stale_hold"]
+    assert len(holds) == 1                                    # one-shot, not per-tick
+    # never nulled → never reclaimed, so no reclaim_cap alert on the hold path
+    assert not [e for e in events if e.event_type == "reclaimed"]
+
+
+def test_held_issue_resumes_when_worker_polls(settings, pool):
+    # After a hold, the worker's heartbeat/poll revives it (offline -> idle) and
+    # the held issue is immediately actionable again — no reassignment needed.
+    goal, issue = _pull_issue(pool)
+    dev1 = repo.register_agent(pool, "backend", "dev", "external")
+    eng = _engine(settings, pool, agent_stale_seconds=60, reclaim_cap=1)
+    eng.run(max_ticks=20)
+    _backdate(pool, dev1.id, seconds=3600)
+    eng.run(max_ticks=20)
+    assert repo.get_agent(pool, dev1.id).status == "offline"
+    assert repo.get_issue(pool, issue.id).assigned_agent == dev1.id
+
+    repo.touch_agent(pool, dev1.id)                           # worker polls again
+    assert repo.get_agent(pool, dev1.id).status == "idle"     # revived
+    assert repo.get_issue(pool, issue.id).assigned_agent == dev1.id  # still its work

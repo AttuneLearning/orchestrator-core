@@ -337,7 +337,6 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         worker (offline -> idle), and returns the live loop policy so the worker
         self-paces. `next_poll_seconds` is 0 when looping is disabled, meaning
         'stop after the queue drains'; otherwise it's the idle poll cadence."""
-        repo.touch_agent(pool, agent_id)
         agent = repo.get_agent(pool, agent_id)
         if agent is None:
             # No such agent in THIS coordinator's DB — almost always means the MCP
@@ -352,10 +351,10 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
                 "loop_enabled": False,
                 "next_poll_seconds": 0,
             }
-        reactivated = False
-        if agent is not None and agent.status == "offline":
-            repo.set_agent_status(pool, agent_id, "idle")
-            reactivated = True
+        # Read status BEFORE touch: touch_agent itself now revives an offline worker
+        # (offline -> idle), so reactivation must be observed from the pre-touch state.
+        reactivated = agent.status == "offline"
+        repo.touch_agent(pool, agent_id)  # refresh last_seen; revives offline -> idle
         loop_enabled = bool(agent.loop_enabled) if agent else False
         # Cooldown window (migration 0019): if paused_until is in the future, the
         # worker should sleep until then instead of polling; the engine also skips
@@ -379,6 +378,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         """Issues currently assigned to this pull worker and awaiting its action
         (in_progress). One call for a poll loop to find what to do next. For the
         full picture (work + inbound messages) use my_queue."""
+        repo.touch_agent(pool, agent_id)  # polling is a liveness signal (revives offline)
         return [
             asdict(i) for i in repo.list_issues(
                 pool, states=["in_progress"], assigned_agent=agent_id)
@@ -403,6 +403,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         'answer') and any pending requests (type 'request'), each linked to its
         originating issue (issue_id), source (from_team) and thread (reply_to).
         Call mark_read(message_id) after consuming a message so it drops off."""
+        repo.touch_agent(pool, agent_id)  # polling is a liveness signal (revives offline)
         agent = repo.get_agent(pool, agent_id)
         work = [asdict(i) for i in repo.list_issues(
             pool, states=["in_progress"], assigned_agent=agent_id)]
