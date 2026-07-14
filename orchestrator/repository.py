@@ -952,13 +952,18 @@ def create_adr(
     """Create an ADR rule. decision = the compact directive agents receive;
     context = rationale (humans only). status='proposed' rules are inert until
     approve_adr promotes them."""
+    # Normalize domain: strip and lowercase for case-insensitive matching and
+    # consistent storage. The output key uses domain.upper() — unchanged.
+    domain = domain.strip().lower()
     with pool.connection() as conn, conn.transaction():
         # Next number = max existing suffix in this domain + 1, NOT count(*).
         # Count-based numbering collides after a delete/supersede (the trailing
         # number can already be in use); adr_key is UNIQUE so that would error.
+        # Use lower(domain) in the WHERE clause for case-insensitive matching
+        # against pre-existing mixed-case rows.
         n = conn.execute(
             "SELECT COALESCE(MAX(substring(adr_key from '[0-9]+$')::int), 0) "
-            "FROM adrs WHERE domain = %s", (domain,)
+            "FROM adrs WHERE lower(domain) = %s", (domain,)
         ).fetchone()[0]
         adr_key = f"ADR-{domain.upper()}-{n + 1:03d}"
         row = conn.execute(
@@ -980,8 +985,8 @@ def list_adrs(pool: ConnectionPool, status: Optional[str] = None,
         clauses.append("status = %s")
         params.append(status)
     if domain:
-        clauses.append("domain = %s")
-        params.append(domain)
+        clauses.append("lower(domain) = %s")
+        params.append(domain.strip().lower())
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with pool.connection() as conn:
         rows = conn.execute(_ADR_SELECT + where + " ORDER BY adr_key", params).fetchall()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +19,8 @@ from psycopg_pool import ConnectionPool
 from .. import repository as repo
 from ..config import Settings
 from ..models import Issue
+from ..workflow.loader import load_effective, load_permissions
+from ..workflow.runner import run_step
 from .npm_deps import ensure_deps_current
 
 WORKTREES_DIR = Path("/tmp/orchestrator-worktrees")
@@ -42,6 +45,98 @@ def _worktree_path(issue: Issue, base: str | Path) -> Path:
     # same issue id must not share a worktree.
     base_key = hashlib.md5(str(Path(base).resolve()).encode()).hexdigest()[:8]
     return WORKTREES_DIR / base_key / _branch(issue)
+
+
+def _apply_in_worktree_enabled(
+    issue: Issue, wt: str | Path, settings: Settings, sha: str, committed: bool,
+) -> dict[str, Any]:
+    """`workflow_profile: enabled` path for `_apply_in_worktree` (WP-09).
+
+    Runs the `prepare` then `verify` steps of the effective workflow Profile
+    (Phase A: `orchestrator.workflow.loader`/`runner`) in place of the inline
+    `ensure_deps_current` call + hardcoded `settings.verify_cmd`. A
+    `blocked_on_approval` outcome from either step returns `passed=None`.
+    Unlike verify_run, this function does NOT log events itself (the caller
+    apply_and_verify handles that) — so event_cb is always None.
+    """
+    perms = load_permissions(settings)
+    profile = load_effective(settings, wt, role="qa")
+    branch = _branch(issue)
+
+    # Run prepare step (no event_cb: the caller handles logging)
+    prepare_result = run_step(wt, profile, "prepare", "qa", perms, event_cb=None)
+
+    if prepare_result.status == "blocked_on_approval":
+        return {
+            "passed": None,
+            "status": "blocked_on_approval",
+            "reason": prepare_result.reason,
+            "branch": branch,
+            "commit": sha,
+        }
+
+    if prepare_result.status == "failed":
+        # Extract detail from the last failed action result if available
+        prepare_detail: dict[str, Any] = {}
+        if prepare_result.results:
+            prepare_detail = prepare_result.results[-1].detail
+        return {
+            "passed": False,
+            "error": f"prepare failed: {prepare_result.reason}",
+            "branch": branch,
+            "commit": sha,
+            "committed": committed,
+            "deps": prepare_detail,
+        }
+
+    # Run verify step
+    started = time.monotonic()
+    verify_result = run_step(wt, profile, "verify", "qa", perms, event_cb=None)
+    duration = round(time.monotonic() - started, 1)
+
+    if verify_result.status == "blocked_on_approval":
+        return {
+            "passed": None,
+            "status": "blocked_on_approval",
+            "reason": verify_result.reason,
+            "branch": branch,
+            "commit": sha,
+        }
+
+    # Extract detail from the last action result if available
+    verify_detail: dict[str, Any] = {}
+    if verify_result.results:
+        verify_detail = verify_result.results[-1].detail
+
+    # Treat a successful verify step with no actions (empty step) as passed
+    returncode = verify_detail.get("returncode")
+    out = verify_detail.get("stdout", "") or ""
+    err = verify_detail.get("stderr", "") or ""
+
+    # If status is "ok" but a verify action actually failed (ok=False with on_fail: warn),
+    # derive returncode from the failed action's result, not from the overall status.
+    if verify_result.status == "ok":
+        for result in verify_result.results:
+            if not result.ok and not result.skipped:
+                failed_detail = result.detail
+                returncode = failed_detail.get("returncode", 1)
+                out = failed_detail.get("stdout", "") or ""
+                err = failed_detail.get("stderr", "") or ""
+                break
+
+    if returncode is None:
+        returncode = 1 if verify_result.status == "failed" else 0
+
+    return {
+        "passed": returncode == 0,
+        "returncode": returncode,
+        "stdout": out[-1000:],
+        "stderr": err[-1000:],
+        "branch": branch,
+        "commit": sha,
+        "committed": committed,
+        "deps": {},  # prepare_detail would go here if we tracked it
+    }
 
 
 def _latest_artifact(pool: ConnectionPool, issue_id: int) -> Optional[str]:
@@ -88,6 +183,13 @@ def _apply_in_worktree(issue: Issue, artifact: str, settings: Settings) -> dict[
     commit = _git(wt, "commit", "-m", f"apply artifact for issue #{issue.id}",
                   check=False)  # empty diff on re-run is fine
     sha = _git(wt, "rev-parse", "HEAD").stdout.strip()
+    committed = commit.returncode == 0
+
+    if settings.workflow_profile == "enabled":
+        # Profile-driven prepare+verify (Phase B of the Workflow Profile cutover)
+        # — replaces the inline ensure_deps_current + hardcoded verify command below.
+        # `legacy` (default) never reaches here.
+        return _apply_in_worktree_enabled(issue, wt, settings, sha, committed)
 
     if not settings.verify_cmd:
         return {"passed": False, "skipped": "verify_cmd not configured",
@@ -112,7 +214,7 @@ def _apply_in_worktree(issue: Issue, artifact: str, settings: Settings) -> dict[
             "stderr": proc.stderr[-1000:],
             "branch": branch,
             "commit": sha,
-            "committed": commit.returncode == 0,
+            "committed": committed,
             "deps": deps,
         }
     except subprocess.TimeoutExpired:

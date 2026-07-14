@@ -17,6 +17,8 @@ from ..apply.npm_deps import ensure_deps_current
 from ..config import load_settings
 from ..pipelines import load_pipelines
 from ..state_machine import apply_gate_decision
+from ..workflow.loader import load_effective, load_permissions
+from ..workflow.runner import run_step
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{6,40}$")
 _STUB_MARKERS = (
@@ -230,6 +232,125 @@ def _has_valid_implementation_report(pool: ConnectionPool, issue_id: int) -> boo
             continue
         return True
     return False
+
+
+def _strip_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop run_step's `action`/`verdict` envelope keys, leaving the bare
+    execution detail dict (e.g. a builtin's `{ok, reason, installed, ...}` or
+    `_run_shell`'s `{ok, reason, returncode, stdout, stderr}`) — this is what
+    lets the enabled path reuse the legacy payload shapes verbatim."""
+    return {k: v for k, v in payload.items() if k not in ("action", "verdict")}
+
+
+def _action_label(payload: dict[str, Any]) -> str:
+    info = payload.get("action") or {}
+    return str(info.get("run") or info.get("builtin") or "<unnamed action>")
+
+
+def _verify_run_enabled(
+    pool: ConnectionPool, settings: Any, issue: Any, issue_id: int,
+    wt: str, verify_branch: str,
+) -> dict[str, Any]:
+    """`workflow_profile: enabled` path for `verify_run` (WP-08).
+
+    Runs the `prepare` then `verify` steps of the effective workflow Profile
+    (Phase A: `orchestrator.workflow.loader`/`runner`) in place of the inline
+    `ensure_deps_current` call + hardcoded `npm run typecheck && npm test`.
+    Emits the SAME event kinds/payload shapes the legacy path emits for the
+    same outcomes (`deps_reinstalled`, `tests_run`) so downstream consumers
+    (gate decisions, `_has_machine_verification`, dashboards) see no
+    difference on the happy/fail paths. A `blocked_on_approval` outcome from
+    either step never becomes a failed `tests_run` event — it appends an
+    `action_escalated` log entry instead (WP-11/12 add real persistence;
+    here it is observability only) and returns `passed=None`.
+    """
+    perms = load_permissions(settings)
+    profile = load_effective(settings, wt, role="qa")
+
+    prepare_detail: dict[str, Any] = {}
+    blocked: dict[str, Any] = {}
+
+    def _prepare_cb(kind: str, payload: dict[str, Any]) -> None:
+        nonlocal prepare_detail, blocked
+        if kind in ("executed", "failed", "refused"):
+            prepare_detail = _strip_envelope(payload)
+            if kind == "executed" and prepare_detail.get("installed"):
+                repo.append_log(pool, issue_id, "deps_reinstalled",
+                                {"machine": True, "branch": verify_branch, **prepare_detail})
+        elif kind == "escalated":
+            blocked = {"step": "prepare", "action": _action_label(payload)}
+            repo.append_log(pool, issue_id, "action_escalated",
+                            {"machine": True, "branch": verify_branch, **blocked})
+
+    prepare_result = run_step(wt, profile, "prepare", "qa", perms, event_cb=_prepare_cb)
+
+    if prepare_result.status == "blocked_on_approval":
+        return {"passed": None, "status": "blocked_on_approval",
+                "reason": blocked.get("action", prepare_result.reason)}
+
+    if prepare_result.status == "failed":
+        returncode = prepare_detail.get("returncode", 1)
+        payload = {
+            "machine": True, "cmd": prepare_detail.get("cmd") or "prepare",
+            "returncode": returncode, "duration_s": 0.0, "branch": verify_branch,
+            "stdout_tail": "", "stderr_tail": (prepare_detail.get("stderr_tail") or "")[-800:],
+            "deps": prepare_detail,
+        }
+        payload.update(_agent_stamp(pool, issue))
+        repo.append_log(pool, issue_id, "tests_run", payload)
+        return {"passed": False, "returncode": returncode, "duration_s": 0.0,
+                "tail": f"dependency install failed before verify: {prepare_result.reason}"}
+
+    verify_detail: dict[str, Any] = {}
+
+    def _verify_cb(kind: str, payload: dict[str, Any]) -> None:
+        nonlocal verify_detail, blocked
+        if kind in ("executed", "failed", "refused"):
+            verify_detail = _strip_envelope(payload)
+            verify_detail["_action"] = payload.get("action") or {}
+        elif kind == "escalated":
+            blocked = {"step": "verify", "action": _action_label(payload)}
+            repo.append_log(pool, issue_id, "action_escalated",
+                            {"machine": True, "branch": verify_branch, **blocked})
+
+    started = time.monotonic()
+    verify_result = run_step(wt, profile, "verify", "qa", perms, event_cb=_verify_cb)
+    duration = round(time.monotonic() - started, 1)
+
+    if verify_result.status == "blocked_on_approval":
+        return {"passed": None, "status": "blocked_on_approval",
+                "reason": blocked.get("action", verify_result.reason)}
+
+    action_info = verify_detail.pop("_action", {})
+    cmd = action_info.get("run") or action_info.get("builtin") or ""
+    returncode = verify_detail.get("returncode")
+    out = verify_detail.get("stdout", "") or ""
+    err = verify_detail.get("stderr", "") or ""
+
+    # If status is "ok" but a verify action actually failed (ok=False with on_fail: warn),
+    # derive returncode from the failed action's result, not from the overall status.
+    if verify_result.status == "ok":
+        for result in verify_result.results:
+            if not result.ok and not result.skipped:
+                failed_detail = result.detail
+                returncode = failed_detail.get("returncode", 1)
+                out = failed_detail.get("stdout", "") or ""
+                err = failed_detail.get("stderr", "") or ""
+                cmd = result.action.run or result.action.builtin or ""
+                break
+
+    if returncode is None:
+        returncode = 1 if verify_result.status == "failed" else 0
+    payload = {
+        "machine": True, "cmd": cmd, "returncode": returncode,
+        "duration_s": duration, "branch": verify_branch,
+        "stdout_tail": out[-1200:], "stderr_tail": err[-800:],
+        "deps": prepare_detail,
+    }
+    payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
+    repo.append_log(pool, issue_id, "tests_run", payload)
+    return {"passed": returncode == 0, "returncode": returncode,
+            "duration_s": duration, "tail": out[-600:] or err[-600:]}
 
 
 def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
@@ -548,6 +669,11 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         co = _git(wt, "checkout", "-B", verify_branch, branch)
         if co.returncode != 0:
             raise ValueError(f"verify checkout failed: {co.stderr[:300]}")
+        if settings.workflow_profile == "enabled":
+            # Profile-driven prepare+verify (Phase A/B of the Workflow Profile
+            # cutover) — replaces the inline ensure_deps_current + hardcoded
+            # verify command below. `legacy` (default) never reaches here.
+            return _verify_run_enabled(pool, settings, issue, issue_id, wt, verify_branch)
         # Reconcile node_modules with the freshly checked-out lockfile BEFORE typecheck.
         # `clean -fd` above keeps node_modules (no -x), so a dependency that landed on
         # main since the last install would otherwise surface as a spurious "Cannot find
