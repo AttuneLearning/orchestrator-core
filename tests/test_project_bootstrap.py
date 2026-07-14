@@ -178,8 +178,14 @@ def test_opencode_runtime_builds_config_and_command(settings, tmp_path, monkeypa
     def run(mode: str | None, capture_name: str):
         env = base_env.copy()
         env["OPENCODE_CAPTURE_DIR"] = str(tmp_path / capture_name)
+        # The default (mode=None) path asserts the NON-interactive `opencode run …`
+        # command, so AGENT_MODE must be genuinely unset — never inherited from the
+        # caller's shell (this orch-manager session exports AGENT_MODE=interactive,
+        # which would otherwise flip the default run into the interactive branch).
         if mode is not None:
             env["AGENT_MODE"] = mode
+        else:
+            env.pop("AGENT_MODE", None)
         rc = subprocess.run(
             ["bash", str(script)],
             cwd=str(cli.REPO_ROOT),
