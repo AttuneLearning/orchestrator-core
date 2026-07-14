@@ -227,6 +227,24 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw not in (None, "") else default
 
 
+def _load_instances() -> dict[str, Any]:
+    """Merge config/instances.yaml with any config/instances.d/*.yaml drop-ins.
+
+    The curated instances.yaml stays hand-edited; `orchestrator init` writes a
+    standalone drop-in per project (non-destructive). A drop-in is either a full
+    `{instances: {...}}` doc or a bare `{<name>: {...}}` mapping. Drop-ins win on
+    key collision (last loaded, sorted by filename)."""
+    merged = dict((_yaml(CONFIG_DIR / "instances.yaml") or {}).get("instances", {}) or {})
+    dropin_dir = CONFIG_DIR / "instances.d"
+    if dropin_dir.is_dir():
+        for path in sorted(dropin_dir.glob("*.yaml")):
+            doc = _yaml(path) or {}
+            entries = doc.get("instances", doc) if isinstance(doc, dict) else {}
+            if isinstance(entries, dict):
+                merged.update(entries)
+    return merged
+
+
 def _resolve_instance(instance: str, s_yaml: dict[str, Any]) -> str:
     """Resolve an orchestrator instance (dev group) from config/instances.yaml.
 
@@ -236,7 +254,7 @@ def _resolve_instance(instance: str, s_yaml: dict[str, Any]) -> str:
     `database_url` is the local default. `database_url_env` remains available
     for deployments that inject secrets via the process environment.
     """
-    instances = (_yaml(CONFIG_DIR / "instances.yaml") or {}).get("instances", {}) or {}
+    instances = _load_instances()
     entry = instances.get(instance)
     if entry is None:
         raise ValueError(

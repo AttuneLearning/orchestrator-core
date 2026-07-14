@@ -770,6 +770,190 @@ def _offer_watchdog(workspace: Path) -> None:
         print(f"Skipped. Enable later with:\n  {manual}")
 
 
+def _ensure_database(database_url: str) -> bool:
+    """Create the target Postgres database if it doesn't exist. Returns True if it
+    was created. Connects to the server's default 'postgres' maintenance DB (CREATE
+    DATABASE cannot run inside a transaction, so autocommit)."""
+    import psycopg
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(database_url)
+    dbname = parts.path.lstrip("/")
+    if not dbname:
+        raise ValueError(f"database_url has no database name: {database_url!r}")
+    admin_url = urlunsplit((parts.scheme, parts.netloc, "/postgres", "", ""))
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)).fetchone()
+        if exists:
+            return False
+        conn.execute(f'CREATE DATABASE "{dbname}"')
+        return True
+
+
+def _run_doctor_checks(settings) -> list:
+    """Run the preflight checks against a resolved instance. Pure-ish: each check is
+    isolated so one failure (e.g. DB down) still reports the rest."""
+    from . import db, onboarding
+    from .pipelines import load_pipelines
+    from .roster import load_roster
+    C, P, W, F = onboarding.Check, onboarding.PASS, onboarding.WARN, onboarding.FAIL
+    checks: list = [C("config", P,
+                      f"tier={settings.decomposition_tier}, "
+                      f"default_pipeline={settings.default_pipeline}")]
+
+    default_team = None
+    try:
+        pipelines = load_pipelines(settings.pipelines)
+        if settings.default_pipeline in pipelines:
+            checks.append(C("pipelines", P, f"{len(pipelines)} defined; default OK"))
+            default_team = getattr(pipelines[settings.default_pipeline], "team", None)
+        else:
+            checks.append(C("pipelines", F,
+                            f"default_pipeline {settings.default_pipeline!r} not in "
+                            f"{sorted(pipelines)}"))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(C("pipelines", F, str(exc)))
+
+    try:
+        roster = load_roster(settings.roster)
+        if default_team and roster.resolve(default_team) is None:
+            checks.append(C("roster", F, f"pipeline team {default_team!r} not in roster"))
+        else:
+            checks.append(C("roster", P, f"resolves ({settings.roster_file})"))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(C("roster", F, str(exc)))
+
+    try:
+        pool = db.get_pool(settings)
+        with pool.connection() as conn:
+            conn.execute("SELECT 1")
+        checks.append(C("database", P, "reachable"))
+        files = sorted(p.name for p in (REPO_ROOT / "migrations").glob("*.sql"))
+        with pool.connection() as conn:
+            try:
+                done = {r[0] for r in conn.execute(
+                    "SELECT filename FROM schema_migrations").fetchall()}
+            except Exception:  # noqa: BLE001 - table missing = nothing applied
+                done = set()
+        pending = [f for f in files if f not in done]
+        if not done:
+            checks.append(C("migrations", F, "none applied — run `migrate`"))
+        elif pending:
+            checks.append(C("migrations", F, f"{len(pending)} pending — run `migrate`"))
+        else:
+            checks.append(C("migrations", P, f"{len(files)} applied"))
+        agents = repo.list_agents(pool)
+        checks.append(C("agents", P if agents else W,
+                        f"{len(agents)} registered" if agents
+                        else "none — `register-agent` or `init`"))
+        goals = repo.list_open_goals(pool)
+        checks.append(C("goals", P if goals else W,
+                        f"{len(goals)} open" if goals
+                        else "none — `add-goal` to start work"))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(C("database", F, f"unreachable: {exc}"))
+
+    backend = settings.reasoner or ("anthropic" if settings.anthropic_api_key else "")
+    if backend and backend != "stub":
+        checks.append(C("reasoner", onboarding.PASS,
+                        f"backend={backend}, "
+                        f"model={settings.reasoner_model or settings.reasoning_model}"))
+    else:
+        checks.append(C("reasoner", W,
+                        "stub/unset — engine decisions will be deterministic placeholders"))
+    return checks
+
+
+def _cmd_doctor(args, settings) -> int:
+    from . import onboarding
+    checks = _run_doctor_checks(settings)
+    code, report = onboarding.summarize(checks)
+    print(f"orchestrator doctor ({settings.roster_file}):")
+    print(report)
+    return code
+
+
+def _cmd_init(args, settings) -> int:
+    """Guided project bootstrap: pick a tier, write a drop-in instance config, create
+    + migrate the DB, register agents, then run the preflight (doctor)."""
+    from . import db, onboarding
+
+    project = args.project
+    label = args.label or project.replace("-", " ").replace("_", " ").title()
+    roster_file = args.roster_file
+    database_url = args.database_url or \
+        f"postgresql://orchestrator:orchestrator@localhost:5432/{project}"
+    models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
+    if args.decomposition_tier:
+        tier = decomposition.resolve_tier(args.decomposition_tier)
+        tier_reason = "explicit --decomposition-tier"
+    else:
+        tier = decomposition.resolve_tier(onboarding.recommend_tier(models))
+        tier_reason = f"recommended from models {models}" if models \
+            else "default (pass --models or --decomposition-tier to tune)"
+    teams = [t.strip() for t in (args.teams or "backend,frontend").split(",") if t.strip()]
+    agent_plan = [(t, f) for t in teams for f in ("dev", "qa")]
+
+    dropin_path = REPO_ROOT / "config" / "instances.d" / f"{project}.yaml"
+    entry = onboarding.build_instance_entry(
+        label=label, database_url=database_url, roster_file=roster_file, tier=tier.name)
+    body = onboarding.render_instances_dropin(project, entry)
+
+    print(f"init plan for project {project!r}:")
+    print(f"  decomposition tier : {tier.name}  ({tier_reason})")
+    print(f"  database_url       : {database_url}")
+    print(f"  roster_file        : {roster_file}")
+    print(f"  instance config    : {dropin_path}")
+    print(f"  agents to register : " + ", ".join(f"{t}/{f}" for t, f in agent_plan))
+
+    if args.dry_run:
+        print(f"\n(dry-run) no changes made.\n--- would write {dropin_path} ---\n{body}")
+        return 0
+    if not args.yes and sys.stdin.isatty():
+        try:
+            if input("\nProceed? [y/N]: ").strip().lower() not in ("y", "yes"):
+                print("aborted.")
+                return 1
+        except EOFError:
+            print("aborted (no tty; pass --yes to run non-interactively).")
+            return 1
+
+    dropin_path.parent.mkdir(parents=True, exist_ok=True)
+    if dropin_path.exists() and not args.force:
+        print(f"refusing to overwrite {dropin_path} (pass --force)", file=sys.stderr)
+        return 1
+    dropin_path.write_text(body)
+    print("wrote", dropin_path)
+
+    try:
+        created = _ensure_database(database_url)
+        print("created database" if created else "database already exists")
+    except Exception as exc:  # noqa: BLE001
+        print(f"database setup failed: {exc}", file=sys.stderr)
+        return 1
+
+    db.close_pool()
+    new_settings = load_settings(instance=project)
+    applied = db.migrate(new_settings)
+    print(f"migrations: {len(applied)} applied" if applied else "migrations: up to date")
+    pool = db.get_pool(new_settings)
+    for team, function in agent_plan:
+        a = repo.register_agent(pool, team, function, args.runtime)
+        print(f"registered agent {a.id}: {a.team}/{a.function}")
+
+    print("\nnext steps:")
+    print(f"  1. render each worker's docs:  orchestrator -i {project} render-agent-docs "
+          "--team <team> --function <dev|qa> --agent-id <id> --out-dir <worktree>")
+    print(f"  2. add a first goal:           orchestrator -i {project} add-goal "
+          f"--pipeline {new_settings.default_pipeline} --title \"...\"")
+    print("  3. launch the engine + workers.")
+    print("\npreflight (orchestrator doctor):")
+    code, report = onboarding.summarize(_run_doctor_checks(new_settings))
+    print(report)
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument(
@@ -986,6 +1170,38 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true",
                     help="show files and worktrees that would be written")
     sp.set_defaults(func=_cmd_setup_project)
+
+    ip = sub.add_parser("init",
+                        help="guided project bootstrap: instance config + DB + "
+                             "migrations + agents + preflight")
+    ip.add_argument("--project", required=True, help="project/instance name")
+    ip.add_argument("--label", default=None, help="human label (default: titled project)")
+    ip.add_argument("--database-url", default=None,
+                    help="Postgres URL (default: postgresql://orchestrator:orchestrator"
+                         "@localhost:5432/<project>). Created if it does not exist.")
+    ip.add_argument("--roster-file", default="config/roster.yaml",
+                    help="roster file for this instance (default: config/roster.yaml)")
+    ip.add_argument("--decomposition-tier", default=None,
+                    choices=decomposition.tier_names(),
+                    help="capability tier; omit to recommend one from --models")
+    ip.add_argument("--models", default="",
+                    help="comma-separated model names the fleet runs; used to "
+                         "recommend a decomposition tier when --decomposition-tier is omitted")
+    ip.add_argument("--teams", default="backend,frontend",
+                    help="comma-separated teams to register dev+qa agents for "
+                         "(default: backend,frontend)")
+    ip.add_argument("--runtime", default="api", help="agent runtime (default: api)")
+    ip.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    ip.add_argument("--force", action="store_true",
+                    help="overwrite an existing instance drop-in config")
+    ip.add_argument("--dry-run", action="store_true",
+                    help="print the plan and the config that would be written; make no changes")
+    ip.set_defaults(func=_cmd_init)
+
+    dp = sub.add_parser("doctor",
+                        help="preflight: validate an instance is ready to launch "
+                             "(DB, migrations, roster, pipelines, agents, reasoner)")
+    dp.set_defaults(func=_cmd_doctor)
 
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)
     return p
