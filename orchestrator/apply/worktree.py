@@ -18,6 +18,7 @@ from psycopg_pool import ConnectionPool
 from .. import repository as repo
 from ..config import Settings
 from ..models import Issue
+from .npm_deps import ensure_deps_current
 
 WORKTREES_DIR = Path("/tmp/orchestrator-worktrees")
 VERIFY_TIMEOUT_S = 300
@@ -92,6 +93,13 @@ def _apply_in_worktree(issue: Issue, artifact: str, settings: Settings) -> dict[
         return {"passed": False, "skipped": "verify_cmd not configured",
                 "branch": branch, "commit": sha}
 
+    # Reconcile node_modules with the checked-out lockfile before verifying — a stale
+    # tree yields spurious "Cannot find module" failures whenever a dep landed on main.
+    deps = ensure_deps_current(wt)
+    if not deps["ok"]:
+        return {"passed": False, "error": f"dependency install failed: {deps['reason']}",
+                "branch": branch, "commit": sha, "deps": deps}
+
     try:
         proc = subprocess.run(
             settings.verify_cmd, shell=True, cwd=wt,
@@ -105,6 +113,7 @@ def _apply_in_worktree(issue: Issue, artifact: str, settings: Settings) -> dict[
             "branch": branch,
             "commit": sha,
             "committed": commit.returncode == 0,
+            "deps": deps,
         }
     except subprocess.TimeoutExpired:
         return {"passed": False, "error": f"verify timed out after {VERIFY_TIMEOUT_S}s",

@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 from psycopg_pool import ConnectionPool
 
 from .. import repository as repo
+from ..apply.npm_deps import ensure_deps_current
 from ..config import load_settings
 from ..pipelines import load_pipelines
 from ..state_machine import apply_gate_decision
@@ -547,6 +548,25 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         co = _git(wt, "checkout", "-B", verify_branch, branch)
         if co.returncode != 0:
             raise ValueError(f"verify checkout failed: {co.stderr[:300]}")
+        # Reconcile node_modules with the freshly checked-out lockfile BEFORE typecheck.
+        # `clean -fd` above keeps node_modules (no -x), so a dependency that landed on
+        # main since the last install would otherwise surface as a spurious "Cannot find
+        # module" failure that falsely bounces the issue. Only reinstalls on lockfile change.
+        deps = ensure_deps_current(wt)
+        if deps.get("installed"):
+            repo.append_log(pool, issue_id, "deps_reinstalled",
+                            {"machine": True, "branch": verify_branch, **deps})
+        if not deps["ok"]:
+            payload = {
+                "machine": True, "cmd": "npm ci", "returncode": deps.get("returncode", 1),
+                "duration_s": 0.0, "branch": verify_branch, "stdout_tail": "",
+                "stderr_tail": (deps.get("stderr_tail") or "")[-800:], "deps": deps,
+            }
+            payload.update(_agent_stamp(pool, issue))
+            repo.append_log(pool, issue_id, "tests_run", payload)
+            return {"passed": False, "returncode": deps.get("returncode", 1),
+                    "duration_s": 0.0,
+                    "tail": f"dependency install failed before verify: {deps['reason']}"}
         cmd = settings.verify_cmd or "npm run typecheck && npm test"
         started = time.monotonic()
         try:
@@ -562,6 +582,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
             "machine": True, "cmd": cmd, "returncode": returncode,
             "duration_s": duration, "branch": verify_branch,
             "stdout_tail": out[-1200:], "stderr_tail": err[-800:],
+            "deps": deps,
         }
         payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
         repo.append_log(pool, issue_id, "tests_run", payload)

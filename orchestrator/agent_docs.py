@@ -60,7 +60,9 @@ _SYNC_STEP = {
             "on `main`, and you only see them after merging it in. Do this every cycle before "
             "working so you build on current `main`, not a stale fork. Conflicts: prefer `main` for "
             "shared contract/config files; for a genuine code conflict resolve minimally or report "
-            "a blocker via `comms_send`. LOCAL only — never push."),
+            "a blocker via `comms_send`. **If the merge changed `package-lock.json`, run `npm ci` "
+            "before typecheck** so a newly-added dependency is installed — a stale `node_modules` "
+            "yields false 'Cannot find module' errors (a bounce, not a real failure). LOCAL only — never push."),
     "qa": ("**Do NOT keep a long-lived branch or pre-merge `main` here.** This worktree is "
            "EPHEMERAL: you rebuild a clean verify branch from the issue's own branch for each issue "
            "in step 5 (force-reset, discards the prior cycle), so nothing accumulates and a "
