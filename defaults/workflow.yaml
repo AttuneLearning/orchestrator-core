@@ -1,0 +1,15 @@
+# Default workflow profile: stack-neutral baseline.
+# This file is the human-readable baseline for engine defaults; the loader
+# merges it with repo and workspace profiles and applies stack-specific
+# adapter defaults (prepare/verify) when auto-detecting a stack.
+#
+# Steps: refresh, services, prepare, verify, cleanup, promote.
+# Actions are executed in order; on_fail determines the behavior on failure:
+#   - block: halt the step
+#   - warn: log and continue to next action
+#   - escalate: ask for approval (WP-12 persistence, WP-13 semantics)
+
+cleanup:
+  - run: git reset --hard && git clean -fd
+    on_fail: block
+    timeout: 300

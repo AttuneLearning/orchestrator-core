@@ -67,3 +67,16 @@ instances:
       # devqa_worker:       { profile: '', model: '', runtime: opencode }
       # docs_reasoner_base_url: http://your-endpoint/v1
       # docs_reasoner_model: <model>
+
+      # --- Workflow Profile system (orchestrator/workflow/) ------------------
+      # `workflow_profile: enabled` routes verify_run/apply call sites through
+      # the profile-driven prepare/verify/cleanup steps instead of the legacy
+      # inline code path. Leave unset (or "legacy") to keep today's behavior.
+      # workflow_profile: legacy
+      #
+      # `workspace_manifest` is YOUR (the operator's) YAML file — the
+      # highest-precedence profile layer AND the only place `permissions:`
+      # (allow/deny/bypass) is honored. A repo-committed `.orchestrator/
+      # workflow.yaml` can propose steps but can never grant itself
+      # permissions; that authority lives only here.
+      # workspace_manifest: /abs/path/to/workspace/manifest.yaml

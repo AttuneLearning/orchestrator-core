@@ -207,6 +207,17 @@ class Settings:
     # as machine evidence. Empty = verify_run unavailable for that team.
     verify_worktrees: dict[str, Any] = field(default_factory=dict)
 
+    # Workflow Profile system (orchestrator/workflow/): composes engine defaults +
+    # repo (.orchestrator/workflow.yaml) + workspace-manifest layers into a Profile
+    # that drives prepare/verify/cleanup steps. `workflow_profile` gates call-site
+    # cutover: "legacy" (default) leaves today's inline apply/verify code path
+    # untouched; "enabled" routes those call sites through orchestrator.workflow's
+    # run_step. `workspace_manifest` is the operator-owned YAML file path — the
+    # highest-precedence profile layer AND the sole source of `permissions:`
+    # (allow/deny/bypass) authority (a repo profile can never self-authorize).
+    workspace_manifest: str = ""
+    workflow_profile: str = "legacy"   # legacy | enabled
+
     # Raw parsed YAML for the pipeline/roster modules to consume.
     pipelines: dict[str, Any] = field(default_factory=dict)
     roster: dict[str, Any] = field(default_factory=dict)
@@ -420,4 +431,6 @@ def load_settings(instance: str | None = None) -> Settings:
         engine_reasoner=engine_reasoner,
         devqa_worker=devqa_worker,
         verify_worktrees=verify_worktrees,
+        workspace_manifest=pick("WORKSPACE_MANIFEST", "workspace_manifest", ""),
+        workflow_profile=pick("WORKFLOW_PROFILE", "workflow_profile", "legacy"),
     )
