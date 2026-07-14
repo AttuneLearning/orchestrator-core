@@ -8,7 +8,8 @@ from pathlib import Path
 from orchestrator import cli
 
 
-def _setup_args(workspace: Path, *, project: str = "tendcharting", dry_run: bool = False):
+def _setup_args(workspace: Path, *, project: str = "tendcharting", dry_run: bool = False,
+                decomposition_tier: str = "mid"):
     return Namespace(
         workspace=str(workspace),
         project=project,
@@ -16,9 +17,35 @@ def _setup_args(workspace: Path, *, project: str = "tendcharting", dry_run: bool
         dashboard_url="http://127.0.0.1:8800",
         worktree_prefix="wt-",
         humantest_worktree="humantest-wt",
+        decomposition_tier=decomposition_tier,
         force=False,
         dry_run=dry_run,
     )
+
+
+def test_setup_project_bakes_decomposition_tier_into_env_and_guidance(settings, tmp_path, capsys):
+    workspace = tmp_path / "tendcharting-ws"
+
+    rc = cli._cmd_setup_project(_setup_args(workspace, decomposition_tier="remedial"), settings)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    env = (workspace / "agent-launchers" / "orchestrator.env").read_text()
+    assert "DECOMPOSITION_TIER=remedial" in env
+    # The authoritative per-instance config line is printed for the operator to pin.
+    assert "decomposition tier: remedial" in out
+    assert "decomposition_tier: remedial" in out
+
+
+def test_setup_project_defaults_tier_to_mid(settings, tmp_path):
+    workspace = tmp_path / "tendcharting-ws"
+    # Omit the attribute entirely — the command must default via getattr, not crash.
+    args = _setup_args(workspace)
+    del args.decomposition_tier
+    rc = cli._cmd_setup_project(args, settings)
+    assert rc == 0
+    env = (workspace / "agent-launchers" / "orchestrator.env").read_text()
+    assert "DECOMPOSITION_TIER=mid" in env
 
 
 def test_workspace_launch_plan_uses_pull_subteams(settings, tmp_path):

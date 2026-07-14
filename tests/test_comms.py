@@ -46,7 +46,7 @@ class _RejectingReasoner:
     def __init__(self):
         self._stub = StubReasoner()
 
-    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "", sizing: str = "") -> list[IssueSpec]:
         return self._stub.decompose_goal(goal, max_subissues)
 
     def plan_issue(self, issue: Issue) -> str:

@@ -67,6 +67,10 @@ _ARCH_HEAVY_RE = re.compile(
     r"migration|envelope encryption|master key)\b", re.I)
 # G5: a heuristic that a spec bundles multiple deliverables (should have been split).
 _OVERSIZED_RE = re.compile(r"(\band\b.*\band\b)|(;.*;)|(\balso\b)", re.I)
+# Remedial-tier mid-run advisory: how far ABOVE the quarantine threshold a drift
+# score still triggers a (non-halting) direction advisory. Wider than the quarantine
+# line so declining work is flagged before it actually crosses into off-rails.
+_MIDRUN_ADVISORY_MARGIN = 0.2
 
 
 @dataclass
@@ -117,6 +121,9 @@ class Engine:
         self.pipelines = load_pipelines(settings.pipelines)
         self.roster = load_roster(settings.roster)
         self.t = settings.thresholds
+        # Decomposition tier (bootstrap capability level): scales issue sizing,
+        # per-issue internal parallelism, and mid-run drift advisories.
+        self.tier = decomposition.resolve_tier(settings.decomposition_tier)
 
     # -- helpers ------------------------------------------------------------ #
 
@@ -360,7 +367,8 @@ class Engine:
                     work_type=None, team=_team, repos=_repos)
                 specs = self.reasoner.decompose_goal(
                     goal, self.t.max_subissues,
-                    rules=adr_rules.format_rules_block(_conv))
+                    rules=adr_rules.format_rules_block(_conv),
+                    sizing=self.tier.sizing)
                 # Drop candidates that merely duplicate a QA gate — the runner owns
                 # verification; it is acceptance criteria on the impl issue, not its
                 # own issue (no standalone test/typecheck/e2e/bundle-output issues).
@@ -917,6 +925,15 @@ class Engine:
                     self._release_agent(issue)
                     repo.set_goal_state(self.pool, issue.goal_id, GoalState.PAUSED.value)
                     summary.quarantined += 1
+                elif self.tier.midrun_checks and signals and \
+                        drift < self.t.drift_threshold + _MIDRUN_ADVISORY_MARGIN:
+                    # Remedial-tier mid-run direction check: drift is declining toward
+                    # the quarantine line but hasn't crossed it. Surface an advisory so
+                    # a human/dashboard can course-correct a low-reliability worker —
+                    # WITHOUT halting it (forward progress is preserved; no state change).
+                    repo.append_log(self.pool, issue.id, "drift_advisory",
+                                    {"signals": signals, "drift": drift,
+                                     "threshold": self.t.drift_threshold})
             except ReasonerExhausted:
                 # Drift scoring is advisory; if the model is down we simply skip
                 # the drift check this tick rather than quarantining on a signal

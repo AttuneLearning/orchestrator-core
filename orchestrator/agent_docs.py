@@ -127,13 +127,13 @@ manual edits.
 2. {sync_step}
 3. `mcp__orchestrator__my_queue(agent_id={agent_id})` — your assigned in-progress issues **and** your unread inbound messages (answers to questions you asked, cross-team requests). Act ONLY on your gate(s): **{owned_gates}** (an assigned issue at a different gate is not yours — leave it). Handle messages too: reply via `comms_send` where a request needs one, then `mark_read(message_id)`. (Use `my_queue`, not bare `list_my_work` — the latter hides comms.)
 4. `mcp__orchestrator__adr_for_issue(<issue id>)` — the ADRs that govern THIS issue (scoped to it, not the whole catalog; honor every returned rule — a gate review cites these ids). You cannot create/approve ADRs; `adr_suggest(...)` a genuinely reusable new decision to the orch-manager.
-5. Process your assigned issues **one at a time** (do NOT batch-claim and run silently). For each: {work_step}
+5. {parallelism_note} {work_step}
 6. **Heartbeat WHILE you work — this is mandatory, not optional.** Call `mcp__orchestrator__heartbeat(agent_id={agent_id})` at the start of every issue and **again at least every ~2 minutes during any long-running step** (test suite, build, e2e). A worker that goes silent past the stale window is treated as dead: its issue is reclaimed mid-run and, after a few reclaims, quarantined (off_rails). Frequent heartbeats are what keep your work yours.
 7. When the queue is empty, obey `next_poll_seconds` (loop enabled → keep polling at that cadence and pick up newly-assigned work; disabled → slow-poll, never fully stop).
 
 ### "Poll for work" = run the Loop above, in full
 When you are asked to **poll**, **poll for work**, **check for work**, or **do a cycle** — whether by the automated loop or a human typing it manually — that phrase means: execute this Loop once from step 1 (`heartbeat` → `my_queue` → …). **Do the actual work step (step 5 — for you: {owned_desc}) BEFORE any `report_work`/`gate_decision`.** Never skip straight to reporting a result on a nudge: reporting an outcome you did not actually produce (e.g. calling `gate_decision` without running the verify/implement step) is a defect. Only after `my_queue` shows nothing actionable — no issue at your gate, no message needing a reply — print `NO WORK`.
-
+{tier_note}
 ## Your contract (exact inputs → exact outputs)
 
 **You get** (per issue, over MCP): the issue spec (`list_my_work`), its governing
@@ -178,21 +178,52 @@ _CONTRACT_OUTPUTS = {
 }
 
 
+# Step-5 "parallelism" clause. Default = one issue at a time, no per-issue subagents
+# (mid/remedial tiers, and every QA/lead role). The high tier lifts the per-issue
+# restriction for DEV workers: a high-tier issue is a cohesive multi-file slice a
+# capable owner may fan out INTERNALLY.
+_PARALLELISM_DEFAULT = ("Process your assigned issues **one at a time** (do NOT "
+                        "batch-claim and run silently, and do NOT spawn parallel "
+                        "subagents on a single issue). For each:")
+_PARALLELISM_INTERNAL = ("Process your assigned issues **one at a time** across issues "
+                         "(do NOT batch-claim). This project runs at the **high** "
+                         "decomposition tier — an issue is a cohesive multi-file slice, "
+                         "so you MAY parallelize WITHIN a single issue by delegating "
+                         "focused subagents (e.g. one per file/endpoint in the slice) "
+                         "and integrating their output BEFORE you commit. For each:")
+# Remedial-tier mid-run advisory note (added to the loop for every role on that tier).
+_TIER_NOTE_MIDRUN = ("\n> **Mid-run checks (remedial tier):** the engine samples your "
+                     "in-progress issues for direction/drift and may post a "
+                     "`drift_advisory`. That is a course-correction hint, NOT a stop "
+                     "order — keep making forward progress unless the issue is actually "
+                     "moved to `off_rails`.\n")
+
+
 def render_agent_doc(*, vendor: str, team: str, function: str, agent_id: int,
-                     rules: list[dict[str, Any]]) -> str:
-    """Render one vendor's instruction file from the protocol template + rules."""
+                     rules: list[dict[str, Any]],
+                     internal_parallelism: bool = False,
+                     midrun_checks: bool = False) -> str:
+    """Render one vendor's instruction file from the protocol template + rules.
+
+    `internal_parallelism` / `midrun_checks` come from the project's decomposition
+    tier (orchestrator.decomposition): high lifts the per-issue subagent ban for dev
+    workers; remedial adds a mid-run drift-advisory note. Both default off (mid tier)."""
     owned_gates, owned_desc = _OWNED.get(function, ("(none)", "—"))
     work_step = _WORK_STEP.get(function, "do your gate's work, then report_work + gate_decision.")
     sync_step = _SYNC_STEP.get(function, _SYNC_STEP["dev"])
     boundary_extra = _BOUNDARY.get(function, "Keep changes minimal and in-lane.")
     if function == "dev" and team in _LANE_BOUNDARY:
         boundary_extra = f"{boundary_extra}\n- {_LANE_BOUNDARY[team]}"
+    parallelism_note = _PARALLELISM_INTERNAL if (internal_parallelism and function == "dev") \
+        else _PARALLELISM_DEFAULT
+    tier_note = _TIER_NOTE_MIDRUN if midrun_checks else ""
     rules_block = adr_rules.format_rules_block(rules) or \
         "## Applicable rules (from the orchestrator SoT)\n\n_(no accepted ADRs apply yet)_"
     return _TEMPLATE.format(
         header=GENERATED_HEADER, team=team, function=function, agent_id=agent_id,
         bootstrap=_BOOTSTRAP.get(vendor, ""), owned_gates=owned_gates,
         owned_desc=owned_desc, work_step=work_step, sync_step=sync_step,
+        parallelism_note=parallelism_note, tier_note=tier_note,
         boundary_extra=boundary_extra, rules_block=rules_block,
         contract_outputs=_CONTRACT_OUTPUTS.get(
             function, "your gate's work, reported via report_work + gate_decision."),
@@ -204,9 +235,12 @@ def filename_for(vendor: str) -> str:
 
 
 def render_for(pool, roster, team: str, function: str, agent_id: int,
-               vendors=("claude", "codex", "qwen")) -> dict[str, str]:
+               vendors=("claude", "codex", "qwen"),
+               internal_parallelism: bool = False,
+               midrun_checks: bool = False) -> dict[str, str]:
     """Fetch the applicable accepted ADRs for (team, its repos) and render each
-    vendor's file. Returns {filename: content}. (The thin DB-backed entry point.)"""
+    vendor's file. Returns {filename: content}. (The thin DB-backed entry point.)
+    `internal_parallelism`/`midrun_checks` come from the project's decomposition tier."""
     from . import repository as repo
     accepted = repo.list_adrs(pool, status="accepted")
     t = roster.resolve(team)
@@ -216,7 +250,9 @@ def render_for(pool, roster, team: str, function: str, agent_id: int,
     for v in vendors:
         out[filename_for(v)] = render_agent_doc(vendor=v, team=team,
                                                 function=function, agent_id=agent_id,
-                                                rules=applicable)
+                                                rules=applicable,
+                                                internal_parallelism=internal_parallelism,
+                                                midrun_checks=midrun_checks)
     return out
 
 

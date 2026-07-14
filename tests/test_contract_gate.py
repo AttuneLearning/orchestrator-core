@@ -144,7 +144,7 @@ def test_fail_open_when_reasoner_lacks_capability(settings, pool):
 
     class _Bare:
         """An older reasoner with no extract_endpoint_deps capability."""
-        def decompose_goal(self, goal, n, rules=""): return []
+        def decompose_goal(self, goal, n, rules="", sizing=""): return []
         def plan_issue(self, issue, rules=""): return ""
         def gate_review(self, *a, **k): return GateReview(passed=True)
         def score_drift(self, *a, **k): return 1.0

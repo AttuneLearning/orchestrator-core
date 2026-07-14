@@ -29,7 +29,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import repository as repo
+from . import decomposition, repository as repo
 from .config import REPO_ROOT, load_settings
 from .db import close_pool, get_pool, migrate
 from .roster import load_roster
@@ -198,7 +198,10 @@ def _cmd_render_agent_docs(args, settings) -> int:
 
     pool = get_pool(settings)
     roster = load_roster(settings.roster)
-    docs = agent_docs.render_for(pool, roster, args.team, args.function, args.agent_id)
+    tier = decomposition.resolve_tier(settings.decomposition_tier)
+    docs = agent_docs.render_for(pool, roster, args.team, args.function, args.agent_id,
+                                 internal_parallelism=tier.internal_parallelism,
+                                 midrun_checks=tier.midrun_checks)
     out = pathlib.Path(args.out_dir)
     if args.check:
         drifted = [f for f, content in docs.items()
@@ -689,11 +692,17 @@ def _cmd_setup_project(args, settings) -> int:
     project = args.project or getattr(args, "instance", None) or workspace.name
     worktree_prefix = getattr(args, "worktree_prefix", "wt-")
     humantest_worktree = getattr(args, "humantest_worktree", "humantest-wt")
+    # Bootstrap decomposition tier: scales granularity/parallelism/drift-checks to
+    # the fleet's models. Normalized through resolve_tier so an unknown value can't
+    # scaffold a broken project.
+    tier = decomposition.resolve_tier(
+        getattr(args, "decomposition_tier", None) or decomposition.DEFAULT_TIER)
     replacements = {
         "__WORKSPACE_ROOT__": str(workspace),
         "__ORCH_PATH__": str(Path(args.orchestrator_path).expanduser().resolve()),
         "__PROJECT_NAME__": project,
         "__DASHBOARD_URL__": args.dashboard_url,
+        "__DECOMPOSITION_TIER__": tier.name,
     }
     src = _launcher_template_root(args.orchestrator_path)
     try:
@@ -710,6 +719,7 @@ def _cmd_setup_project(args, settings) -> int:
         print(f"would install {len(planned_launchers)} launcher file(s)")
         for _, dest in planned_launchers:
             print(f"  {dest}")
+        _print_tier_guidance(tier, project)
         return 0
 
     workspace.mkdir(parents=True, exist_ok=True)
@@ -717,8 +727,23 @@ def _cmd_setup_project(args, settings) -> int:
         path.mkdir(parents=True, exist_ok=True)
         print("created", path)
     _write_launcher_plan(planned_launchers, replacements)
+    _print_tier_guidance(tier, project)
     _offer_watchdog(workspace)
     return 0
+
+
+def _print_tier_guidance(tier, project: str) -> None:
+    """Report the chosen decomposition tier and print the authoritative config line
+    to pin it per-project. The launcher env carries DECOMPOSITION_TIER for the
+    scaffolded workspace; adding it to the instance's `settings:` block makes it the
+    coordinator's source of truth (config precedence: env > this yaml > tier default)."""
+    print(f"\ndecomposition tier: {tier.name}"
+          f"  (internal_parallelism={tier.internal_parallelism}, "
+          f"midrun_checks={tier.midrun_checks})")
+    print("To make it authoritative for the coordinator, add to the instance's "
+          "settings block in config/instances.yaml:")
+    print(f"  instances:\n    {project}:\n      settings:\n"
+          f"        decomposition_tier: {tier.name}")
 
 
 def _offer_watchdog(workspace: Path) -> None:
@@ -949,6 +974,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="prefix for child worker worktree dirs (default: wt-)")
     sp.add_argument("--humantest-worktree", default="humantest-wt",
                     help="worktree dir used for human-test consolidation")
+    sp.add_argument("--decomposition-tier", default=decomposition.DEFAULT_TIER,
+                    choices=decomposition.tier_names(),
+                    help="capability tier that scales issue granularity, per-issue "
+                         "internal parallelism, and mid-run drift checks to the fleet's "
+                         f"models (default: {decomposition.DEFAULT_TIER}). high=coarse "
+                         "feature-slices + internal parallelism; mid=one deliverable "
+                         "per issue; remedial=smallest steps + mid-run drift advisories.")
     sp.add_argument("--force", action="store_true",
                     help="overwrite existing launcher files")
     sp.add_argument("--dry-run", action="store_true",

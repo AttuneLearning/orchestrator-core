@@ -84,6 +84,36 @@ def test_routing_violations_pure():
 
 
 # --------------------------------------------------------------------------- #
+# Pure: decomposition tiers (bootstrap capability presets)
+# --------------------------------------------------------------------------- #
+
+def test_tier_names_are_the_three_levels():
+    assert set(dec.tier_names()) == {dec.HIGH, dec.MID, dec.REMEDIAL}
+    assert dec.DEFAULT_TIER == dec.MID
+
+
+def test_resolve_tier_falls_back_to_default_on_unknown():
+    assert dec.resolve_tier("high").name == dec.HIGH
+    assert dec.resolve_tier("REMEDIAL").name == dec.REMEDIAL   # case-insensitive
+    assert dec.resolve_tier("  mid ").name == dec.MID          # trimmed
+    assert dec.resolve_tier("nonsense").name == dec.MID        # unknown -> default
+    assert dec.resolve_tier(None).name == dec.MID              # empty -> default
+
+
+def test_tier_behavior_flags_scale_by_capability():
+    high, mid, rem = (dec.resolve_tier(t) for t in (dec.HIGH, dec.MID, dec.REMEDIAL))
+    # Only the high tier lifts the per-issue internal-parallelism ban.
+    assert high.internal_parallelism and not mid.internal_parallelism \
+        and not rem.internal_parallelism
+    # Only the remedial tier runs mid-run drift checks.
+    assert rem.midrun_checks and not high.midrun_checks and not mid.midrun_checks
+    # Sizing widens with capability: high spans several files, remedial is one file.
+    assert "cohesive" in high.sizing.lower()
+    assert "one deliverable" in mid.sizing.lower()
+    assert "smallest" in rem.sizing.lower()
+
+
+# --------------------------------------------------------------------------- #
 # Pure: state-machine cancel
 # --------------------------------------------------------------------------- #
 
@@ -105,7 +135,7 @@ class _MisroutingReasoner(StubReasoner):
     """Returns the impl issue tagged with the WRONG team (backend) — the engine
     must override it with the pipeline's team."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "", sizing: str = "") -> list[IssueSpec]:
         return [IssueSpec(title=f"Implement: {goal.title}",
                           description=goal.description, team="backend")]
 
@@ -113,7 +143,7 @@ class _MisroutingReasoner(StubReasoner):
 class _NoisyReasoner(StubReasoner):
     """Emits an impl issue plus QA-gate duplicates the filter must drop."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "", sizing: str = "") -> list[IssueSpec]:
         return [IssueSpec(title=f"Implement: {goal.title}"),
                 IssueSpec(title="Run unit tests"),
                 IssueSpec(title="Typecheck"),
@@ -123,7 +153,7 @@ class _NoisyReasoner(StubReasoner):
 class _UnknownTeamReasoner(StubReasoner):
     """Pipeline has no team; reasoner emits an unknown team → routing violation."""
 
-    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "") -> list[IssueSpec]:
+    def decompose_goal(self, goal: Goal, max_subissues: int, rules: str = "", sizing: str = "") -> list[IssueSpec]:
         return [IssueSpec(title=f"Implement: {goal.title}", team="nonsense")]
 
 

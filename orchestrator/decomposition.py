@@ -18,9 +18,114 @@ The engine imports these; all DB access stays in the engine/repository.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 SINGLE = "single"
 FULL = "full"
+
+
+# --------------------------------------------------------------------------- #
+# Decomposition tiers — capability-scaled bootstrap presets
+#
+# A project is bootstrapped at ONE tier, matched to the reliability/bandwidth of
+# the fleet's models (set via `setup-project --decomposition-tier` or the
+# per-project `decomposition_tier:` setting). The tier scales three things:
+#
+#   * SIZING           — the granularity clause fed to the reasoner's decompose
+#                        prompt (coarse feature-slices → single deliverables →
+#                        the smallest safely-shippable step).
+#   * internal_parallelism — whether ONE issue may be worked by internally
+#                        parallel subagents (only worthwhile for high-capability
+#                        owners driving a larger slice; off everywhere else so a
+#                        weaker worker keeps a single, auditable focus).
+#   * midrun_checks    — whether the engine runs mid-run direction/drift advisories
+#                        while an issue is in progress (for low-reliability fleets
+#                        that drift; advisory only — never blocks forward progress).
+#
+# Each tier also carries THRESHOLD OVERRIDES. These are layered UNDER any explicit
+# per-project threshold override (explicit config always wins): a bootstrapped
+# project with no thresholds set inherits the tier's granularity caps; a project
+# that pins its own thresholds keeps them.
+# --------------------------------------------------------------------------- #
+
+HIGH = "high"
+MID = "mid"
+REMEDIAL = "remedial"
+DEFAULT_TIER = MID
+
+
+@dataclass(frozen=True)
+class TierProfile:
+    name: str
+    sizing: str
+    internal_parallelism: bool
+    midrun_checks: bool
+    thresholds: dict = field(default_factory=dict)
+
+
+# The MID sizing clause is verbatim the historical hardcoded prompt text, so the
+# default tier reproduces prior behavior exactly.
+_MID_SIZING = (
+    "ONE deliverable (one endpoint OR one component OR one contract, ~1-3 files); "
+    "each description names the exact target file(s) (matching the conventions) and "
+    "the acceptance commands"
+)
+
+_TIERS: dict[str, TierProfile] = {
+    HIGH: TierProfile(
+        name=HIGH,
+        sizing=(
+            "a COHESIVE feature slice — it may span several closely-related "
+            "endpoints/components/contracts (~3-8 files), because a high-capability "
+            "owner can drive it with internally parallel subagents; keep each slice "
+            "independently shippable and single-team, and name the target file(s) and "
+            "acceptance commands"
+        ),
+        internal_parallelism=True,
+        midrun_checks=False,
+        thresholds={"max_subissues": 6, "max_children_per_parent": 4},
+    ),
+    MID: TierProfile(
+        name=MID,
+        sizing=_MID_SIZING,
+        internal_parallelism=False,
+        midrun_checks=False,
+        thresholds={"max_subissues": 8, "max_children_per_parent": 5},
+    ),
+    REMEDIAL: TierProfile(
+        name=REMEDIAL,
+        sizing=(
+            "the SMALLEST safely-shippable step — ONE function/route/file (~1 file). "
+            "Prefer more, smaller issues over any issue with multiple parts, so a "
+            "low-reliability worker cannot drift across a wide surface; name the exact "
+            "target file and the acceptance commands"
+        ),
+        internal_parallelism=False,
+        midrun_checks=True,
+        thresholds={
+            "max_subissues": 10,
+            "max_children_per_parent": 6,
+            "max_issues_per_goal": 40,
+            "max_depth": 4,
+            # One extra attempt before failing a low-reliability worker (forward
+            # progress). Quarantine drift_threshold is deliberately NOT raised —
+            # remedial surfaces drift via advisories, it does not halt more eagerly.
+            "retry_cap": 4,
+        },
+    ),
+}
+
+
+def tier_names() -> list[str]:
+    """The valid decomposition-tier names (bootstrap choices)."""
+    return list(_TIERS)
+
+
+def resolve_tier(name: str | None) -> TierProfile:
+    """Resolve a tier name to its profile. Unknown/empty falls back to DEFAULT_TIER,
+    so a mis-set project degrades to standard one-deliverable decomposition rather
+    than failing to boot."""
+    return _TIERS.get((name or "").strip().lower(), _TIERS[DEFAULT_TIER])
 
 # A goal is "simple" when its text reads as a dependency bump / config tweak /
 # rename rather than a new feature or subsystem. Such goals take the fast-path:

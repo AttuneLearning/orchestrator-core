@@ -5,7 +5,7 @@ placeholder output and needs no network, so the full pipeline is verifiable
 in-cloud without any external endpoint. `openai` targets any OpenAI-compatible
 endpoint via base_url; `anthropic` reuses the Anthropic SDK.
 
-NOTE: the Qwen box 10.100.90.132:8081 is a private LAN IP, unreachable from the
+NOTE: the Qwen box 10.100.90.132:8083 is a private LAN IP, unreachable from the
 Anthropic cloud env. Point `openai` at a publicly reachable endpoint (added to
 the environment's Custom allowed domains) or run via a teleported local session.
 """

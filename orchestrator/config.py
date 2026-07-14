@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml
 
+from . import decomposition
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
@@ -144,6 +146,10 @@ class Settings:
     contract_gate_enabled: bool = False
 
     default_pipeline: str = "pipeline-1"
+    # Decomposition tier (bootstrap capability level): high | mid | remedial.
+    # Scales issue granularity, per-issue internal parallelism, and mid-run drift
+    # checks to the fleet's model capability. See orchestrator.decomposition.
+    decomposition_tier: str = decomposition.DEFAULT_TIER
     thresholds: Thresholds = field(default_factory=Thresholds)
 
     embed_provider: str = "stub"           # stub | openai | none
@@ -262,15 +268,27 @@ def load_settings(instance: str | None = None) -> Settings:
     inst_db = _resolve_instance(instance, s_yaml) if instance else None
     t_yaml = s_yaml.get("thresholds", {}) or {}
 
+    # Decomposition tier (bootstrap capability level). Resolved before thresholds so
+    # its granularity caps can seed the defaults. Precedence per field:
+    #   explicit env  >  explicit thresholds: yaml  >  tier preset  >  hardcoded default.
+    # `pick` is not defined yet here, so read env/yaml directly.
+    tier_name = os.getenv("DECOMPOSITION_TIER") or s_yaml.get("decomposition_tier") \
+        or decomposition.DEFAULT_TIER
+    tier = decomposition.resolve_tier(str(tier_name))
+    tt = tier.thresholds
+
+    def _tier_default(field_name: str, hardcoded):
+        return tt.get(field_name, hardcoded)
+
     thresholds = Thresholds(
-        drift_threshold=_env_float("DRIFT_THRESHOLD", t_yaml.get("drift_threshold", 0.5)),
-        retry_cap=_env_int("RETRY_CAP", t_yaml.get("retry_cap", 3)),
-        escalate_to_senior_at=_env_int("ESCALATE_TO_SENIOR_AT", t_yaml.get("escalate_to_senior_at", 2)),
-        step_budget=_env_int("STEP_BUDGET", t_yaml.get("step_budget", 25)),
-        max_depth=_env_int("MAX_DEPTH", t_yaml.get("max_depth", 3)),
-        max_subissues=_env_int("MAX_SUBISSUES", t_yaml.get("max_subissues", 8)),
-        max_issues_per_goal=_env_int("MAX_ISSUES_PER_GOAL", t_yaml.get("max_issues_per_goal", 30)),
-        max_children_per_parent=_env_int("MAX_CHILDREN_PER_PARENT", t_yaml.get("max_children_per_parent", 5)),
+        drift_threshold=_env_float("DRIFT_THRESHOLD", t_yaml.get("drift_threshold", _tier_default("drift_threshold", 0.5))),
+        retry_cap=_env_int("RETRY_CAP", t_yaml.get("retry_cap", _tier_default("retry_cap", 3))),
+        escalate_to_senior_at=_env_int("ESCALATE_TO_SENIOR_AT", t_yaml.get("escalate_to_senior_at", _tier_default("escalate_to_senior_at", 2))),
+        step_budget=_env_int("STEP_BUDGET", t_yaml.get("step_budget", _tier_default("step_budget", 25))),
+        max_depth=_env_int("MAX_DEPTH", t_yaml.get("max_depth", _tier_default("max_depth", 3))),
+        max_subissues=_env_int("MAX_SUBISSUES", t_yaml.get("max_subissues", _tier_default("max_subissues", 8))),
+        max_issues_per_goal=_env_int("MAX_ISSUES_PER_GOAL", t_yaml.get("max_issues_per_goal", _tier_default("max_issues_per_goal", 30))),
+        max_children_per_parent=_env_int("MAX_CHILDREN_PER_PARENT", t_yaml.get("max_children_per_parent", _tier_default("max_children_per_parent", 5))),
         agent_stale_seconds=_env_int("AGENT_STALE_SECONDS", t_yaml.get("agent_stale_seconds", 300)),
         reclaim_cap=_env_int("RECLAIM_CAP", t_yaml.get("reclaim_cap", 3)),
     )
@@ -369,6 +387,7 @@ def load_settings(instance: str | None = None) -> Settings:
         docs_path=pick("DOCS_PATH", "docs_path", ""),
         contract_gate_enabled=pick_bool("CONTRACT_GATE_ENABLED", "contract_gate_enabled", False),
         default_pipeline=pick("DEFAULT_PIPELINE", "default_pipeline", "pipeline-1"),
+        decomposition_tier=tier.name,
         thresholds=thresholds,
         pipelines=_yaml(CONFIG_DIR / "pipelines.yaml"),
         roster=_yaml(REPO_ROOT / roster_file),
