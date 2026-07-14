@@ -536,6 +536,14 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         if _git(wt, "rev-parse", "--verify", "--quiet", branch).returncode != 0:
             raise ValueError(f"issue {issue_id}: branch '{branch}' does not exist — "
                              f"nothing to verify")
+        # The verify worktree is a throwaway checkout target (it never holds real
+        # work — commits live on issue-<id>). Discard any residue from a prior or
+        # interrupted verify run BEFORE switching branches: a dirty tree makes
+        # `git checkout -B` abort with "local changes would be overwritten", which
+        # otherwise permanently wedges every subsequent verify for the team until
+        # the worktree is cleaned by hand. reset+clean (no -x: keep node_modules).
+        _git(wt, "reset", "--hard")
+        _git(wt, "clean", "-fd")
         co = _git(wt, "checkout", "-B", verify_branch, branch)
         if co.returncode != 0:
             raise ValueError(f"verify checkout failed: {co.stderr[:300]}")
