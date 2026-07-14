@@ -125,11 +125,14 @@ manual edits.
 ## Loop (each cycle)
 1. `mcp__orchestrator__heartbeat(agent_id={agent_id})` — liveness + cadence (`next_poll_seconds`).
 2. {sync_step}
-3. `mcp__orchestrator__list_my_work(agent_id={agent_id})` — your assigned in-progress issues. Act ONLY on your gate(s): **{owned_gates}**. (If an assigned issue is at a different gate, it's not yours to work — leave it.)
+3. `mcp__orchestrator__my_queue(agent_id={agent_id})` — your assigned in-progress issues **and** your unread inbound messages (answers to questions you asked, cross-team requests). Act ONLY on your gate(s): **{owned_gates}** (an assigned issue at a different gate is not yours — leave it). Handle messages too: reply via `comms_send` where a request needs one, then `mark_read(message_id)`. (Use `my_queue`, not bare `list_my_work` — the latter hides comms.)
 4. `mcp__orchestrator__adr_for_issue(<issue id>)` — the ADRs that govern THIS issue (scoped to it, not the whole catalog; honor every returned rule — a gate review cites these ids). You cannot create/approve ADRs; `adr_suggest(...)` a genuinely reusable new decision to the orch-manager.
 5. Process your assigned issues **one at a time** (do NOT batch-claim and run silently). For each: {work_step}
 6. **Heartbeat WHILE you work — this is mandatory, not optional.** Call `mcp__orchestrator__heartbeat(agent_id={agent_id})` at the start of every issue and **again at least every ~2 minutes during any long-running step** (test suite, build, e2e). A worker that goes silent past the stale window is treated as dead: its issue is reclaimed mid-run and, after a few reclaims, quarantined (off_rails). Frequent heartbeats are what keep your work yours.
 7. When the queue is empty, obey `next_poll_seconds` (loop enabled → keep polling at that cadence and pick up newly-assigned work; disabled → slow-poll, never fully stop).
+
+### "Poll for work" = run the Loop above, in full
+When you are asked to **poll**, **poll for work**, **check for work**, or **do a cycle** — whether by the automated loop or a human typing it manually — that phrase means: execute this Loop once from step 1 (`heartbeat` → `my_queue` → …). **Do the actual work step (step 5 — for you: {owned_desc}) BEFORE any `report_work`/`gate_decision`.** Never skip straight to reporting a result on a nudge: reporting an outcome you did not actually produce (e.g. calling `gate_decision` without running the verify/implement step) is a defect. Only after `my_queue` shows nothing actionable — no issue at your gate, no message needing a reply — print `NO WORK`.
 
 ## Your contract (exact inputs → exact outputs)
 
