@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 WS="$(cd "$(dirname "$0")" && pwd)"
-# Parse launch flags anywhere on the line (not just before the runtime); the
-# runtime is the first bare runtime name, everything else is a runtime arg.
-LAUNCH_FLAGS=()
-PASSTHRU=()
-RUNTIME=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --dry-run|--no-enable-loop|--interactive|--non-interactive) LAUNCH_FLAGS+=("$1"); shift ;;
-    -m|--model) LAUNCH_FLAGS+=("$1" "${2:?-m/--model requires a value}"); shift 2 ;;
-    --model=*) LAUNCH_FLAGS+=("$1"); shift ;;
-    -h|--help) exec "$WS/start-agent.sh" --help ;;
-    claude|codex|opencode|qwen|qwen-code)
-      if [ -z "$RUNTIME" ]; then RUNTIME="$1"; else PASSTHRU+=("$1"); fi
-      shift ;;
-    *) PASSTHRU+=("$1"); shift ;;
-  esac
-done
+source "$WS/agent-launchers/lib.sh"
+
+usage() {
+  cat <<EOF
+usage: ./start-senior-dev.sh [runtime] [flags] [runtime args...]
+
+runtime: claude | codex | opencode | qwen | qwen-code   (default: claude)
+flags (anywhere on the line):
+  --dry-run  --no-enable-loop  --interactive  --non-interactive
+  -m/--model MODEL  -h/--help
+EOF
+}
+
+parse_launch_args "$@"
+if [ "$WANT_HELP" = 1 ]; then
+  usage
+  exit 0
+fi
 exec "$WS/start-agent.sh" "${LAUNCH_FLAGS[@]}" senior-dev "${RUNTIME:-claude}" "${PASSTHRU[@]}"

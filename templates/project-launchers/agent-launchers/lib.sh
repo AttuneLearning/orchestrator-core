@@ -1,5 +1,67 @@
 #!/usr/bin/env bash
 
+# ---------------------------------------------------------------------------
+# Canonical launcher vocabulary — the SINGLE definition of the runtime enum,
+# the team enum, and the launch-flag parser. Every start-*.sh sources this so
+# all entry points accept the same flags, in any position, with the same
+# spellings.
+# ---------------------------------------------------------------------------
+
+KNOWN_RUNTIMES="claude codex opencode qwen qwen-code"
+
+is_known_runtime() {
+  case " $KNOWN_RUNTIMES " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# resolve_team <backend|frontend|be|fe> — echoes the canonical team name.
+resolve_team() {
+  case "$1" in
+    backend|be) echo backend ;;
+    frontend|fe) echo frontend ;;
+    wt-*) echo "team must be backend or frontend, not a worktree name ('$1')" >&2; return 1 ;;
+    *) echo "unknown team: $1 (expected backend|frontend)" >&2; return 1 ;;
+  esac
+}
+
+# parse_launch_args [args...] — the shared flag parser. Flags are accepted
+# anywhere on the line. Sets:
+#   LAUNCH_FLAGS  flags to forward to start-agent.sh (wrappers)
+#   RUNTIME       first bare runtime name on the line, or "" (see KNOWN_RUNTIMES)
+#   PASSTHRU      every other bare argument, forwarded to the runtime adapter
+#   WANT_HELP     1 when -h/--help was given
+#   DRY_RUN, MODEL_SEL, AGENT_MODE, AGENT_ENABLE_LOOP  semantic values for the
+#     terminal consumer (start-agent.sh); mode/loop are only set when the flag
+#     appears, so environment defaults still apply.
+parse_launch_args() {
+  LAUNCH_FLAGS=()
+  PASSTHRU=()
+  RUNTIME=""
+  WANT_HELP=0
+  DRY_RUN="${DRY_RUN:-0}"
+  MODEL_SEL="${MODEL_SEL:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1; LAUNCH_FLAGS+=("$1"); shift ;;
+      --no-enable-loop) AGENT_ENABLE_LOOP=0; LAUNCH_FLAGS+=("$1"); shift ;;
+      --interactive) AGENT_MODE=interactive; LAUNCH_FLAGS+=("$1"); shift ;;
+      --non-interactive) AGENT_MODE=non-interactive; LAUNCH_FLAGS+=("$1"); shift ;;
+      -m|--model) MODEL_SEL="${2:?-m/--model requires a value}"; LAUNCH_FLAGS+=("$1" "$2"); shift 2 ;;
+      --model=*) MODEL_SEL="${1#--model=}"; LAUNCH_FLAGS+=("$1"); shift ;;
+      -h|--help) WANT_HELP=1; shift ;;
+      *)
+        if [ -z "$RUNTIME" ] && is_known_runtime "$1"; then
+          RUNTIME="$1"
+        else
+          PASSTHRU+=("$1")
+        fi
+        shift ;;
+    esac
+  done
+}
+
 render_prompt() {
   local prompt_file="$1"
   if [ ! -f "$prompt_file" ]; then
@@ -63,7 +125,7 @@ EOF
 # ---------------------------------------------------------------------------
 # Shared runtime config: the SINGLE definition of the open-source model menu
 # and the orchestrator MCP wiring. Every opencode launcher (runtime adapter
-# and standalone start-opencode-*.sh) calls opencode_write_config so the model
+# and standalone start-opencode.sh) calls opencode_write_config so the model
 # menu + MCP are identical everywhere. The MCP block is included only when the
 # workspace was installed through the orchestrator config (ORCH + PROJECT set,
 # from agent-launchers/orchestrator.env), satisfying "MCP available to any

@@ -98,22 +98,37 @@ resolve_role() {
       DEFAULT_RUNTIME="opencode"
       LOOP_AGENT=1
       ;;
-    senior|senior-dev|escalation)
+    senior|senior-dev|sr-dev|escalation)
       ROLE="senior-dev"
       AGENT_ID=5
       TEAM="senior"
       FUNCTION="dev"
       GATE="implementation"
       APP="apps/api apps/web packages/contracts"
-      WORKTREE="$WORKSPACE_ROOT/wt-seniordev"
+      WORKTREE="$WORKSPACE_ROOT/wt-senior-dev"
       PROMPT_NAME="senior-dev"
       DEFAULT_RUNTIME="claude"
       LOOP_AGENT=1
       IDLE_STOP=2
       ;;
+    senior-qa|senior-qa-worker|sr-qa)
+      # Cross-team QA: the 'senior' team is exempt from the claim team-guard, so
+      # agent 6 can verify pre-assigned issues in any lane (apps/api + apps/web).
+      ROLE="senior-qa-worker"
+      AGENT_ID=6
+      TEAM="senior"
+      FUNCTION="qa"
+      GATE="verification"
+      APP="apps/api apps/web packages/contracts"
+      WORKTREE="$WORKSPACE_ROOT/wt-senior-qa"
+      PROMPT_NAME="qa-worker"
+      DEFAULT_RUNTIME="opencode"
+      LOOP_AGENT=1
+      IDLE_STOP=2
+      ;;
     *)
       echo "unknown role: $ROLE_INPUT" >&2
-      echo "known roles: orch-manager, backend-dev-manager, frontend-dev-manager, backend-dev-worker, frontend-dev-worker, backend-qa-worker, frontend-qa-worker, senior-dev" >&2
+      echo "known roles: orch-manager, backend-dev-manager, frontend-dev-manager, backend-dev-worker, frontend-dev-worker, backend-qa-worker, frontend-qa-worker, senior-dev, senior-qa" >&2
       return 1
       ;;
   esac

@@ -93,31 +93,37 @@ def test_setup_project_writes_launchers_and_workspace_dirs(settings, tmp_path):
 
     launcher = workspace / "agent-launchers" / "orchestrator.env"
     startup = workspace / "ORCH_MANAGER_STARTUP.md"
-    qwen_worker = workspace / "start-qwen-code-worker.sh"
-    qwen_orch = workspace / "start-qwen-orch-manager.sh"
-    qwen_runtime = workspace / "agent-launchers" / "runtimes" / "qwen-code.sh"
-    opencode_worker = workspace / "start-opencode-worker.sh"
-    opencode_orch = workspace / "start-opencode-orch-manager.sh"
-    opencode_runtime = workspace / "agent-launchers" / "runtimes" / "opencode.sh"
+    wrappers = [
+        workspace / "start-orch-manager.sh",
+        workspace / "start-dev-manager.sh",
+        workspace / "start-dev-worker.sh",
+        workspace / "start-qa-worker.sh",
+        workspace / "start-senior-dev.sh",
+        workspace / "start-senior-qa.sh",
+    ]
+    runtimes = [
+        workspace / "agent-launchers" / "runtimes" / name
+        for name in ("claude.sh", "codex.sh", "opencode.sh", "qwen.sh", "qwen-code.sh")
+    ]
     assert launcher.is_file()
     assert startup.is_file()
-    assert qwen_worker.is_file()
-    assert qwen_orch.is_file()
-    assert qwen_runtime.is_file()
-    assert opencode_worker.is_file()
-    assert opencode_orch.is_file()
-    assert opencode_runtime.is_file()
     assert "__WORKSPACE_ROOT__" not in launcher.read_text()
     assert str(workspace) in launcher.read_text()
     assert "tendcharting" in startup.read_text()
     assert not any(part.name == "__pycache__" for part in workspace.rglob("*"))
     assert os.access(workspace / "start-agent.sh", os.X_OK)
-    assert os.access(qwen_worker, os.X_OK)
-    assert os.access(qwen_orch, os.X_OK)
-    assert os.access(qwen_runtime, os.X_OK)
-    assert os.access(opencode_worker, os.X_OK)
-    assert os.access(opencode_orch, os.X_OK)
-    assert os.access(opencode_runtime, os.X_OK)
+    for script in wrappers + runtimes:
+        assert os.access(script, os.X_OK), script
+    # Legacy wrappers were consolidated into start-agent.sh + the role wrappers.
+    for legacy in (
+        "start-claude-dev.sh",
+        "start-qa.sh",
+        "start-opencode-worker.sh",
+        "start-qwen-code-worker.sh",
+        "start-opencode-orch-manager.sh",
+        "start-qwen-orch-manager.sh",
+    ):
+        assert not (workspace / legacy).exists(), legacy
 
 
 def test_opencode_runtime_builds_config_and_command(settings, tmp_path, monkeypatch):

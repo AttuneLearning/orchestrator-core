@@ -4,9 +4,13 @@ set -euo pipefail
 WORKSPACE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 LAUNCHER_DIR="$WORKSPACE_ROOT/agent-launchers"
 
+source "$LAUNCHER_DIR/orchestrator.env"
+source "$LAUNCHER_DIR/roles.sh"
+source "$LAUNCHER_DIR/lib.sh"
+
 usage() {
   cat <<EOF
-usage: ./start-agent.sh [--dry-run] [--no-enable-loop] [--interactive|--non-interactive] [-m MODEL] <role> [runtime] [runtime args...]
+usage: ./start-agent.sh <role> [runtime] [flags] [runtime args...]
 
 roles:
   orch-manager
@@ -15,54 +19,46 @@ roles:
   backend-qa-worker   | frontend-qa-worker
   senior-dev          | senior-qa
 
-runtimes: claude, codex, opencode, qwen, qwen-code
+runtime: claude | codex | opencode | qwen | qwen-code
+  (default is per-role: managers/senior -> claude, workers -> opencode)
 
-model (-m/--model): shortcut or model string valid for the chosen runtime.
-  omit for the runtime default (claude->opus, codex->gpt-5.4-mini, opencode->glm-5.2)
-  list valid combos: agent-launchers/resolve-model.py --list
-
-mode:
-  default behavior is runtime-specific and backward compatible
-  use --interactive or --non-interactive to override the launcher mode
+flags (accepted anywhere on the line):
+  --dry-run            print the launch plan without starting anything
+  --no-enable-loop     do not enable the dashboard agent loop
+  --interactive        force the runtime's interactive mode
+  --non-interactive    force one-shot/non-interactive mode
+  -m, --model MODEL    shortcut or model string valid for the chosen runtime
+                       (omit for the runtime default: claude->opus,
+                        codex->gpt-5.4-mini, opencode->glm-5.2;
+                        list combos: agent-launchers/resolve-model.py --list)
+  -h, --help           show this help
 EOF
 }
 
-DRY_RUN=0
-MODEL_SEL=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    --no-enable-loop) AGENT_ENABLE_LOOP=0; shift ;;
-    --interactive) AGENT_MODE=interactive; shift ;;
-    --non-interactive) AGENT_MODE=non-interactive; shift ;;
-    -m|--model) MODEL_SEL="${2:?-m/--model requires a value}"; shift 2 ;;
-    --model=*) MODEL_SEL="${1#--model=}"; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) break ;;
-  esac
-done
-
-ROLE_ARG="${1:-}"
-if [ -z "$ROLE_ARG" ]; then
+# Shared parser: flags land in semantic vars (DRY_RUN, MODEL_SEL, AGENT_MODE,
+# AGENT_ENABLE_LOOP), the first bare runtime name lands in RUNTIME, and every
+# other bare token lands in PASSTHRU — the first of which is the role.
+parse_launch_args "$@"
+if [ "$WANT_HELP" = 1 ]; then
+  usage
+  exit 0
+fi
+if [ ${#PASSTHRU[@]} -eq 0 ]; then
   usage >&2
   exit 1
 fi
-shift
-
-source "$LAUNCHER_DIR/orchestrator.env"
-source "$LAUNCHER_DIR/roles.sh"
-source "$LAUNCHER_DIR/lib.sh"
+ROLE_ARG="${PASSTHRU[0]}"
+PASSTHRU=("${PASSTHRU[@]:1}")
 
 resolve_role "$ROLE_ARG"
-RUNTIME="${1:-$DEFAULT_RUNTIME}"
-if [ $# -gt 0 ]; then
-  shift
-fi
 
-case "$RUNTIME" in
-  claude|codex|opencode|qwen|qwen-code) ;;
-  *) echo "unknown runtime: $RUNTIME (expected claude, codex, opencode, qwen, or qwen-code)" >&2; exit 1 ;;
-esac
+# Runtime args are only meaningful after an explicit runtime; a bare token with
+# no runtime named is almost always a typo'd runtime.
+if [ -z "$RUNTIME" ] && [ ${#PASSTHRU[@]} -gt 0 ]; then
+  echo "unknown runtime: ${PASSTHRU[0]} (expected one of: $KNOWN_RUNTIMES)" >&2
+  exit 1
+fi
+RUNTIME="${RUNTIME:-$DEFAULT_RUNTIME}"
 
 # Resolve -m/--model against agent-model.yaml and route to the harness-specific
 # env var. No -m = each harness's default (claude->opus, codex->gpt-5.4-mini,
@@ -117,9 +113,9 @@ if [ "$DRY_RUN" = "1" ]; then
   print_launch_summary
   echo "model_selection=${MODEL_SEL:-'(default)'}"
   echo "adapter=$ADAPTER"
-  echo "extra_args=$*"
+  echo "extra_args=${PASSTHRU[*]}"
   if [ "$RUNTIME" = "codex" ] || [ "$RUNTIME" = "claude" ] || [ "$RUNTIME" = "opencode" ]; then
-    ORCH_LAUNCH_DRY_RUN=1 "$ADAPTER" "$@"
+    ORCH_LAUNCH_DRY_RUN=1 "$ADAPTER" "${PASSTHRU[@]}"
   fi
   exit 0
 fi
@@ -163,4 +159,4 @@ if [ "$RUNTIME" = "claude" ] && [ "${DOC_FN:-}" = "dev" ] \
 fi
 
 enable_agent_loop
-exec "$ADAPTER" "$@"
+exec "$ADAPTER" "${PASSTHRU[@]}"

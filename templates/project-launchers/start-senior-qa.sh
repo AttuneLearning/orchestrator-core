@@ -5,7 +5,7 @@ source "$WS/agent-launchers/lib.sh"
 
 usage() {
   cat <<EOF
-usage: ./start-qa-worker.sh <backend|frontend> [runtime] [flags] [runtime args...]
+usage: ./start-senior-qa.sh [runtime] [flags] [runtime args...]
 
 runtime: claude | codex | opencode | qwen | qwen-code   (default: opencode)
 flags (anywhere on the line):
@@ -14,17 +14,9 @@ flags (anywhere on the line):
 EOF
 }
 
-TEAM_ARG="${1:-}"
-case "$TEAM_ARG" in
-  "") usage >&2; exit 1 ;;
-  -h|--help) usage; exit 0 ;;
-esac
-shift
-TEAM="$(resolve_team "$TEAM_ARG")" || { usage >&2; exit 1; }
-
 parse_launch_args "$@"
 if [ "$WANT_HELP" = 1 ]; then
   usage
   exit 0
 fi
-exec "$WS/start-agent.sh" "${LAUNCH_FLAGS[@]}" "$TEAM-qa-worker" "${RUNTIME:-opencode}" "${PASSTHRU[@]}"
+exec "$WS/start-agent.sh" "${LAUNCH_FLAGS[@]}" senior-qa "${RUNTIME:-opencode}" "${PASSTHRU[@]}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start ONE tmux session ("__PROJECT_NAME__") with 6 WINDOWS — one per role — each cd'd
+# Start ONE tmux session ("__PROJECT_NAME__") with 7 WINDOWS — one per role — each cd'd
 # into the right worktree and showing a banner (identity + launch command). Attach
 # once and switch windows with Ctrl-b <n>. It does NOT start the CLI agents; you
 # launch them yourself in each window.
@@ -14,7 +14,8 @@
 #   2 be-qa    backend  qa   (a2)  wt-backend-qa     -> $WS/start-qa-worker.sh backend
 #   3 fe-dev   frontend dev  (a3)  wt-frontend-dev   -> $WS/start-dev-worker.sh frontend
 #   4 fe-qa    frontend qa   (a4)  wt-frontend-qa    -> $WS/start-qa-worker.sh frontend
-#   5 senior   escalation    (a5)  wt-seniordev      -> $WS/start-senior-dev.sh (on escalation)
+#   5 sr-dev   senior   dev  (a5)  wt-senior-dev     -> $WS/start-senior-dev.sh (on escalation)
+#   6 sr-qa    senior   qa   (a6)  wt-senior-qa      -> $WS/start-senior-qa.sh (on escalation)
 set -u
 SESSION=__PROJECT_NAME__
 WS=__WORKSPACE_ROOT__
@@ -53,11 +54,17 @@ EOF
 Worktree : wt-frontend-qa   Coordinator: __PROJECT_NAME__
 Launch   : $WS/start-qa-worker.sh frontend
 EOF
-  cat > "$BAN/sr.txt" <<EOF
+  cat > "$BAN/sr-dev.txt" <<EOF
 ════ SENIOR / ESCALATION DEV — agent 5 (Claude Code) ════
-Worktree : wt-seniordev     Coordinator: __PROJECT_NAME__ (via ./.mcp.json)
+Worktree : wt-senior-dev    Coordinator: __PROJECT_NAME__ (via ./.mcp.json)
 Launch   : $WS/start-senior-dev.sh          # ON DEMAND, after escalating an issue to agent 5
 Role     : cross-team; reads the escalated issue's team -> apps/api | apps/web | packages/contracts
+EOF
+  cat > "$BAN/sr-qa.txt" <<EOF
+════ SENIOR / ESCALATION QA — agent 6 (Claude Code) ════
+Worktree : wt-senior-qa     Coordinator: __PROJECT_NAME__ (via ./.mcp.json)
+Launch   : $WS/start-senior-qa.sh           # ON DEMAND, after escalating an issue to agent 6
+Role     : cross-team verification; reads the escalated issue's team -> apps/api | apps/web | packages/contracts
 EOF
 }
 
@@ -85,10 +92,11 @@ start() {
   _win 2 be-qa  "$WS/wt-backend-qa"   be-qa
   _win 3 fe-dev "$WS/wt-frontend-dev" fe-dev
   _win 4 fe-qa  "$WS/wt-frontend-qa"  fe-qa
-  _win 5 senior "$WS/wt-seniordev"    sr
+  _win 5 sr-dev "$WS/wt-senior-dev"   sr-dev
+  _win 6 sr-qa  "$WS/wt-senior-qa"    sr-qa
   tmux select-window -t "$SESSION:0"
-  echo "session '$SESSION' created with 6 windows (0 orch, 1 be-dev, 2 be-qa, 3 fe-dev, 4 fe-qa, 5 senior)."
-  echo "Attach:  tmux attach -t $SESSION      Switch windows: Ctrl-b <0-5>   Detach: Ctrl-b d"
+  echo "session '$SESSION' created with 7 windows (0 orch, 1 be-dev, 2 be-qa, 3 fe-dev, 4 fe-qa, 5 sr-dev, 6 sr-qa)."
+  echo "Attach:  tmux attach -t $SESSION      Switch windows: Ctrl-b <0-6>   Detach: Ctrl-b d"
 }
 
 case "${1:-start}" in
