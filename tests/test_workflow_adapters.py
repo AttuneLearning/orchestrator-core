@@ -183,13 +183,68 @@ class TestNodeAdapter:
 
 
 class TestPythonAdapter:
-    """Tests for Python adapter (stub for now)."""
+    """Tests for Python adapter default steps and builtins."""
 
-    def test_python_default_steps_empty(self):
-        """Python adapter returns empty dict (stub for WP-21)."""
+    def test_python_default_steps_shape(self):
+        """Python adapter returns expected step structure."""
         adapter = PythonAdapter()
         steps = adapter.default_steps()
-        assert steps == {}
+
+        assert "prepare" in steps
+        assert "verify" in steps
+        assert "cleanup" in steps
+
+    def test_python_prepare_step(self):
+        """prepare step uses py-deps-reconcile builtin."""
+        adapter = PythonAdapter()
+        steps = adapter.default_steps()
+
+        prepare = steps["prepare"]
+        assert len(prepare) == 1
+        assert prepare[0]["builtin"] == "py-deps-reconcile"
+        assert prepare[0]["on_fail"] == "escalate"
+        assert prepare[0]["timeout"] == 300
+        # Sentinel is owned by the builtin, not at the action level
+        assert "when_changed" not in prepare[0]
+        assert "sentinel" not in prepare[0]
+
+    def test_python_verify_step(self):
+        """verify step runs python -m pytest -q."""
+        adapter = PythonAdapter()
+        steps = adapter.default_steps()
+
+        verify = steps["verify"]
+        assert len(verify) == 1
+        assert verify[0]["run"] == "python -m pytest -q"
+        assert verify[0]["on_fail"] == "block"
+        assert verify[0]["timeout"] == 300
+
+    def test_python_cleanup_step(self):
+        """cleanup step resets and cleans without -x."""
+        adapter = PythonAdapter()
+        steps = adapter.default_steps()
+
+        cleanup = steps["cleanup"]
+        assert len(cleanup) == 1
+        # Check the exact command (no -x)
+        assert cleanup[0]["run"] == "git reset --hard && git clean -fd"
+        assert cleanup[0]["on_fail"] == "block"
+        assert cleanup[0]["timeout"] == 300
+
+    def test_python_cleanup_no_dash_x(self):
+        """Verify no -x flag anywhere in cleanup."""
+        adapter = PythonAdapter()
+        steps = adapter.default_steps()
+        cleanup_run = steps["cleanup"][0]["run"]
+        assert "-x" not in cleanup_run
+
+    def test_python_builtins(self):
+        """Python adapter exports py-deps-reconcile builtin."""
+        adapter = PythonAdapter()
+        builtins = adapter.builtins()
+
+        assert "py-deps-reconcile" in builtins
+        assert callable(builtins["py-deps-reconcile"])
 
     def test_python_builtins_has_probe_tcp(self):
         """Python adapter inherits probe-tcp from base."""
@@ -197,6 +252,19 @@ class TestPythonAdapter:
         builtins = adapter.builtins()
         assert "probe-tcp" in builtins
         assert callable(builtins["probe-tcp"])
+
+    def test_python_deps_reconcile_no_lockfile(self, tmp_path):
+        """py-deps-reconcile with no lockfile returns ok=True (no-op)."""
+        adapter = PythonAdapter()
+        builtins = adapter.builtins()
+
+        # Call with a tmp path (no uv.lock or poetry.lock -> should return ok=True)
+        result = builtins["py-deps-reconcile"](tmp_path)
+
+        assert isinstance(result, dict)
+        assert "ok" in result
+        assert "reason" in result
+        assert result["ok"] is True  # No lockfile -> ok
 
 
 class TestGoAdapter:

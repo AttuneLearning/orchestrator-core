@@ -227,12 +227,25 @@ class TestWorkflowStepNeutral:
         profile = load_effective(settings, worktree)
 
         assert profile.stack == "python"
-        # Python adapter is currently a stub (WP-21) with no default_steps(),
-        # so prepare and verify should be empty from the engine defaults
-        # (which are now stack-neutral).
-        assert profile.step("prepare").actions == ()
-        assert profile.step("verify").actions == ()
-        # Only cleanup from the engine defaults
+        # Python adapter (WP-21) now provides default_steps with:
+        # - prepare: py-deps-reconcile builtin (sentinel owned by builtin)
+        # - verify: python -m pytest -q
+        # - cleanup: git reset --hard && git clean -fd
+        prepare = profile.step("prepare").actions
+        assert len(prepare) == 1
+        assert prepare[0].builtin == "py-deps-reconcile"
+        # Sentinel is owned by the builtin, not at the action level
+        assert prepare[0].sentinel == ""
+        assert prepare[0].when_changed == ()
+
+        verify = profile.step("verify").actions
+        assert len(verify) == 1
+        assert verify[0].run == "python -m pytest -q"
+
+        # Verify npm commands do NOT appear anywhere (no node-specific steps)
+        for action in prepare + verify:
+            assert "npm" not in action.run.lower()
+
         cleanup = profile.step("cleanup").actions
         assert len(cleanup) == 1
         assert "git reset --hard && git clean -fd" in cleanup[0].run

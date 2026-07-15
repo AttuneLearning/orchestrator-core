@@ -654,3 +654,57 @@ C2: WP-12 → WP-13 ∥ WP-15   (WP-22, WP-23 may run here too)   → GATE C
 D:  WP-18 ∥ WP-19 → WP-20                       → GATE D
 E:  WP-21 ∥ (WP-22, WP-23 if not done) → WP-24 → WP-25
 ```
+
+---
+
+## Appendix: ADR draft (for operator approval on /adrs)
+
+This is **draft text only** — WP-25 does not write to the database. An operator
+files it via the dashboard `/adrs` proposal flow (or `adr propose`/equivalent
+CLI), reviewing/editing as they see fit before approval. It is written to
+**supersede ADR-BUILD-001** ("Verify and dev worktrees must reconcile
+node_modules to the lockfile before typecheck"), which described one
+hardcoded, npm-specific instance of a problem this ADR generalizes and gates.
+
+```
+domain: BUILD
+title: Executable per-project hygiene is expressed as gated Workflow Profiles
+supersedes: ADR-BUILD-001
+
+decision:
+  Stack-specific, executable worktree hygiene (dependency reconcile, codegen,
+  service readiness, verify commands, cleanup) is declared as a per-project
+  Workflow Profile, never hardcoded into engine core. A profile is composed
+  from three layers in precedence order — engine defaults, the product repo's
+  `.orchestrator/workflow.yaml` (request-only), and the operator-owned
+  workspace manifest (authority) — and the workspace manifest always wins.
+  Every required action is gated: built-in adapter actions and actions
+  sourced from the engine defaults or the workspace manifest are trusted by
+  identity/provenance; any other custom command requires an exact-match (or
+  sha256-pinned) grant in the workspace manifest's `permissions.allow` list.
+  An unauthorized action never runs silently and never fails the verify gate
+  outright — it escalates asynchronously (`blocked_on_approval`, a
+  pending-actions queue, and a dashboard approval card) and the state machine
+  treats it as not-yet-attempted until a human approves, denies, or lets it
+  expire. This supersedes ADR-BUILD-001: the node_modules/lockfile reconcile
+  it described is now one instance of the node stack adapter's `prepare` step
+  under this general mechanism, not a standalone rule.
+
+context:
+  ADR-BUILD-001 was filed after the tendcharting fleet wedged on stale
+  node_modules in QA verify worktrees (2026-07-14) — a real fix, but encoded
+  as npm-specific logic inside project-agnostic engine core, and with no
+  generalized gating story for the executable actions the harness runs on an
+  operator's behalf. The Workflow Profile system (this repo's
+  `orchestrator/workflow/` package; see `docs/ARCHITECTURE.md` §9 and
+  `WORKFLOW-PROFILE-IMPLEMENTATION-PLAN.md`) generalizes the fix: any stack
+  (node and python shipped with full adapters; go adapter is a stub pending
+  further work; rust is auto-detected but lacks an adapter yet) can declare
+  its own hygiene steps, and no action — however it is sourced — can grant
+  itself execution rights on the host. The security posture is deliberate:
+  the engine runs actions as the agent OS user with no sandbox beyond `cwd`,
+  so authority for what may run must live only with the operator (the
+  workspace manifest), never with whoever has commit rights to the product
+  repo.
+```
+
