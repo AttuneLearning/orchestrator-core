@@ -121,3 +121,82 @@ def test_init_dry_run_plans_without_side_effects(settings, capsys):
     assert "decomposition tier : remedial" in out   # recommended from qwen-local
     assert "would write" in out
     assert not dropin.exists()                        # dry-run wrote nothing
+
+
+# --------------------------------------------------------------------------- #
+# Workflow profile lints (WP-17)
+# --------------------------------------------------------------------------- #
+
+def test_doctor_workflow_lint4_enabled_without_manifest(settings, pool):
+    """Lint 4: workflow_profile=enabled but workspace_manifest unset -> FAIL."""
+    # Set workflow_profile to enabled without a manifest
+    from copy import deepcopy
+    custom_settings = deepcopy(settings)
+    custom_settings.workflow_profile = "enabled"
+    custom_settings.workspace_manifest = ""
+
+    checks = cli._run_doctor_checks(custom_settings)
+    workflow_checks = [c for c in checks if c.name == "workflow_profile"]
+
+    # Should have a FAIL check about missing manifest
+    assert any(c.status == onboarding.FAIL and "workspace_manifest" in c.detail
+               for c in workflow_checks)
+
+
+def test_doctor_workflow_lint5_repo_permissions(settings, pool, tmp_path):
+    """Lint 5: repo profile with permissions: key -> FAIL."""
+    from copy import deepcopy
+
+    # Create a temporary worktree with a repo profile containing permissions
+    worktree = tmp_path / "test_repo"
+    worktree.mkdir()
+
+    # Initialize as git repo
+    import subprocess
+    subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True)
+
+    # Create repo profile with permissions (self-authorization attempt)
+    orch_dir = worktree / ".orchestrator"
+    orch_dir.mkdir()
+    profile_file = orch_dir / "workflow.yaml"
+    profile_file.write_text(
+        "prepare:\n"
+        "  - run: npm ci\n"
+        "permissions:\n"
+        "  allow:\n"
+        "    - npm ci\n"
+    )
+
+    # Create settings with verify_worktrees pointing to this worktree
+    custom_settings = deepcopy(settings)
+    custom_settings.verify_worktrees = {"test": str(worktree)}
+
+    checks = cli._run_doctor_checks(custom_settings)
+    workflow_checks = [c for c in checks if c.name == "workflow_profile"]
+
+    # Should have a FAIL check about repo permissions
+    assert any(c.status == onboarding.FAIL and "permissions" in c.detail
+               for c in workflow_checks)
+
+
+def test_doctor_workflow_regression_legacy_no_profile(settings, pool):
+    """Regression: legacy flag with no profile -> no new FAILs (stays green)."""
+    # Ensure workflow_profile is legacy (default)
+    from copy import deepcopy
+    custom_settings = deepcopy(settings)
+    custom_settings.workflow_profile = "legacy"
+    custom_settings.workspace_manifest = ""
+    # No verify_worktrees set, so worktree-dependent lints skip
+
+    checks = cli._run_doctor_checks(custom_settings)
+    fail_checks = [c for c in checks if c.status == onboarding.FAIL]
+
+    # Should have the same FAILs as before (not new ones from workflow lints)
+    # On a clean DB, the only possible FAILs would be from pipelines/roster/etc,
+    # not from workflow_profile
+    workflow_fails = [c for c in fail_checks if c.name == "workflow_profile"]
+    assert len(workflow_fails) == 0, "Legacy flag with no profile should not add workflow_profile FAILs"
+
+    # Overall should still be ready (code == 0)
+    code, _ = onboarding.summarize(checks)
+    assert code == 0

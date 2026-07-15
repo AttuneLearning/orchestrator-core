@@ -19,6 +19,7 @@ from psycopg_pool import ConnectionPool
 from .. import repository as repo
 from ..config import Settings
 from ..models import Issue
+from ..workflow.escalation import make_escalation_cb
 from ..workflow.loader import load_effective, load_permissions
 from ..workflow.runner import run_step
 from .npm_deps import ensure_deps_current
@@ -27,6 +28,7 @@ WORKTREES_DIR = Path("/tmp/orchestrator-worktrees")
 VERIFY_TIMEOUT_S = 300
 _GIT_ID = ["-c", "user.email=orchestrator@local", "-c", "user.name=orchestrator",
            "-c", "commit.gpgsign=false"]
+_BLOCKED_NOTE = "approval pending on /actions; re-run after approval"
 
 
 def _git(repo_path: str | Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -47,30 +49,73 @@ def _worktree_path(issue: Issue, base: str | Path) -> Path:
     return WORKTREES_DIR / base_key / _branch(issue)
 
 
+def _action_ident(action: Any) -> str:
+    """Short human-readable identity for a RequiredAction (run string, or
+    builtin name) — mirrors `runner._action_label` without importing it, since
+    here we only have the `ActionResult.action` object, not an event payload."""
+    return (getattr(action, "run", "") or "").strip() \
+        or (getattr(action, "builtin", "") or "").strip() \
+        or "<unnamed action>"
+
+
 def _apply_in_worktree_enabled(
     issue: Issue, wt: str | Path, settings: Settings, sha: str, committed: bool,
+    pool: Optional[ConnectionPool] = None,
 ) -> dict[str, Any]:
-    """`workflow_profile: enabled` path for `_apply_in_worktree` (WP-09).
+    """`workflow_profile: enabled` path for `_apply_in_worktree` (WP-09/WP-13).
 
     Runs the `prepare` then `verify` steps of the effective workflow Profile
     (Phase A: `orchestrator.workflow.loader`/`runner`) in place of the inline
     `ensure_deps_current` call + hardcoded `settings.verify_cmd`. A
-    `blocked_on_approval` outcome from either step returns `passed=None`.
+    `blocked_on_approval` outcome from either step returns `passed=None` plus
+    `step`/`action`/`phase`/`note` (WP-13), same shape as verify_run's.
     Unlike verify_run, this function does NOT log events itself (the caller
     apply_and_verify handles that) — so event_cb is always None.
+
+    `pool`: threaded from `apply_and_verify` (which has it) through
+    `_apply_in_worktree` (which may be called directly by callers/tests
+    without one — hence the default). When `pool` is None there is nowhere to
+    persist a `pending_actions` row, so escalations stay "pending-only" (no
+    DB write, no comms message, no one-shot approval/denial resume) —
+    source-compatible with every existing caller that doesn't pass a pool.
     """
     perms = load_permissions(settings)
     profile = load_effective(settings, wt, role="qa")
     branch = _branch(issue)
+    requested_by = f"apply:{issue.team or ''}"
+
+    def _make_escalation_cb(step_name: str) -> tuple[Any, dict[str, str]]:
+        """Build a (escalation_cb, phase_holder) pair for one step. `pool=None`
+        means no persistence is possible, so escalation_cb stays None — the
+        runner's own default (`escalation_cb=None` -> always "pending") keeps
+        this call source-compatible with every existing caller."""
+        phase_seen: dict[str, str] = {}
+        if pool is None:
+            return None, phase_seen
+        base = make_escalation_cb(pool, issue.id, str(wt), step_name, requested_by)
+
+        def _cb(action: Any, phase: str) -> str:
+            phase_seen["phase"] = phase
+            return base(action, phase)
+
+        return _cb, phase_seen
+
+    prepare_escalation_cb, prepare_phase_seen = _make_escalation_cb("prepare")
 
     # Run prepare step (no event_cb: the caller handles logging)
-    prepare_result = run_step(wt, profile, "prepare", "qa", perms, event_cb=None)
+    prepare_result = run_step(wt, profile, "prepare", "qa", perms, event_cb=None,
+                              escalation_cb=prepare_escalation_cb)
 
     if prepare_result.status == "blocked_on_approval":
+        action = prepare_result.results[-1].action if prepare_result.results else None
         return {
             "passed": None,
             "status": "blocked_on_approval",
             "reason": prepare_result.reason,
+            "step": "prepare",
+            "action": _action_ident(action) if action is not None else prepare_result.reason,
+            "phase": prepare_phase_seen.get("phase", "authorize"),
+            "note": _BLOCKED_NOTE,
             "branch": branch,
             "commit": sha,
         }
@@ -89,16 +134,24 @@ def _apply_in_worktree_enabled(
             "deps": prepare_detail,
         }
 
+    verify_escalation_cb, verify_phase_seen = _make_escalation_cb("verify")
+
     # Run verify step
     started = time.monotonic()
-    verify_result = run_step(wt, profile, "verify", "qa", perms, event_cb=None)
+    verify_result = run_step(wt, profile, "verify", "qa", perms, event_cb=None,
+                             escalation_cb=verify_escalation_cb)
     duration = round(time.monotonic() - started, 1)
 
     if verify_result.status == "blocked_on_approval":
+        action = verify_result.results[-1].action if verify_result.results else None
         return {
             "passed": None,
             "status": "blocked_on_approval",
             "reason": verify_result.reason,
+            "step": "verify",
+            "action": _action_ident(action) if action is not None else verify_result.reason,
+            "phase": verify_phase_seen.get("phase", "authorize"),
+            "note": _BLOCKED_NOTE,
             "branch": branch,
             "commit": sha,
         }
@@ -127,7 +180,7 @@ def _apply_in_worktree_enabled(
     if returncode is None:
         returncode = 1 if verify_result.status == "failed" else 0
 
-    return {
+    result: dict[str, Any] = {
         "passed": returncode == 0,
         "returncode": returncode,
         "stdout": out[-1000:],
@@ -137,6 +190,13 @@ def _apply_in_worktree_enabled(
         "committed": committed,
         "deps": {},  # prepare_detail would go here if we tracked it
     }
+    if verify_result.status == "failed" and not out and not err:
+        # No process output to show (e.g. a denied escalation never executes,
+        # so there's nothing to capture) — surface the StepResult's own reason
+        # instead of a silent blank stdout/stderr (WP-13 (c): a denial must be
+        # a REAL, self-naming failure).
+        result["reason"] = verify_result.reason
+    return result
 
 
 def _latest_artifact(pool: ConnectionPool, issue_id: int) -> Optional[str]:
@@ -161,12 +221,15 @@ def apply_and_verify(pool: ConnectionPool, issue: Issue, settings: Settings) -> 
         if artifact is None:
             result = {"passed": False, "skipped": "no code_generated artifact"}
         else:
-            result = _apply_in_worktree(issue, artifact, settings)
+            result = _apply_in_worktree(issue, artifact, settings, pool=pool)
     repo.append_log(pool, issue.id, "verification", result)
     return result
 
 
-def _apply_in_worktree(issue: Issue, artifact: str, settings: Settings) -> dict[str, Any]:
+def _apply_in_worktree(
+    issue: Issue, artifact: str, settings: Settings,
+    pool: Optional[ConnectionPool] = None,
+) -> dict[str, Any]:
     base = settings.apply_repo_path
     branch = _branch(issue)
     wt = _worktree_path(issue, base)
@@ -189,7 +252,7 @@ def _apply_in_worktree(issue: Issue, artifact: str, settings: Settings) -> dict[
         # Profile-driven prepare+verify (Phase B of the Workflow Profile cutover)
         # — replaces the inline ensure_deps_current + hardcoded verify command below.
         # `legacy` (default) never reaches here.
-        return _apply_in_worktree_enabled(issue, wt, settings, sha, committed)
+        return _apply_in_worktree_enabled(issue, wt, settings, sha, committed, pool=pool)
 
     if not settings.verify_cmd:
         return {"passed": False, "skipped": "verify_cmd not configured",

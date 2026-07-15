@@ -179,6 +179,7 @@ def page(title: str, body: str) -> str:
         "<a href='/orch/monitor'>Monitor</a>"
         "<a href='/contracts'>Contracts</a>"
         "<a href='/adrs'>ADRs</a>"
+        "<a href='/actions'>Actions</a>"
         "<a href='/tiers'>Tiers</a>"
         "<a href='/docs'>Docs</a>"
         "<a href='/settings'>Settings</a>"
@@ -858,6 +859,26 @@ def _ago(dt: Optional[datetime]) -> str:
     return f"{int(secs / 86400)}d"
 
 
+def _expires_in(dt: Optional[datetime]) -> str:
+    """Compact relative time UNTIL a future dt (e.g. '3h', '5d'), or 'expired'
+    once past. '—' if unknown. Mirrors _ago's bucketing, inverted direction."""
+    if dt is None:
+        return "—"
+    try:
+        secs = (dt - datetime.now(timezone.utc)).total_seconds()
+    except (TypeError, ValueError):
+        return "—"
+    if secs <= 0:
+        return "expired"
+    if secs < 90:
+        return f"{int(secs)}s"
+    if secs < 5400:
+        return f"{int(secs / 60)}m"
+    if secs < 172800:
+        return f"{int(secs / 3600)}h"
+    return f"{int(secs / 86400)}d"
+
+
 # Human labels for the raw issue_events.event_type values.
 _EVENT_LABEL = {
     "state_change": "state change", "gate_enter": "entered gate",
@@ -1360,6 +1381,66 @@ def adr_detail(adr: dict[str, Any], incoming: list[str]) -> str:
         f"linked from: {links(incoming)}</p>"
         f"<p class='muted'>proposed by {escape(adr['proposed_by'])}</p>"
     ))
+
+
+def _action_issue_link(a: dict[str, Any]) -> str:
+    iid = a.get("issue_id")
+    return f"<a href='/issues/{iid}'>#{iid}</a>" if iid else "<span class='muted'>—</span>"
+
+
+def actions_page(pending: list[dict[str, Any]], resolved: list[dict[str, Any]]) -> str:
+    """Workflow-profile escalated-action approval queue (migration 0022
+    pending_actions). Mirrors the ADR review queue: an actionable pending
+    table (approve/deny buttons) plus a read-only recently-resolved section
+    (approved/denied/expired/executed) — same as ADRs showing non-proposed
+    states alongside the proposed-awaiting-approval ones."""
+    def pending_row(a: dict[str, Any]) -> str:
+        aid = a["id"]
+        return (
+            "<tr>"
+            f"<td>{_action_issue_link(a)}</td>"
+            f"<td>{escape(a['step'])}</td>"
+            f"<td><code>{escape(a['action'])}</code></td>"
+            f"<td>{escape(a['action_kind'])}</td>"
+            f"<td>{escape(a['requested_by'] or '—')}</td>"
+            f"<td>{_ago(a['created_at'])}</td>"
+            f"<td>{_expires_in(a['expires_at'])}</td>"
+            "<td>"
+            f"<form method='post' action='/actions/{aid}/approve' style='display:inline'>"
+            "<button class='ok'>Approve</button></form> "
+            f"<form method='post' action='/actions/{aid}/deny' style='display:inline'>"
+            "<button>Deny</button></form>"
+            "</td></tr>"
+        )
+
+    def resolved_row(a: dict[str, Any]) -> str:
+        return (
+            "<tr>"
+            f"<td>{_action_issue_link(a)}</td>"
+            f"<td>{escape(a['step'])}</td>"
+            f"<td><code>{escape(a['action'])}</code></td>"
+            f"<td>{escape(a['action_kind'])}</td>"
+            f"<td>{escape(a['requested_by'] or '—')}</td>"
+            f"<td>{_state(a['status'])}</td>"
+            f"<td>{escape(a['resolved_by'] or '—')}</td>"
+            f"<td>{_ago(a['resolved_at'])}</td>"
+            "</tr>"
+        )
+
+    pending_body = (
+        "<table><tr><th>Issue</th><th>Step</th><th>Action</th><th>Kind</th>"
+        "<th>Requested by</th><th>Age</th><th>Expires</th><th></th></tr>"
+        f"{''.join(pending_row(a) for a in pending)}</table>"
+    ) if pending else "<p class='muted'>No pending actions awaiting approval.</p>"
+
+    resolved_body = (
+        "<h2>Recently resolved</h2>"
+        "<table><tr><th>Issue</th><th>Step</th><th>Action</th><th>Kind</th>"
+        "<th>Requested by</th><th>Status</th><th>Resolved by</th><th>Age</th></tr>"
+        f"{''.join(resolved_row(a) for a in resolved)}</table>"
+    ) if resolved else ""
+
+    return page("Actions", f"<h1>Pending action approvals</h1>{pending_body}{resolved_body}")
 
 
 def agents_page(agents: list[dict[str, Any]],

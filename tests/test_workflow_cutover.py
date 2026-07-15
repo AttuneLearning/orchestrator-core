@@ -251,13 +251,18 @@ def test_enabled_prepare_blocked_never_records_failed_tests_run(gitrepo, db, mon
 
     out = tools["verify_run"](1)
 
-    assert out == {"passed": None, "status": "blocked_on_approval", "reason": "rm -rf /tmp/x"}
+    assert out["passed"] is None
+    assert out["status"] == "blocked_on_approval"
+    assert out["step"] == "prepare"
+    assert out["action"] == "rm -rf /tmp/x"
+    assert out["phase"] == "authorize"
+    assert "note" in out
     assert db.of("tests_run") == []  # never a failed tests_run event on a block
-    escalated = db.of("action_escalated")
-    assert len(escalated) == 1
-    assert escalated[0]["machine"] is True
-    assert escalated[0]["action"] == "rm -rf /tmp/x"
-    assert escalated[0]["step"] == "prepare"
+    # `action_escalated` is emitted by repository.create_pending_action (owned by
+    # escalation.handle_escalation), not by this tool — this pure test's fake
+    # run_step never reaches real persistence, so there's no event to observe
+    # here. Coverage for the event itself lives in the DB-backed tests below
+    # (test_db_enabled_prepare_blocked_records_no_failed_tests_run).
 
 
 def test_enabled_verify_failed_records_tests_run_failure(gitrepo, db, monkeypatch):
@@ -302,12 +307,17 @@ def test_enabled_verify_blocked_never_records_failed_tests_run(gitrepo, db, monk
 
     out = tools["verify_run"](1)
 
-    assert out == {"passed": None, "status": "blocked_on_approval", "reason": "custom-deploy-step"}
+    assert out["passed"] is None
+    assert out["status"] == "blocked_on_approval"
+    assert out["step"] == "verify"
+    assert out["action"] == "custom-deploy-step"
+    assert out["phase"] == "authorize"
+    assert "note" in out
     assert db.of("tests_run") == []
-    escalated = db.of("action_escalated")
-    assert len(escalated) == 1
-    assert escalated[0]["step"] == "verify"
-    assert escalated[0]["action"] == "custom-deploy-step"
+    # `action_escalated` is emitted by repository.create_pending_action, not by
+    # this tool — see the matching comment in
+    # test_enabled_prepare_blocked_never_records_failed_tests_run above; DB
+    # coverage lives in the DB-backed tests below.
 
 
 def test_enabled_verify_failed_action_with_warn_reports_failed(gitrepo, db, monkeypatch):
@@ -449,8 +459,12 @@ def test_db_enabled_prepare_blocked_records_no_failed_tests_run(gitrepo, pool):
 
     out = tools["verify_run"](issue.id)
 
-    assert out == {"passed": None, "status": "blocked_on_approval",
-                    "reason": "custom-unapproved-step"}
+    assert out["passed"] is None
+    assert out["status"] == "blocked_on_approval"
+    assert out["step"] == "prepare"
+    assert out["action"] == "custom-unapproved-step"
+    assert out["phase"] == "authorize"
+    assert "note" in out
     kinds = [e.event_type for e in repo.recent_events(pool, issue.id, limit=20)]
     assert "tests_run" not in kinds
     assert "action_escalated" in kinds

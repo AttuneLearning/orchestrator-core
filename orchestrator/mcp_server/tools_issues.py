@@ -17,6 +17,7 @@ from ..apply.npm_deps import ensure_deps_current
 from ..config import load_settings
 from ..pipelines import load_pipelines
 from ..state_machine import apply_gate_decision
+from ..workflow.escalation import make_escalation_cb
 from ..workflow.loader import load_effective, load_permissions
 from ..workflow.runner import run_step
 
@@ -247,11 +248,14 @@ def _action_label(payload: dict[str, Any]) -> str:
     return str(info.get("run") or info.get("builtin") or "<unnamed action>")
 
 
+_BLOCKED_NOTE = "approval pending on /actions; re-run after approval"
+
+
 def _verify_run_enabled(
     pool: ConnectionPool, settings: Any, issue: Any, issue_id: int,
     wt: str, verify_branch: str,
 ) -> dict[str, Any]:
-    """`workflow_profile: enabled` path for `verify_run` (WP-08).
+    """`workflow_profile: enabled` path for `verify_run` (WP-08/WP-13).
 
     Runs the `prepare` then `verify` steps of the effective workflow Profile
     (Phase A: `orchestrator.workflow.loader`/`runner`) in place of the inline
@@ -260,15 +264,26 @@ def _verify_run_enabled(
     same outcomes (`deps_reinstalled`, `tests_run`) so downstream consumers
     (gate decisions, `_has_machine_verification`, dashboards) see no
     difference on the happy/fail paths. A `blocked_on_approval` outcome from
-    either step never becomes a failed `tests_run` event — it appends an
-    `action_escalated` log entry instead (WP-11/12 add real persistence;
-    here it is observability only) and returns `passed=None`.
+    either step never becomes a failed `tests_run` event — instead the real
+    persistence (WP-12's `escalation.make_escalation_cb`, wired below, calling
+    through to `repository.create_pending_action`) records the ONE
+    `action_escalated` event for a NEW pending row; this function's own
+    `event_cb` only builds the `blocked` dict used for the return payload, it
+    never appends the event itself (a re-polled call that hits an existing
+    pending row correctly emits no duplicate). Returns `passed=None` with
+    `step`/`action`/`phase`/`note` (WP-13) so a caller knows exactly what is
+    pending and what to do about it. The issue's state/retry counters are
+    never touched on this path — a pending approval is "not attempted", not a
+    failure (plan §2.2).
     """
     perms = load_permissions(settings)
     profile = load_effective(settings, wt, role="qa")
+    requested_by = f"verify_run:{issue.team or ''}"
 
     prepare_detail: dict[str, Any] = {}
     blocked: dict[str, Any] = {}
+    prepare_phase_seen: dict[str, str] = {}
+    prepare_escalation_base = make_escalation_cb(pool, issue_id, wt, "prepare", requested_by)
 
     def _prepare_cb(kind: str, payload: dict[str, Any]) -> None:
         nonlocal prepare_detail, blocked
@@ -278,15 +293,29 @@ def _verify_run_enabled(
                 repo.append_log(pool, issue_id, "deps_reinstalled",
                                 {"machine": True, "branch": verify_branch, **prepare_detail})
         elif kind == "escalated":
-            blocked = {"step": "prepare", "action": _action_label(payload)}
-            repo.append_log(pool, issue_id, "action_escalated",
-                            {"machine": True, "branch": verify_branch, **blocked})
+            # The `action_escalated` event is owned by repository.create_pending_action
+            # (called via the escalation_cb -> escalation.handle_escalation, below) —
+            # it fires once per NEW pending row, so a re-polled call that hits an
+            # existing pending row emits no duplicate event. Only the return payload
+            # (built from `blocked`) is this callback's job now.
+            blocked = {"step": "prepare", "action": _action_label(payload),
+                       "phase": prepare_phase_seen.get("phase", "authorize")}
 
-    prepare_result = run_step(wt, profile, "prepare", "qa", perms, event_cb=_prepare_cb)
+    def _prepare_escalation_cb(action: Any, phase: str) -> str:
+        prepare_phase_seen["phase"] = phase
+        return prepare_escalation_base(action, phase)
+
+    prepare_result = run_step(wt, profile, "prepare", "qa", perms,
+                              event_cb=_prepare_cb, escalation_cb=_prepare_escalation_cb)
 
     if prepare_result.status == "blocked_on_approval":
-        return {"passed": None, "status": "blocked_on_approval",
-                "reason": blocked.get("action", prepare_result.reason)}
+        return {
+            "passed": None, "status": "blocked_on_approval",
+            "step": blocked.get("step", "prepare"),
+            "action": blocked.get("action", prepare_result.reason),
+            "phase": blocked.get("phase", prepare_phase_seen.get("phase", "authorize")),
+            "note": _BLOCKED_NOTE,
+        }
 
     if prepare_result.status == "failed":
         returncode = prepare_detail.get("returncode", 1)
@@ -302,6 +331,8 @@ def _verify_run_enabled(
                 "tail": f"dependency install failed before verify: {prepare_result.reason}"}
 
     verify_detail: dict[str, Any] = {}
+    verify_phase_seen: dict[str, str] = {}
+    verify_escalation_base = make_escalation_cb(pool, issue_id, wt, "verify", requested_by)
 
     def _verify_cb(kind: str, payload: dict[str, Any]) -> None:
         nonlocal verify_detail, blocked
@@ -309,17 +340,28 @@ def _verify_run_enabled(
             verify_detail = _strip_envelope(payload)
             verify_detail["_action"] = payload.get("action") or {}
         elif kind == "escalated":
-            blocked = {"step": "verify", "action": _action_label(payload)}
-            repo.append_log(pool, issue_id, "action_escalated",
-                            {"machine": True, "branch": verify_branch, **blocked})
+            # See the matching comment in _prepare_cb: create_pending_action is the
+            # sole emitter of `action_escalated` — no tool-level append here.
+            blocked = {"step": "verify", "action": _action_label(payload),
+                       "phase": verify_phase_seen.get("phase", "authorize")}
+
+    def _verify_escalation_cb(action: Any, phase: str) -> str:
+        verify_phase_seen["phase"] = phase
+        return verify_escalation_base(action, phase)
 
     started = time.monotonic()
-    verify_result = run_step(wt, profile, "verify", "qa", perms, event_cb=_verify_cb)
+    verify_result = run_step(wt, profile, "verify", "qa", perms,
+                             event_cb=_verify_cb, escalation_cb=_verify_escalation_cb)
     duration = round(time.monotonic() - started, 1)
 
     if verify_result.status == "blocked_on_approval":
-        return {"passed": None, "status": "blocked_on_approval",
-                "reason": blocked.get("action", verify_result.reason)}
+        return {
+            "passed": None, "status": "blocked_on_approval",
+            "step": blocked.get("step", "verify"),
+            "action": blocked.get("action", verify_result.reason),
+            "phase": blocked.get("phase", verify_phase_seen.get("phase", "authorize")),
+            "note": _BLOCKED_NOTE,
+        }
 
     action_info = verify_detail.pop("_action", {})
     cmd = action_info.get("run") or action_info.get("builtin") or ""
@@ -349,8 +391,13 @@ def _verify_run_enabled(
     }
     payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
     repo.append_log(pool, issue_id, "tests_run", payload)
+    # Fall back to the StepResult's own reason when there's no stdout/stderr to
+    # show (e.g. a denied escalation never executes, so there's no process
+    # output) — WP-13 (c): a denial must be a REAL failure that names itself,
+    # not a silent blank tail.
+    tail = out[-600:] or err[-600:] or (verify_result.reason if verify_result.status == "failed" else "")
     return {"passed": returncode == 0, "returncode": returncode,
-            "duration_s": duration, "tail": out[-600:] or err[-600:]}
+            "duration_s": duration, "tail": tail}
 
 
 def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
@@ -645,7 +692,13 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         worktree, executes the verify command (typecheck + tests), and appends a
         machine-stamped `tests_run` event with the real exit code. The verification
         gate only accepts a pass backed by this evidence. May take a few minutes —
-        wait for it. Then call gate_decision(issue_id, passed=<returned passed>)."""
+        wait for it. Then call gate_decision(issue_id, passed=<returned passed>).
+
+        If the result is `{"status": "blocked_on_approval", "passed": None, ...}`
+        (workflow-profile mode only), a required action needs a human's OK on the
+        dashboard's `/actions` queue first — this is NOT a failure: heartbeat and
+        re-poll, then call verify_run(issue_id) again later (after approval) to
+        resume; do NOT call gate_decision with a failing verdict for this outcome."""
         issue = repo.get_issue(pool, issue_id)
         if issue is None:
             raise ValueError(f"no issue {issue_id}")

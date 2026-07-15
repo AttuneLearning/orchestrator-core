@@ -11,6 +11,7 @@ issue_events row in the same transaction as the issues update.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from psycopg.rows import class_row, dict_row
@@ -1123,6 +1124,184 @@ def update_adr(pool: ConnectionPool, adr_key: str, *, title: Optional[str] = Non
         if row is None:
             raise ValueError(f"ADR {adr_key} not found")
         return dict(zip(_ADR_COLS, row))
+
+
+# -- pending actions: escalation persistence (migration 0022) --------------- #
+_PENDING_ACTION_COLS = ["id", "issue_id", "worktree", "step", "action", "action_kind",
+                        "requested_by", "status", "resolved_by", "created_at", "resolved_at",
+                        "expires_at"]
+_PENDING_ACTION_SELECT = ("SELECT id, issue_id, worktree, step, action, action_kind, "
+                          "requested_by, status, resolved_by, created_at, resolved_at, expires_at "
+                          "FROM pending_actions")
+
+
+def create_pending_action(
+    pool: ConnectionPool,
+    *,
+    issue_id: Optional[int],
+    worktree: str,
+    step: str,
+    action: str,
+    action_kind: str = "run",
+    requested_by: str = "",
+    ttl_hours: int = 24,
+    phase: str = "",
+) -> dict[str, Any]:
+    """Create a pending action row awaiting approval. When issue_id is set,
+    appends an 'action_escalated' event to that issue's timeline."""
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "INSERT INTO pending_actions (issue_id, worktree, step, action, action_kind, "
+            "requested_by, expires_at) "
+            f"VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            f"RETURNING {', '.join(_PENDING_ACTION_COLS)}",
+            (issue_id, worktree, step, action, action_kind, requested_by, expires_at),
+        ).fetchone()
+        result = dict(zip(_PENDING_ACTION_COLS, row))
+        if issue_id:
+            payload = {
+                "worktree": worktree,
+                "step": step,
+                "action": action,
+                "action_kind": action_kind,
+                "requested_by": requested_by,
+                "expires_at": expires_at.isoformat(),
+                "machine": True,
+            }
+            if phase:
+                payload["phase"] = phase
+            _append_event(conn, issue_id, "action_escalated", None, None, payload)
+    return result
+
+
+def list_pending_actions(pool: ConnectionPool, status: str = "pending") -> list[dict[str, Any]]:
+    """List pending actions. First, lazily expire any overdue pending rows and
+    emit 'action_expired' events for each (when issue_id is set). Create a
+    re-escalation alert message for each expired action. Then return rows
+    matching the requested status, ordered by created_at."""
+    with pool.connection() as conn, conn.transaction():
+        # Lazily expire overdue pending rows
+        expired_rows = conn.execute(
+            "UPDATE pending_actions SET status = 'expired', resolved_at = now() "
+            "WHERE status = 'pending' AND expires_at < now() "
+            f"RETURNING {', '.join(_PENDING_ACTION_COLS)}",
+        ).fetchall()
+        for row in expired_rows:
+            expired_action = dict(zip(_PENDING_ACTION_COLS, row))
+            if expired_action["issue_id"]:
+                _append_event(conn, expired_action["issue_id"], "action_expired", None, None, {
+                    "action_id": expired_action["id"],
+                    "worktree": expired_action["worktree"],
+                    "step": expired_action["step"],
+                    "action": expired_action["action"],
+                    "machine": True,
+                })
+                # Create re-escalation alert message
+                action_str = expired_action["action"]
+                subject = f"Action approval EXPIRED unanswered: {expired_action['step']}/{action_str[:60]}"
+                body = (
+                    f"Action approval expired unanswered after waiting period.\n"
+                    f"Issue #{expired_action['issue_id']}, step '{expired_action['step']}'.\n"
+                    f"Worktree: {expired_action['worktree']}\n"
+                    f"Action: {action_str}\n"
+                    f"Requested by: {expired_action['requested_by']}\n"
+                    f"Created: {expired_action['created_at']}\n"
+                    f"Expired: {expired_action['expires_at']}\n"
+                    f"\n"
+                    f"The step remains blocked. The approval will re-escalate when "
+                    f"the worker attempts this step again."
+                )
+                conn.execute(
+                    "INSERT INTO messages (from_team, to_team, subject, body, priority, "
+                    "issue_id, kind, status, reply_to) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    ("engine", "orchestration", subject, body, "high", expired_action["issue_id"],
+                     "request", "pending", None),
+                )
+        # Fetch all rows with the requested status
+        rows = conn.execute(
+            _PENDING_ACTION_SELECT + " WHERE status = %s ORDER BY created_at",
+            (status,),
+        ).fetchall()
+    return [dict(zip(_PENDING_ACTION_COLS, r)) for r in rows]
+
+
+def resolve_pending_action(
+    pool: ConnectionPool,
+    action_id: int,
+    status: str,
+    resolved_by: str,
+) -> dict[str, Any]:
+    """Resolve a pending action to 'approved' or 'denied', setting resolved_by
+    and appending the corresponding event. Only transitions FROM 'pending' are
+    allowed. Raises ValueError on invalid transition or unknown id."""
+    if status not in ("approved", "denied"):
+        raise ValueError(f"Invalid status {status!r}; must be 'approved' or 'denied'")
+    event_type = "action_approved" if status == "approved" else "action_denied"
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "UPDATE pending_actions SET status = %s, resolved_by = %s, resolved_at = now() "
+            "WHERE id = %s AND status = 'pending' "
+            f"RETURNING {', '.join(_PENDING_ACTION_COLS)}",
+            (status, resolved_by, action_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Action {action_id} not found or not in 'pending' status")
+        result = dict(zip(_PENDING_ACTION_COLS, row))
+        if result["issue_id"]:
+            _append_event(conn, result["issue_id"], event_type, None, None, {
+                "action_id": result["id"],
+                "worktree": result["worktree"],
+                "step": result["step"],
+                "action": result["action"],
+                "resolved_by": resolved_by,
+                "machine": True,
+            })
+    return result
+
+
+def find_approved_action(
+    pool: ConnectionPool,
+    issue_id: int,
+    step: str,
+    action: str,
+) -> Optional[dict[str, Any]]:
+    """Find the newest 'approved' action matching the (issue_id, step, action)
+    triple. Returns None if no match found."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            _PENDING_ACTION_SELECT + " "
+            "WHERE issue_id = %s AND step = %s AND action = %s AND status = 'approved' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (issue_id, step, action),
+        ).fetchone()
+    return dict(zip(_PENDING_ACTION_COLS, row)) if row else None
+
+
+def consume_approved_action(pool: ConnectionPool, action_id: int) -> dict[str, Any]:
+    """Consume an approved action by transitioning it to 'executed'. One-shot
+    semantics: an approval unblocks exactly one run. Raises ValueError if the
+    action is not in 'approved' status."""
+    with pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            "UPDATE pending_actions SET status = 'executed', resolved_at = now() "
+            "WHERE id = %s AND status = 'approved' "
+            f"RETURNING {', '.join(_PENDING_ACTION_COLS)}",
+            (action_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Action {action_id} not found or not in 'approved' status")
+        result = dict(zip(_PENDING_ACTION_COLS, row))
+        if result["issue_id"]:
+            _append_event(conn, result["issue_id"], "action_executed", None, None, {
+                "action_id": result["id"],
+                "worktree": result["worktree"],
+                "step": result["step"],
+                "action": result["action"],
+                "machine": True,
+            })
+    return result
 
 
 # -- issue <-> ADR relevance links (migration 0020) ------------------------- #

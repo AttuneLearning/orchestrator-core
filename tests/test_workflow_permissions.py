@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from typing import Any
 
 from orchestrator.workflow.permissions import Permissions, authorize
 
@@ -21,6 +22,17 @@ class Action:
 
     run: str = ""
     builtin: str = ""
+
+
+@dataclass
+class SourcedAction:
+    """Local stand-in for RequiredAction that also carries a `.source` attribute,
+    for provenance-trust tests. Kept separate from `Action` (which has no
+    `source` field at all) to prove the "absent attribute -> no trust" rule."""
+
+    run: str = ""
+    builtin: str = ""
+    source: Any = ""
 
 
 def sha256_of(s: str) -> str:
@@ -43,6 +55,88 @@ class TestBuiltinIdentity:
         action = Action(builtin="node-deps-reconcile")
         perms = Permissions(deny=("node-deps-reconcile",))
         assert authorize(action, perms) == "deny"
+
+
+class TestProvenanceTrust:
+    """Rule 3 (amended during Phase C): action.source in ("default", "workspace")
+    is trusted by identity, same as a builtin — no allow-list entry needed. This
+    is safe only because `source` is stamped unconditionally per layer by
+    merge._parse_action_list, so a repo profile can never forge it (see
+    permissions.py module docstring + test_workflow_security.py composed tests
+    for the spoof-proof-stamping proof)."""
+
+    def test_source_default_custom_run_allows(self):
+        """An engine-shipped default action with a custom `run:` string (e.g. the
+        defaults-layer cleanup `git reset --hard && git clean -fd`) is trusted by
+        source, with empty perms and no allow-list entry."""
+        action = SourcedAction(run="git reset --hard && git clean -fd", source="default")
+        assert authorize(action, Permissions()) == "allow"
+
+    def test_source_workspace_custom_run_allows(self):
+        """An action authored directly in the operator's own workspace manifest is
+        self-authorizing by definition."""
+        action = SourcedAction(run="anything the operator wrote", source="workspace")
+        assert authorize(action, Permissions()) == "allow"
+
+    def test_source_repo_unchanged_escalates(self):
+        """A repo-layer action's source is 'repo' — unaffected by this rule, still
+        needs an explicit allow-list grant or it escalates."""
+        action = SourcedAction(run="npm run build", source="repo")
+        assert authorize(action, Permissions()) == "escalate"
+
+    def test_source_absent_attribute_escalates(self):
+        """The plain `Action` stub has no `source` attribute at all. Absent means
+        NO trust — must not silently allow."""
+        action = Action(run="git reset --hard && git clean -fd")
+        assert authorize(action, Permissions()) == "escalate"
+
+    def test_source_none_escalates(self):
+        """An explicit `source=None` must not be trusted (fail safe, not crash)."""
+        action = SourcedAction(run="git reset --hard && git clean -fd", source=None)
+        assert authorize(action, Permissions()) == "escalate"
+
+    def test_source_non_str_escalates(self):
+        """A non-str source (e.g. an int, list, or other lookalike garbage) must
+        not be trusted — this rule only ever matches an exact str comparison."""
+        action = SourcedAction(run="git reset --hard && git clean -fd", source=123)
+        assert authorize(action, Permissions()) == "escalate"
+
+        action2 = SourcedAction(run="git reset --hard && git clean -fd", source=["default"])
+        assert authorize(action2, Permissions()) == "escalate"
+
+    def test_deny_beats_source_trust(self):
+        """Threat model: deny is absolute — even a source='default' engine action
+        can be kill-switched by an explicit deny entry."""
+        cmd = "git reset --hard && git clean -fd"
+        action = SourcedAction(run=cmd, source="default")
+        perms = Permissions(deny=(cmd,))
+        assert authorize(action, perms) == "deny"
+
+    def test_deny_beats_source_workspace(self):
+        cmd = "rm -rf /some/scratch/dir"
+        action = SourcedAction(run=cmd, source="workspace")
+        perms = Permissions(deny=(cmd,))
+        assert authorize(action, perms) == "deny"
+
+    def test_source_trust_does_not_leak_into_allow_list_matching(self):
+        """Source trust is a separate, coarse-grained rule — it must not cause a
+        'repo' sourced action to be allowed via some accidental interaction with
+        the allow-list or sha256 matching logic, and a 'default'/'workspace'
+        sourced action's run string must not need to appear in perms.allow at all
+        (empty allow list still allows via source, proving the two mechanisms are
+        independent)."""
+        action_repo = SourcedAction(run="npm run build", source="repo")
+        perms = Permissions(allow=())
+        assert authorize(action_repo, perms) == "escalate"
+
+        action_default = SourcedAction(run="npm run build", source="default")
+        assert authorize(action_default, Permissions(allow=())) == "allow"
+
+    def test_source_trust_independent_of_builtin_field(self):
+        """A source-trusted action with no builtin set must still allow purely on
+        source (proving rule 3 doesn't require rule 2's builtin path)."""
+        action = SourcedAction(run="npm run typecheck && npm test", builtin="", source="default")
+        assert authorize(action, Permissions()) == "allow"
 
 
 class TestBypass:

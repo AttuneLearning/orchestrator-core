@@ -907,6 +907,28 @@ def create_app(pool: Optional[ConnectionPool] = None,
         repo.delete_adr(pool, adr_key)
         return RedirectResponse("/adrs", status_code=303)
 
+    @app.get("/actions", response_class=HTMLResponse)
+    def actions_page() -> str:
+        # list_pending_actions("pending") lazily expires overdue rows first, so
+        # calling it before the resolved-status lookups picks up any rows that
+        # flip to 'expired' on this very request.
+        pending = repo.list_pending_actions(pool, status="pending")
+        resolved: list = []
+        for st in ("approved", "denied", "expired", "executed"):
+            resolved.extend(repo.list_pending_actions(pool, status=st))
+        resolved.sort(key=lambda a: a["resolved_at"] or a["created_at"], reverse=True)
+        return templates.actions_page(pending, resolved[:20])
+
+    @app.post("/actions/{action_id}/approve")
+    def action_approve(action_id: int):
+        repo.resolve_pending_action(pool, action_id, "approved", resolved_by="dashboard")
+        return RedirectResponse("/actions", status_code=303)
+
+    @app.post("/actions/{action_id}/deny")
+    def action_deny(action_id: int):
+        repo.resolve_pending_action(pool, action_id, "denied", resolved_by="dashboard")
+        return RedirectResponse("/actions", status_code=303)
+
     @app.post("/issues/{issue_id}/directive")
     def directive(issue_id: int):
         repo.apply_directive(pool, issue_id, "resume", note="dashboard", actor="dashboard")

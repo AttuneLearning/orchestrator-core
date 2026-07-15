@@ -862,6 +862,89 @@ def _run_doctor_checks(settings) -> list:
     else:
         checks.append(C("reasoner", W,
                         "stub/unset — engine decisions will be deterministic placeholders"))
+
+    # --- Workflow profile lints (WP-17) ---
+    # Lint 4: workflow_profile enabled but workspace_manifest unset or missing
+    if settings.workflow_profile == "enabled":
+        manifest_str = str(settings.workspace_manifest or "").strip()
+        if not manifest_str:
+            checks.append(C("workflow_profile", F,
+                            "workflow_profile=enabled but workspace_manifest is unset"))
+        else:
+            manifest_path = Path(manifest_str)
+            if not manifest_path.is_file():
+                checks.append(C("workflow_profile", F,
+                                f"workspace_manifest file not found: {manifest_str}"))
+
+    # Worktree-dependent lints: get first verify_worktrees value if available
+    worktree = None
+    if settings.verify_worktrees:
+        worktree = next(iter(settings.verify_worktrees.values()), None)
+
+    if worktree:
+        try:
+            from .workflow import loader, models, permissions as perm_module, adapters
+
+            # Load the effective profile
+            profile = loader.load_effective(settings, worktree)
+
+            # Lint 1: Profile has warnings
+            if profile.warnings:
+                for warning in profile.warnings:
+                    checks.append(C("workflow_profile", W, f"profile warning: {warning}"))
+
+            # Lint 2: Validate all actions in the profile
+            validation_problems = models.validate(profile)
+            for problem in validation_problems:
+                checks.append(C("workflow_profile", W, f"validation: {problem}"))
+
+            # Lint 3: Actions with escalate verdict
+            perms = loader.load_permissions(settings)
+            escalate_actions = []
+            for step in profile.steps.values():
+                # Check role-agnostic actions
+                for action in step.actions:
+                    if perm_module.authorize(action, perms) == "escalate":
+                        escalate_actions.append(
+                            f"{step.name}: {action.run or action.builtin}"
+                        )
+                # Check role-specific actions
+                for role, actions in step.by_role.items():
+                    for action in actions:
+                        if perm_module.authorize(action, perms) == "escalate":
+                            escalate_actions.append(
+                                f"{step.name}[{role}]: {action.run or action.builtin}"
+                            )
+            if escalate_actions:
+                checks.append(C("workflow_profile", W,
+                                f"{len(escalate_actions)} custom action(s) will require approval: "
+                                + "; ".join(escalate_actions)))
+
+            # Lint 5: Repo profile has permissions key (detected via loader warning)
+            # The loader produces a warning when it detects repo-layer permissions.
+            # Check if any warning mentions "permissions".
+            if any("permissions" in w for w in profile.warnings):
+                checks.append(C("workflow_profile", F,
+                                "repo profile contains permissions: key (self-authorization "
+                                "not allowed — remove it and set permissions in workspace manifest)"))
+
+            # Lint 6: Stack has no adapter or empty default steps
+            if profile.stack:
+                adapter = adapters.get_adapter(profile.stack)
+                if adapter is None:
+                    checks.append(C("workflow_profile", W,
+                                    f"detected stack '{profile.stack}' has no adapter"))
+                else:
+                    steps = adapter.default_steps()
+                    if not steps:
+                        checks.append(C("workflow_profile", W,
+                                        f"detected stack '{profile.stack}' adapter has no default steps"))
+
+        except Exception as exc:  # noqa: BLE001
+            # Profile loading or lint execution failed — report as warning, not blocker
+            checks.append(C("workflow_profile", W,
+                            f"could not load effective profile: {exc}"))
+
     return checks
 
 
@@ -872,6 +955,70 @@ def _cmd_doctor(args, settings) -> int:
     print(f"orchestrator doctor ({settings.roster_file}):")
     print(report)
     return code
+
+
+def _cmd_workflow_explain(args, settings) -> int:
+    """Print each action in the effective workflow profile with its authorization verdict.
+
+    Loads the profile from the three layers (defaults, repo, workspace) and authorizes
+    each action against the workspace-granted permissions. Outputs one line per action
+    with step, role-scope, verdict, source, and the run/builtin string.
+
+    Exit codes: 0 normally; 2 if any action verdict is 'deny' OR the profile has warnings.
+    """
+    from pathlib import Path
+    from .workflow import loader, permissions as perm_module
+
+    # Resolve the team's worktree
+    team = getattr(args, "team", None)
+    if team and team in settings.verify_worktrees:
+        worktree = Path(settings.verify_worktrees[team])
+    else:
+        worktree = Path.cwd()
+
+    # Role defaults to "qa"
+    role = getattr(args, "role", None) or "qa"
+
+    # Load the effective profile and permissions
+    try:
+        profile = loader.load_effective(settings, worktree, role=role)
+        perms = loader.load_permissions(settings)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: failed to load workflow profile: {exc}", file=sys.stderr)
+        return 2
+
+    # Collect any violations
+    has_deny = False
+    has_warnings = bool(profile.warnings)
+
+    # Print each step's actions
+    for step_name in profile.steps:
+        step = profile.step(step_name)
+        actions = step.actions_for(role)
+        for action in actions:
+            verdict = perm_module.authorize(action, perms)
+            if verdict == "deny":
+                has_deny = True
+
+            # Format role-scope: show it only if there's a role-specific action
+            role_scope = f" [{role}]" if role and role in step.by_role else ""
+
+            # Format source
+            source_str = f" [{action.source}]" if action.source else ""
+
+            # Format the run or builtin string
+            run_or_builtin = action.run if action.run else f"@{action.builtin}"
+
+            print(f"{step_name}{role_scope} {verdict}{source_str} {run_or_builtin}")
+
+    # Print warnings
+    for warning in profile.warnings:
+        print(f"warning: {warning}")
+
+    # Exit code: 0 normally, 2 if any deny or warnings
+    if has_deny or has_warnings:
+        return 2
+    return 0
 
 
 def _cmd_init(args, settings) -> int:
@@ -1202,6 +1349,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="preflight: validate an instance is ready to launch "
                              "(DB, migrations, roster, pipelines, agents, reasoner)")
     dp.set_defaults(func=_cmd_doctor)
+
+    wf = sub.add_parser("workflow-explain",
+                        help="print the effective workflow profile with action authorization verdicts")
+    wf.add_argument("--team", default=None,
+                    help="team name (resolves worktree from verify_worktrees if present, else CWD)")
+    wf.add_argument("--role", default=None,
+                    help="role name (default: qa if not given)")
+    wf.set_defaults(func=_cmd_workflow_explain)
 
     sub.add_parser("status", help="print a state snapshot").set_defaults(func=_cmd_status)
     return p

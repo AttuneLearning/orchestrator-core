@@ -116,11 +116,16 @@ class TestEscalate:
     def test_escalate_blocks_and_skips_later_actions(self, tmp_path: Path) -> None:
         marker = tmp_path / "marker2"
         actions = (
-            RequiredAction(run="custom-unapproved-command", on_fail="block"),
-            RequiredAction(run=f"touch {marker}", on_fail="block"),
+            # source="repo": engine/workspace-sourced actions are now trusted by
+            # provenance (permissions.py rule 3) — a repo-sourced custom command
+            # is the one case that still has no grant and must escalate.
+            RequiredAction(
+                run="custom-unapproved-command", on_fail="block", source="repo"
+            ),
+            RequiredAction(run=f"touch {marker}", on_fail="block", source="repo"),
         )
         profile = _profile_with("verify", actions)
-        perms = Permissions()  # no allow/deny/bypass -> custom run escalates
+        perms = Permissions()  # no allow/deny/bypass -> custom repo-sourced run escalates
 
         result = run_step(tmp_path, profile, "verify", None, perms)
 
@@ -130,7 +135,9 @@ class TestEscalate:
         assert not marker.exists()
 
     def test_default_escalation_cb_is_none_means_pending(self, tmp_path: Path) -> None:
-        actions = (RequiredAction(run="custom-cmd", on_fail="block"),)
+        # source="repo": must actually escalate (not be trusted by provenance)
+        # for this to exercise the "no escalation_cb -> pending" path.
+        actions = (RequiredAction(run="custom-cmd", on_fail="block", source="repo"),)
         profile = _profile_with("verify", actions)
 
         result = run_step(tmp_path, profile, "verify", None, Permissions(), escalation_cb=None)
@@ -139,12 +146,17 @@ class TestEscalate:
 
     def test_escalation_cb_approved_lets_action_run(self, tmp_path: Path) -> None:
         marker = tmp_path / "ran"
-        actions = (RequiredAction(run=f"touch {marker}", on_fail="block"),)
+        # source="repo": force the escalate path so escalation_cb is actually
+        # exercised (a "default"/"workspace" source would allow directly and
+        # never call escalation_cb at all).
+        actions = (
+            RequiredAction(run=f"touch {marker}", on_fail="block", source="repo"),
+        )
         profile = _profile_with("verify", actions)
 
         result = run_step(
             tmp_path, profile, "verify", None, Permissions(),
-            escalation_cb=lambda action: "approved",
+            escalation_cb=lambda action, phase: "approved",
         )
 
         assert result.status == "ok"
@@ -152,15 +164,35 @@ class TestEscalate:
         assert result.results[0].ok is True
 
     def test_escalation_cb_pending_still_blocks(self, tmp_path: Path) -> None:
-        actions = (RequiredAction(run="custom-cmd", on_fail="block"),)
+        actions = (RequiredAction(run="custom-cmd", on_fail="block", source="repo"),)
         profile = _profile_with("verify", actions)
 
         result = run_step(
             tmp_path, profile, "verify", None, Permissions(),
-            escalation_cb=lambda action: "pending",
+            escalation_cb=lambda action, phase: "pending",
         )
 
         assert result.status == "blocked_on_approval"
+
+    def test_escalation_cb_denied_fails_step_now(self, tmp_path: Path) -> None:
+        """WP-13: a "denied" decision is a hard stop, distinct from "pending" —
+        the step fails immediately (not blocked_on_approval) and the reason
+        names the denial."""
+        marker = tmp_path / "never-runs"
+        actions = (
+            RequiredAction(run=f"touch {marker}", on_fail="block", source="repo"),
+        )
+        profile = _profile_with("verify", actions)
+
+        result = run_step(
+            tmp_path, profile, "verify", None, Permissions(),
+            escalation_cb=lambda action, phase: "denied",
+        )
+
+        assert result.status == "failed"
+        assert "denied" in result.reason.lower()
+        assert not marker.exists()  # the denied action never actually ran
+        assert result.results[0].ok is False
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +252,76 @@ class TestOnFail:
 
         result = run_step(
             tmp_path, profile, "verify", None, perms,
-            escalation_cb=lambda action: "approved",
+            escalation_cb=lambda action, phase: "approved",
         )
 
         assert result.status == "ok"
         assert marker.exists()
+
+    def test_on_fail_escalate_denied_fails_step_now(self, tmp_path: Path) -> None:
+        """WP-13: on_fail="escalate" + a "denied" decision is also a hard stop
+        (not blocked_on_approval), distinct from the pending case above."""
+        marker = tmp_path / "marker"
+        actions = (
+            RequiredAction(run="false", on_fail="escalate"),
+            RequiredAction(run=f"touch {marker}", on_fail="block"),
+        )
+        profile = _profile_with("verify", actions)
+        perms = Permissions(bypass=True)
+
+        result = run_step(
+            tmp_path, profile, "verify", None, perms,
+            escalation_cb=lambda action, phase: "denied",
+        )
+
+        assert result.status == "failed"
+        assert "denied" in result.reason.lower()
+        assert not marker.exists()  # short-circuited: the second action never ran
+
+
+# ---------------------------------------------------------------------------
+# escalation phase discriminator (WP-12 / Gate A QA finding 4b)
+#
+# authorize-time escalation and on_fail-triggered escalation must be
+# distinguishable to the callback (and, downstream, to a human approver) —
+# the runner names which case it is via the second escalation_cb argument.
+
+
+class TestEscalationPhase:
+    def test_authorize_escalate_passes_phase_authorize(self, tmp_path: Path) -> None:
+        seen_phases: list[str] = []
+
+        def cb(action: RequiredAction, phase: str) -> str:
+            seen_phases.append(phase)
+            return "pending"
+
+        # source="repo": no provenance trust and no grant -> escalates at
+        # authorize time (the action never gets a chance to run).
+        actions = (RequiredAction(run="custom-cmd", on_fail="block", source="repo"),)
+        profile = _profile_with("verify", actions)
+
+        result = run_step(tmp_path, profile, "verify", None, Permissions(), escalation_cb=cb)
+
+        assert result.status == "blocked_on_approval"
+        assert seen_phases == ["authorize"]
+
+    def test_on_fail_escalate_passes_phase_on_fail(self, tmp_path: Path) -> None:
+        seen_phases: list[str] = []
+
+        def cb(action: RequiredAction, phase: str) -> str:
+            seen_phases.append(phase)
+            return "pending"
+
+        # bypass=True: authorized to run outright; it fails, and on_fail
+        # escalates -- this is the on_fail phase, distinct from authorize.
+        actions = (RequiredAction(run="false", on_fail="escalate"),)
+        profile = _profile_with("verify", actions)
+        perms = Permissions(bypass=True)
+
+        result = run_step(tmp_path, profile, "verify", None, perms, escalation_cb=cb)
+
+        assert result.status == "blocked_on_approval"
+        assert seen_phases == ["on_fail"]
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +472,9 @@ class TestEventCb:
 
     def test_escalated_event_on_escalate(self, tmp_path: Path) -> None:
         events, cb = _collector()
-        action = RequiredAction(run="custom-cmd", on_fail="block")
+        # source="repo": a repo-sourced custom command has no provenance trust
+        # and no grant, so it still escalates.
+        action = RequiredAction(run="custom-cmd", on_fail="block", source="repo")
         profile = _profile_with("verify", (action,))
 
         run_step(tmp_path, profile, "verify", None, Permissions(), event_cb=cb)
