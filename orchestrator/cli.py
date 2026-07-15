@@ -1073,6 +1073,24 @@ def _cmd_init(args, settings) -> int:
     dropin_path.write_text(body)
     print("wrote", dropin_path)
 
+    # Scaffold the project's roster if it doesn't exist yet. Real project
+    # rosters (config/roster.<project>.yaml) are gitignored — the tool ships
+    # only templates — so the install wizard must create a working one from
+    # config/roster.example.pull.yaml. The default --roster-file points at the
+    # tracked generic roster.yaml, which already exists (no scaffold needed).
+    roster_path = (REPO_ROOT / roster_file) if not Path(roster_file).is_absolute() \
+        else Path(roster_file)
+    if not roster_path.exists():
+        template = REPO_ROOT / "config" / "roster.example.pull.yaml"
+        if template.is_file():
+            roster_path.parent.mkdir(parents=True, exist_ok=True)
+            roster_path.write_text(template.read_text())
+            print(f"scaffolded roster {roster_path} (from roster.example.pull.yaml — "
+                  "edit teams/repos before your first real run)")
+        else:
+            print(f"warning: roster {roster_path} missing and no template to scaffold "
+                  "from — create it before running", file=sys.stderr)
+
     try:
         created = _ensure_database(database_url)
         print("created database" if created else "database already exists")

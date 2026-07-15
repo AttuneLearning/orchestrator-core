@@ -10,3 +10,14 @@ backups/
 setup_agent.py
 templates/project-launchers/agent-launchers/secrets.env
 **/agent-launchers/secrets.env
+
+# Operator/project-local config — NEVER ship real project config in the public
+# repo. The tool ships *.example.yaml templates + the generic default roster;
+# `orchestrator init` scaffolds the real (gitignored) files at install time.
+config/instances.yaml
+config/instances.d/
+config/roster.*.yaml
+!config/roster.example.pull.yaml
+!config/roster.monorepo.yaml
+# Operator's workspace manifest / permission grants, if kept inside the repo dir.
+config/*.manifest.yaml

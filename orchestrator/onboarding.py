@@ -66,7 +66,9 @@ def recommend_tier(models: list[str]) -> str:
 def build_instance_entry(*, label: str, database_url: str, roster_file: str,
                          tier: str, extra_settings: dict | None = None) -> dict:
     """The instance mapping value (matches an instances.yaml entry)."""
-    settings: dict = {"decomposition_tier": tier}
+    # `workflow_profile: legacy` is written explicitly so the operator can see
+    # and flip the Workflow Profile cutover toggle; legacy is today's behavior.
+    settings: dict = {"decomposition_tier": tier, "workflow_profile": "legacy"}
     if extra_settings:
         settings.update(extra_settings)
     return {
