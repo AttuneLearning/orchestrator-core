@@ -165,3 +165,50 @@ single-lane implementation, QA orchestration via `verify_run`. T3 local
 (qwen3-coder): single-file, contract-bound, test-guarded backend CRUD only.
 Promotion/demotion per lane on GAP-5 telemetry. All tiers untrusted by default —
 the gates in §6 are the admission control.
+
+## 9. Workflow Profiles
+
+**Status**: `refresh` and `promote` steps are now **wired and fully operational**.
+
+Profiles define custom actions for pipeline steps: `cleanup`, `refresh`, `services`,
+`prepare`, `verify`, and `promote`. The default profile (`defaults/workflow.yaml`)
+declares no actions for `refresh` and `promote` — they are unconditionally available
+for repos and operators to opt into, but intentionally ship with no baseline
+implementation. Real deploy/refresh actions belong in the repo profile
+(`.orchestrator/workflow.yaml`) or the operator's workspace manifest, never the
+engine defaults.
+
+**Refresh** (dev `git merge main` / qa rebuild verify branch / branch hygiene):
+- Wired in `verify_run` (harness-executed): runs after `cleanup`, before the
+  deterministic `git checkout -B verify_branch branch` that prepares the worktree.
+  A failed or blocked refresh aborts verification before checkout — the worktree
+  is never tested against a stale tree.
+- Wired in `_apply_in_worktree_enabled` (apply gate engine path, enabled-profile
+  mode): runs after `cleanup`, before `services`/`prepare`/`verify`. Same failure
+  semantics — a blocked or failed refresh halts the step and returns early without
+  attempting verification.
+
+**Promote** (deploy/CI-CD hook, runs **after** successful merge):
+- Wired in `promote()` (human CLI directive, enabled-profile mode only): once the
+  merge to the base branch succeeds and the `promoted` event is recorded, runs the
+  profile's `promote` step actions (typically deploy/CI commands). The merge is
+  **already committed and unconditional** at this point — a blocked or failed
+  `promote` step does NOT roll back the merge; it only gates what happens after.
+  Execution order: `merge → (gated) promote step`.
+
+**Security note (§5)**: a `promote` action with `source: repo` (a deploy command
+authored by a repo committer) is authorized exactly like any other custom action
+via `permissions.authorize()`. Unless the workspace manifest allow-lists it, it
+escalates to `/actions` for operator approval. Nothing here bypasses that gate;
+the permission flow is unchanged from any other repo-authored action.
+
+**Known limitation**: if a `promote` step action is `blocked_on_approval`, there
+is no automatic resume path — `promote()` is not safely re-callable (the merge
+would conflict or no-op on a second invocation). After approving the deploy on
+the `/actions` queue, the operator must manually re-run the promote command or use
+a future "re-run promote step" dashboard action to complete the deployment.
+
+All steps declare a `timeout` (default varies by step type) and `on_fail`
+behavior: `block` (halt), `warn` (log and continue), or `escalate` (request
+approval). The default `cleanup` step (inline `git reset --hard && git clean`)
+has a 300s timeout and blocks on failure.

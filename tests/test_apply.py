@@ -236,6 +236,7 @@ def test_apply_enabled_ok_path(target_repo, monkeypatch):
     """Enabled mode: cleanup ok + prepare ok + verify ok -> passed=True with proper keys."""
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok"),
     }
@@ -277,10 +278,88 @@ def test_apply_enabled_ok_path(target_repo, monkeypatch):
     assert set(result) >= {"passed", "branch", "commit", "committed", "returncode"}
 
 
+def test_apply_enabled_refresh_failed(target_repo, monkeypatch):
+    """Enabled mode: cleanup ok + refresh failed -> passed=False with error,
+    naming refresh, and prepare/verify are never reached."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="failed",
+                             reason="failed: git merge main: exit code 1"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "refresh": [("failed", _action_payload(
+            "allow", run="git merge main",
+            ok=False, reason="exit code 1", returncode=1,
+        ))],
+    }
+
+    from orchestrator.apply import worktree as wt_module
+    monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)
+    monkeypatch.setattr(wt_module, "run_step", _fake_run_step(script, events))
+
+    s = load_settings()
+    s.apply_repo_path = str(target_repo)
+    s.workflow_profile = "enabled"
+
+    issue = Issue(id=106, goal_id=1, title="test", team="backend")
+    artifact = "test artifact"
+
+    result = _apply_in_worktree(issue, artifact, s)
+
+    assert result["passed"] is False
+    assert "refresh failed" in result["error"]
+    assert result["branch"] == "issue-106"
+    assert result["committed"] is True
+
+
+def test_apply_enabled_refresh_blocked(target_repo, monkeypatch):
+    """Enabled mode: cleanup ok + refresh escalates -> passed=None +
+    status=blocked_on_approval, step='refresh'."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="blocked_on_approval",
+                             reason="awaiting approval: git merge main"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "refresh": [("escalated", _action_payload(
+            "escalate", run="git merge main", decision="pending",
+        ))],
+    }
+
+    from orchestrator.apply import worktree as wt_module
+    monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)
+    monkeypatch.setattr(wt_module, "run_step", _fake_run_step(script, events))
+
+    s = load_settings()
+    s.apply_repo_path = str(target_repo)
+    s.workflow_profile = "enabled"
+
+    issue = Issue(id=107, goal_id=1, title="test", team="backend")
+    artifact = "test artifact"
+
+    result = _apply_in_worktree(issue, artifact, s)
+
+    assert result["passed"] is None
+    assert result["status"] == "blocked_on_approval"
+    assert result["step"] == "refresh"
+    assert "git merge main" in result["action"]
+    assert result["branch"] == "issue-107"
+    assert result["commit"]
+
+
 def test_apply_enabled_prepare_failed(target_repo, monkeypatch):
     """Enabled mode: cleanup ok + prepare failed -> passed=False with error + deps detail."""
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="failed",
                              reason="failed: npm ci: exit code 1"),
     }
@@ -320,6 +399,7 @@ def test_apply_enabled_prepare_blocked(target_repo, monkeypatch):
     """Enabled mode: cleanup ok + prepare escalates -> passed=None + status=blocked_on_approval."""
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="blocked_on_approval",
                              reason="awaiting approval: custom-setup"),
     }
@@ -357,6 +437,7 @@ def test_apply_enabled_verify_failed(target_repo, monkeypatch):
     """Enabled mode: cleanup ok + prepare ok + verify failed -> passed=False with returncode from verify step."""
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="failed", reason="failed: verify: exit code 1"),
     }
@@ -399,6 +480,7 @@ def test_apply_enabled_verify_blocked(target_repo, monkeypatch):
     """Enabled mode: cleanup ok + prepare ok + verify escalates -> passed=None + status=blocked_on_approval."""
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="blocked_on_approval",
                              reason="awaiting approval: deploy-prod"),
@@ -441,6 +523,7 @@ def test_apply_enabled_verify_failed_action_with_warn_reports_failed(target_repo
     -> passed=False with returncode from the failed action, not synthesized from status."""
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok", results=[]),
     }

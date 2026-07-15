@@ -179,6 +179,7 @@ def test_legacy_red_path_records_failure(gitrepo, db):
 def test_enabled_ok_path_emits_deps_reinstalled_and_tests_run(gitrepo, db, monkeypatch):
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok"),
     }
@@ -226,6 +227,7 @@ def test_enabled_ok_path_emits_deps_reinstalled_and_tests_run(gitrepo, db, monke
 def test_enabled_prepare_failed_records_tests_run_failure(gitrepo, db, monkeypatch):
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="failed",
                              reason="failed: node-deps-reconcile: npm ci failed"),
     }
@@ -258,6 +260,7 @@ def test_enabled_prepare_failed_records_tests_run_failure(gitrepo, db, monkeypat
 def test_enabled_prepare_blocked_never_records_failed_tests_run(gitrepo, db, monkeypatch):
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="blocked_on_approval",
                              reason="awaiting approval: rm -rf /tmp/x"),
     }
@@ -294,6 +297,7 @@ def test_enabled_prepare_blocked_never_records_failed_tests_run(gitrepo, db, mon
 def test_enabled_verify_failed_records_tests_run_failure(gitrepo, db, monkeypatch):
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="failed", reason="failed: npm test: exit code 1"),
     }
@@ -331,6 +335,7 @@ def test_enabled_verify_failed_records_tests_run_failure(gitrepo, db, monkeypatc
 def test_enabled_verify_blocked_never_records_failed_tests_run(gitrepo, db, monkeypatch):
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="blocked_on_approval",
                              reason="awaiting approval: custom-deploy-step"),
@@ -390,6 +395,7 @@ def test_enabled_verify_failed_action_with_warn_reports_failed(gitrepo, db, monk
 
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok", results=[failed_result, good_result]),
     }
@@ -583,8 +589,122 @@ def test_enabled_cleanup_blocked_on_approval_returns_blocked(gitrepo, db, monkey
 
     out = tools["verify_run"](1)
 
-    assert out["passed"] is False
+    assert out["passed"] is None
+    assert out["status"] == "blocked_on_approval"
     assert "cleanup blocked on approval" in out["tail"]
+
+
+# ---------------------------------------------------------------------------
+# refresh step wiring: runs after cleanup, BEFORE the deterministic
+# `git checkout -B verify_branch branch` — a failed/blocked refresh must not
+# check out a stale worktree. An empty refresh (no actions, the default
+# profile) is a no-op that proceeds straight to checkout.
+
+
+def _verify_branch_exists(gitrepo) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(gitrepo), "rev-parse", "--verify", "--quiet", "_verify-1"],
+        capture_output=True,
+    ).returncode == 0
+
+
+def test_enabled_refresh_runs_before_checkout(gitrepo, db, monkeypatch):
+    """refresh is called (and completes) before checkout — call-order proof
+    via a run_step recorder, mirroring the services no-op call-order test."""
+    calls: list[str] = []
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
+        "prepare": StepResult(status="ok"),
+        "verify": StepResult(status="ok"),
+    }
+    events = {
+        "verify": [("executed", _action_payload(
+            "allow", run="npm run typecheck && npm test",
+            ok=True, reason="", returncode=0, stdout="ok\n", stderr="",
+        ))],
+    }
+    base_fake = _fake_run_step(script, events)
+
+    def _tracking_fake(worktree, profile, step_name, role, perms, **kw):
+        calls.append(step_name)
+        return base_fake(worktree, profile, step_name, role, perms, **kw)
+
+    monkeypatch.setattr(tools_issues, "run_step", _tracking_fake)
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is True
+    assert calls == ["cleanup", "refresh", "prepare", "verify"]
+    # checkout actually ran (refresh didn't short-circuit it)
+    assert _verify_branch_exists(gitrepo)
+
+
+def test_enabled_refresh_failed_returns_failure_before_checkout(gitrepo, db, monkeypatch):
+    """A failed refresh returns a clear verify failure naming refresh, WITHOUT
+    checking out — never verify a stale worktree."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="failed",
+                             reason="failed: git merge main: exit code 1"),
+    }
+    monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script))
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is False
+    assert "refresh failed" in out["tail"]
+    assert "git merge main" in out["tail"]
+    assert not _verify_branch_exists(gitrepo)
+
+
+def test_enabled_refresh_blocked_returns_blocked_before_checkout(gitrepo, db, monkeypatch):
+    """A blocked refresh returns blocked (passed None + status blocked_on_approval)
+    without proceeding to checkout."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="blocked_on_approval",
+                             reason="awaiting approval: git merge main"),
+    }
+    events = {
+        "refresh": [("escalated", _action_payload(
+            "escalate", run="git merge main", decision="pending",
+        ))]
+    }
+    monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is None
+    assert out["status"] == "blocked_on_approval"
+    assert "refresh blocked on approval" in out["tail"]
+    assert not _verify_branch_exists(gitrepo)
+
+
+def test_legacy_refresh_never_calls_run_step(gitrepo, db, monkeypatch):
+    """Hard acceptance bar: with the flag 'legacy', refresh must never be
+    invoked — run_step is not called for it (or anything else)."""
+    def _boom(*a, **k):
+        raise AssertionError("legacy mode must never call run_step (incl. refresh)")
+    monkeypatch.setattr(tools_issues, "run_step", _boom)
+
+    s = _settings(gitrepo, workflow_profile="legacy")
+    s.verify_cmd = "exit 0"
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is True
+    assert out["returncode"] == 0
 
 
 def test_enabled_verify_denied_action_includes_cmd_and_denial_reason(gitrepo, db, monkeypatch):
@@ -600,6 +720,7 @@ def test_enabled_verify_denied_action_includes_cmd_and_denial_reason(gitrepo, db
 
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="failed", results=[denied_result],
                             reason="denied: custom-unapproved-verify"),
@@ -651,6 +772,7 @@ def test_enabled_services_step_empty_proceeds_to_prepare(gitrepo, db, monkeypatc
     calls: list[str] = []
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok"),
     }
@@ -683,7 +805,7 @@ def test_enabled_services_step_empty_proceeds_to_prepare(gitrepo, db, monkeypatc
 
     assert out["passed"] is True
     assert "services" not in calls
-    assert calls == ["cleanup", "prepare", "verify"]
+    assert calls == ["cleanup", "refresh", "prepare", "verify"]
 
 
 def test_enabled_services_down_returns_service_not_ready_failure(gitrepo, db, monkeypatch):
@@ -695,6 +817,7 @@ def test_enabled_services_down_returns_service_not_ready_failure(gitrepo, db, mo
 
     script = {
         "cleanup": StepResult(status="ok"),
+        "refresh": StepResult(status="ok"),
         "services": StepResult(status="failed",
                               reason="denied (retry after failure): probe-tcp"),
     }

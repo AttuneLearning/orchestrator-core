@@ -8,6 +8,13 @@
 #   - block: halt the step
 #   - warn: log and continue to next action
 #   - escalate: ask for approval (WP-12 persistence, WP-13 semantics)
+#
+# `refresh` (dev merge-main / qa rebuild verify branch / branch hygiene) and
+# `promote` (deploy/CI-CD hook, run AFTER a successful merge) are now wired
+# into the run loop (verify_run, _apply_in_worktree_enabled, promote()) but
+# deliberately declare NO default actions here — a real deploy/refresh action
+# belongs in the repo profile (`.orchestrator/workflow.yaml`) or the operator's
+# workspace manifest, never the engine baseline. An empty step is a no-op.
 
 cleanup:
   - run: git reset --hard && git clean -fd

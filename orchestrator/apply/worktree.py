@@ -133,6 +133,39 @@ def _apply_in_worktree_enabled(
             "deps": {},
         }
 
+    # Refresh step (profile-extensible pre-verify hook, plan §3.1: dev
+    # `git merge main` / qa rebuild verify branch / branch hygiene) — runs
+    # right after cleanup, before services/prepare/verify. Same failed/
+    # blocked mapping as the other steps here. The default profile declares
+    # no refresh actions, so an unconfigured repo sees this as a no-op.
+    refresh_escalation_cb, refresh_phase_seen = _make_escalation_cb("refresh")
+    refresh_result = run_step(wt, profile, "refresh", "qa", perms, event_cb=None,
+                             escalation_cb=refresh_escalation_cb)
+
+    if refresh_result.status == "blocked_on_approval":
+        action = refresh_result.results[-1].action if refresh_result.results else None
+        return {
+            "passed": None,
+            "status": "blocked_on_approval",
+            "reason": refresh_result.reason,
+            "step": "refresh",
+            "action": _action_ident(action) if action is not None else refresh_result.reason,
+            "phase": refresh_phase_seen.get("phase", "authorize"),
+            "note": _BLOCKED_NOTE,
+            "branch": branch,
+            "commit": sha,
+        }
+
+    if refresh_result.status == "failed":
+        return {
+            "passed": False,
+            "error": f"refresh failed: {refresh_result.reason}",
+            "branch": branch,
+            "commit": sha,
+            "committed": committed,
+            "deps": {},
+        }
+
     # Services readiness gate (WP-18/plan step-4 wiring): a down default/
     # engine-declared service is an environment problem, not an approval
     # question, so a non-repo probe's on_fail=escalate is denied immediately
@@ -573,6 +606,16 @@ def promote(pool: ConnectionPool, issue: Issue, settings: Settings,
 
     Human directive only — the engine never calls this. Requires the latest
     verification event to have passed. Local merge; never pushes.
+
+    `workflow_profile: enabled` (WIRE-REFRESH-PROMOTE): once the merge succeeds and the
+    `promoted` event is recorded, run the effective profile's `promote` step
+    (plan §3.1 — deploy/CI-CD hook) in the just-merged repo. The merge is
+    ALREADY DONE and unconditional by this point — a blocked or failed
+    `promote` step never rolls it back, it only gates what happens AFTER the
+    merge (a deploy command). The default profile declares no promote
+    actions, so this is a no-op on every repo that hasn't opted in, and the
+    `legacy` (unset) flag never reaches this branch at all — byte-identical
+    to the pre-existing behavior.
     """
     if not settings.apply_repo_path:
         raise ValueError("apply_repo_path not configured")
@@ -595,4 +638,34 @@ def promote(pool: ConnectionPool, issue: Issue, settings: Settings,
     sha = _git(settings.apply_repo_path, "rev-parse", "HEAD").stdout.strip()
     record = {"actor": actor, "note": note, "branch": branch, "merge_commit": sha}
     repo.append_log(pool, issue.id, "promoted", record)
+
+    if settings.workflow_profile == "enabled":
+        # SECURITY (plan §5): a promote action with source="repo" (a deploy
+        # command a repo committer authored) is authorized exactly like any
+        # other custom action — permissions.authorize() escalates it unless
+        # the workspace manifest allow-lists it or grants bypass. Nothing
+        # here bypasses that gate; perms flows straight from the workspace
+        # manifest through load_permissions/run_step, unchanged.
+        perms = load_permissions(settings)
+        profile = load_effective(settings, settings.apply_repo_path, role=None)
+        escalation_cb = make_escalation_cb(
+            pool, issue.id, str(settings.apply_repo_path), "promote",
+            requested_by=f"promote:{actor}")
+        promote_result = run_step(settings.apply_repo_path, profile, "promote",
+                                  None, perms, escalation_cb=escalation_cb)
+
+        if promote_result.status == "ok":
+            record["promote_actions"] = "ran"
+        elif promote_result.status == "blocked_on_approval":
+            action = promote_result.results[-1].action if promote_result.results else None
+            record["promote"] = "blocked_on_approval"
+            # Use a distinct key — never clobber the human's promote `note`.
+            record["promote_note"] = (
+                f"{_action_ident(action) if action is not None else promote_result.reason} "
+                f"pending approval on /actions — merge is complete, deploy is gated. "
+                f"After approving the action on /actions, re-run "
+                f"`orchestrator apply-promote --issue {issue.id}` to complete the deploy.")
+        else:  # "failed"
+            record["promote_failed"] = promote_result.reason
+
     return record

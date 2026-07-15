@@ -805,12 +805,41 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
                                       event_cb=_cleanup_cb)
 
             if cleanup_result.status == "blocked_on_approval":
-                return {"passed": False, "returncode": 1, "duration_s": 0.0,
+                return {"passed": None, "status": "blocked_on_approval", "returncode": None, "duration_s": 0.0,
                         "tail": f"cleanup blocked on approval: {cleanup_result.reason}"}
 
             if cleanup_result.status == "failed":
                 return {"passed": False, "returncode": 1, "duration_s": 0.0,
                         "tail": f"cleanup failed: {cleanup_result.reason}"}
+
+            # Refresh step (profile-extensible pre-verify hook, plan §3.1: dev
+            # `git merge main` / qa rebuild verify branch / branch hygiene).
+            # Runs AFTER cleanup, BEFORE the deterministic `checkout -B
+            # verify_branch branch` below — a failed refresh must NOT check
+            # out a stale worktree, so this short-circuits before that line.
+            # The default profile declares no refresh actions, so this is a
+            # no-op (status "ok" with no results) on every repo that hasn't
+            # opted in.
+            refresh_detail: dict[str, Any] = {}
+
+            def _refresh_cb(kind: str, payload: dict[str, Any]) -> None:
+                nonlocal refresh_detail
+                if kind in ("executed", "failed", "refused"):
+                    refresh_detail = _strip_envelope(payload)
+
+            refresh_escalation_cb = make_escalation_cb(
+                pool, issue_id, wt, "refresh", f"verify_run:{issue.team or ''}")
+            refresh_result = run_step(wt, profile, "refresh", "qa", perms,
+                                      event_cb=_refresh_cb,
+                                      escalation_cb=refresh_escalation_cb)
+
+            if refresh_result.status == "blocked_on_approval":
+                return {"passed": None, "status": "blocked_on_approval", "returncode": None, "duration_s": 0.0,
+                        "tail": f"refresh blocked on approval: {refresh_result.reason}"}
+
+            if refresh_result.status == "failed":
+                return {"passed": False, "returncode": 1, "duration_s": 0.0,
+                        "tail": f"refresh failed: {refresh_result.reason}"}
         else:
             # Legacy path: inline reset/clean (unchanged).
             _git(wt, "reset", "--hard")
