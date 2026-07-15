@@ -177,8 +177,16 @@ def test_legacy_red_path_records_failure(gitrepo, db):
 
 
 def test_enabled_ok_path_emits_deps_reinstalled_and_tests_run(gitrepo, db, monkeypatch):
-    script = {"prepare": StepResult(status="ok"), "verify": StepResult(status="ok")}
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="ok"),
+        "verify": StepResult(status="ok"),
+    }
     events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
         "prepare": [("executed", _action_payload(
             "allow", builtin="node-deps-reconcile",
             ok=True, reason="npm ci ran", checked=True, installed=True, returncode=0,
@@ -216,12 +224,21 @@ def test_enabled_ok_path_emits_deps_reinstalled_and_tests_run(gitrepo, db, monke
 
 
 def test_enabled_prepare_failed_records_tests_run_failure(gitrepo, db, monkeypatch):
-    script = {"prepare": StepResult(status="failed",
-                                     reason="failed: node-deps-reconcile: npm ci failed")}
-    events = {"prepare": [("failed", _action_payload(
-        "allow", builtin="node-deps-reconcile",
-        ok=False, reason="npm ci failed", returncode=1, stderr_tail="boom",
-    ))]}
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="failed",
+                             reason="failed: node-deps-reconcile: npm ci failed"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("failed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=False, reason="npm ci failed", returncode=1, stderr_tail="boom",
+        ))],
+    }
     monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
 
     s = _settings(gitrepo, workflow_profile="enabled")
@@ -239,11 +256,20 @@ def test_enabled_prepare_failed_records_tests_run_failure(gitrepo, db, monkeypat
 
 
 def test_enabled_prepare_blocked_never_records_failed_tests_run(gitrepo, db, monkeypatch):
-    script = {"prepare": StepResult(status="blocked_on_approval",
-                                     reason="awaiting approval: rm -rf /tmp/x")}
-    events = {"prepare": [("escalated", _action_payload(
-        "escalate", run="rm -rf /tmp/x", decision="pending",
-    ))]}
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="blocked_on_approval",
+                             reason="awaiting approval: rm -rf /tmp/x"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("escalated", _action_payload(
+            "escalate", run="rm -rf /tmp/x", decision="pending",
+        ))],
+    }
     monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
 
     s = _settings(gitrepo, workflow_profile="enabled")
@@ -267,14 +293,25 @@ def test_enabled_prepare_blocked_never_records_failed_tests_run(gitrepo, db, mon
 
 def test_enabled_verify_failed_records_tests_run_failure(gitrepo, db, monkeypatch):
     script = {
+        "cleanup": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="failed", reason="failed: npm test: exit code 1"),
     }
-    events = {"verify": [("failed", _action_payload(
-        "allow", run="npm run typecheck && npm test",
-        ok=False, reason="exit code 1", returncode=1,
-        stdout="fail output", stderr="err output",
-    ))]}
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [("failed", _action_payload(
+            "allow", run="npm run typecheck && npm test",
+            ok=False, reason="exit code 1", returncode=1,
+            stdout="fail output", stderr="err output",
+        ))],
+    }
     monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
 
     s = _settings(gitrepo, workflow_profile="enabled")
@@ -293,13 +330,24 @@ def test_enabled_verify_failed_records_tests_run_failure(gitrepo, db, monkeypatc
 
 def test_enabled_verify_blocked_never_records_failed_tests_run(gitrepo, db, monkeypatch):
     script = {
+        "cleanup": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="blocked_on_approval",
-                              reason="awaiting approval: custom-deploy-step"),
+                             reason="awaiting approval: custom-deploy-step"),
     }
-    events = {"verify": [("escalated", _action_payload(
-        "escalate", run="custom-deploy-step", decision="pending",
-    ))]}
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [("escalated", _action_payload(
+            "escalate", run="custom-deploy-step", decision="pending",
+        ))],
+    }
     monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
 
     s = _settings(gitrepo, workflow_profile="enabled")
@@ -341,10 +389,15 @@ def test_enabled_verify_failed_action_with_warn_reports_failed(gitrepo, db, monk
     )
 
     script = {
+        "cleanup": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok", results=[failed_result, good_result]),
     }
     events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
         "prepare": [("executed", _action_payload(
             "allow", builtin="node-deps-reconcile",
             ok=True, reason="", returncode=0,
@@ -473,3 +526,233 @@ def test_db_enabled_prepare_blocked_records_no_failed_tests_run(gitrepo, pool):
     assert len(escalated) == 1
     assert escalated[0].payload["step"] == "prepare"
     assert escalated[0].payload["action"] == "custom-unapproved-step"
+
+
+# ---------------------------------------------------------------------------
+# cleanup step wiring (WP-19): enabled mode routes through run_step,
+# legacy mode unchanged; cleanup happens before checkout; denied actions
+# carry cmd in tests_run event
+
+
+def test_legacy_cleanup_never_calls_run_step(gitrepo, db, monkeypatch):
+    """Hard acceptance bar: with the flag 'legacy', cleanup must use inline
+    reset/clean and must not call run_step."""
+    def _boom(*a, **k):
+        raise AssertionError("legacy mode must never call run_step")
+    monkeypatch.setattr(tools_issues, "run_step", _boom)
+
+    s = _settings(gitrepo, workflow_profile="legacy")
+    s.verify_cmd = "exit 0"
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is True
+    assert out["returncode"] == 0
+
+
+def test_enabled_cleanup_failure_returns_failed(gitrepo, db, monkeypatch):
+    """Cleanup failure (on_fail: block by default) prevents checkout and verify."""
+    cleanup_script = {"cleanup": StepResult(status="failed",
+                                            reason="failed: git reset: permission denied")}
+    monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(cleanup_script))
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is False
+    assert "cleanup failed" in out["tail"]
+    assert "permission denied" in out["tail"]
+
+
+def test_enabled_cleanup_blocked_on_approval_returns_blocked(gitrepo, db, monkeypatch):
+    """Cleanup escalation (e.g. custom cleanup action) blocks without proceeding to checkout."""
+    cleanup_script = {"cleanup": StepResult(status="blocked_on_approval",
+                                            reason="awaiting approval: custom-cleanup-hook")}
+    cleanup_events = {
+        "cleanup": [("escalated", _action_payload(
+            "escalate", run="custom-cleanup-hook", decision="pending",
+        ))]
+    }
+    monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(cleanup_script, cleanup_events))
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is False
+    assert "cleanup blocked on approval" in out["tail"]
+
+
+def test_enabled_verify_denied_action_includes_cmd_and_denial_reason(gitrepo, db, monkeypatch):
+    """When a verify action is denied (verdict: deny, not escalate->denied),
+    the tests_run event should include the cmd string and denial reason in stderr."""
+    denied_action = RequiredAction(run="custom-unapproved-verify")
+    denied_result = ActionResult(
+        action=denied_action,
+        verdict="deny",
+        ok=False,
+        detail={"reason": "denied: custom-unapproved-verify"}
+    )
+
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="ok"),
+        "verify": StepResult(status="failed", results=[denied_result],
+                            reason="denied: custom-unapproved-verify"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [("refused", _action_payload(
+            "deny", run="custom-unapproved-verify",
+            reason="denied: custom-unapproved-verify",
+        ))],
+    }
+    monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is False
+    assert out["returncode"] == 1
+
+    tests_run = db.of("tests_run")
+    assert len(tests_run) == 1
+    tr = tests_run[0]
+    # WP-19 NIT: denied action should have cmd set (not empty string)
+    assert tr["cmd"] == "custom-unapproved-verify"
+    # WP-19 NIT: denial reason should be in stderr_tail so the event is self-naming
+    assert "denied" in tr["stderr_tail"].lower() or "denied" in out["tail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# services step wiring (WP-18 Gate D / plan step-4 acceptance): the services
+# step runs BEFORE prepare and gates the build; a down service fails FAST
+# with a clear message instead of blocking on approval; no services declared
+# is a no-op that proceeds straight to prepare.
+
+
+def test_enabled_services_step_empty_proceeds_to_prepare(gitrepo, db, monkeypatch):
+    """No services declared (the gitrepo fixture has none) -> the services
+    step is a true no-op: run_step is never even called for it, and
+    verify_run proceeds straight through cleanup -> prepare -> verify."""
+    calls: list[str] = []
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="ok"),
+        "verify": StepResult(status="ok"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [("executed", _action_payload(
+            "allow", run="npm run typecheck && npm test",
+            ok=True, reason="", returncode=0, stdout="ok\n", stderr="",
+        ))],
+    }
+    base_fake = _fake_run_step(script, events)
+
+    def _tracking_fake(worktree, profile, step_name, role, perms, **kw):
+        calls.append(step_name)
+        return base_fake(worktree, profile, step_name, role, perms, **kw)
+
+    monkeypatch.setattr(tools_issues, "run_step", _tracking_fake)
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is True
+    assert "services" not in calls
+    assert calls == ["cleanup", "prepare", "verify"]
+
+
+def test_enabled_services_down_returns_service_not_ready_failure(gitrepo, db, monkeypatch):
+    """A services StepResult of status 'failed' maps to a clear, fast
+    verify_run failure ('service not ready: <reason>') — not a hang on the
+    approval queue — and records a tests_run-style failure event, same as
+    the other enabled-path failures. prepare is never reached."""
+    _write_repo_profile(gitrepo, "services:\n  - mongo\n")
+
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "services": StepResult(status="failed",
+                              reason="denied (retry after failure): probe-tcp"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "services": [("failed", _action_payload(
+            "allow", builtin="probe-tcp",
+            ok=False, reason="mongo=localhost:27017: [Errno 111] Connection refused",
+        ))],
+    }
+    monkeypatch.setattr(tools_issues, "run_step", _fake_run_step(script, events))
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is False
+    assert "service not ready" in out["tail"]
+    assert "mongo=localhost:27017" in out["tail"]
+
+    tests_run = db.of("tests_run")
+    assert len(tests_run) == 1
+    assert "service not ready" in tests_run[0]["stderr_tail"]
+    assert db.of("deps_reinstalled") == []  # prepare never reached
+
+
+def test_enabled_services_down_real_probe_fails_fast_not_blocked(gitrepo, db):
+    """End-to-end (real load_effective + real run_step for cleanup/services;
+    only repo.get_issue/append_log/_agent_stamp are faked by `db`): a down
+    default-sourced probe (source='default', from the services: scalar
+    expansion) must fail the step immediately via the deny-by-default
+    escalation_cb wired in `_verify_run_enabled`, never blocked_on_approval.
+    The repo profile is COMMITTED (WP-19 note: untracked files don't survive
+    the real cleanup step's `git clean -fd`). `stack: node` is declared
+    explicitly since this fixture has no package-lock.json to auto-detect —
+    `probe-tcp` only resolves through a real adapter (get_adapter needs a
+    non-empty stack)."""
+    _write_and_commit_repo_profile(gitrepo, "stack: node\nservices:\n  - mongo\n")
+    manifest = gitrepo.parent / "workspace.yaml"
+    # Point 'mongo' at a closed port so the probe deterministically fails.
+    manifest.write_text("service_endpoints:\n  mongo: 127.0.0.1:54329\n")
+
+    s = _settings(gitrepo, workflow_profile="enabled")
+    s.workspace_manifest = str(manifest)
+    tools = _issue_tools(object(), s)
+
+    out = tools["verify_run"](1)
+
+    assert out["passed"] is False
+    assert out.get("status") != "blocked_on_approval"
+    assert "service not ready" in out["tail"]
+    assert "127.0.0.1:54329" in out["tail"]
+
+    tests_run = db.of("tests_run")
+    assert len(tests_run) == 1
+    assert "service not ready" in tests_run[0]["stderr_tail"]
+    assert db.of("deps_reinstalled") == []

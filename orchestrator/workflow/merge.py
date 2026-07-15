@@ -59,11 +59,11 @@ def parse_profile_dict(raw: dict, source: str) -> dict:
     """
     normalized = {}
 
-    # Copy scalar keys (stack, services, permissions) and validate other non-step keys
+    # Copy scalar keys (stack, services, permissions, service_endpoints) and validate other non-step keys
     for key in raw:
         if key not in STEP_NAMES:
             # Only allow specific scalar keys
-            if key not in ("stack", "services", "permissions"):
+            if key not in ("stack", "services", "permissions", "service_endpoints"):
                 raise ProfileError(
                     f"unknown top-level key {key!r}; valid steps: {', '.join(STEP_NAMES)}"
                 )
@@ -360,5 +360,7 @@ def _merge_layer(base: dict, overlay: dict, layer_name: str) -> dict:
         result["stack"] = overlay["stack"]
     if "services" in overlay:
         result["services"] = overlay["services"]
+    if "service_endpoints" in overlay:
+        result["service_endpoints"] = overlay["service_endpoints"]
 
     return result

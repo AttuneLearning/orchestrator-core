@@ -10,8 +10,49 @@ into an effective Profile.
 
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from typing import Any
+
+
+def _probe_tcp(worktree: str | Path, action: Any) -> dict[str, Any]:
+    """Probe a TCP service for reachability.
+
+    Args:
+        worktree: checkout root (unused, required by the builtin interface).
+        action: the `RequiredAction` driving this probe. `action.args` carries
+            the endpoint spec, "service=host:port" or a bare "host:port"
+            string (e.g., "mongo=localhost:27017" or "localhost:27017").
+
+    Returns:
+        A dict with `ok: bool` and `reason: str`. On success, `ok=True`
+        and reason names the endpoint. On failure, `ok=False` and reason
+        names the endpoint and why it failed (timeout, connection refused,
+        malformed spec, etc). Never raises.
+    """
+    endpoint_spec = (getattr(action, "args", "") or "").strip()
+
+    # Parse the endpoint, stripping the service name if present
+    if "=" in endpoint_spec:
+        # Format: "service=host:port"
+        _service_name, endpoint = endpoint_spec.split("=", 1)
+    else:
+        # Format: "host:port"
+        endpoint = endpoint_spec
+
+    try:
+        host, port_str = endpoint.rsplit(":", 1)
+        if not host or not port_str:
+            raise ValueError("missing host or port")
+        port = int(port_str)
+    except (ValueError, AttributeError) as exc:
+        return {"ok": False, "reason": f"malformed endpoint {endpoint_spec!r}: {exc}"}
+
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return {"ok": True, "reason": endpoint_spec}
+    except OSError as exc:
+        return {"ok": False, "reason": f"{endpoint_spec}: {exc}"}
 
 
 def detect_stack(worktree: str | Path) -> str:
@@ -60,13 +101,16 @@ class Adapter:
     def builtins(self) -> dict[str, Any]:
         """Return a dict of builtin action handlers.
 
-        Maps builtin action name to a callable fn(worktree) -> dict with
-        at least {ok: bool, reason: str}.
+        Maps builtin action name to a callable `fn(worktree, action) -> dict`
+        with at least `{ok: bool, reason: str}`. `action` is the
+        `RequiredAction` that resolved to this builtin, so a handler can read
+        parameters off `action.args` (e.g. `probe-tcp`'s endpoint spec).
 
         Returns:
-            dict[str, callable]: Empty dict by default (override in subclasses).
+            dict[str, callable]: a plain dict of stack-specific builtins
+                (base: just `probe-tcp`; override/extend in subclasses).
         """
-        return {}
+        return {"probe-tcp": _probe_tcp}
 
 
 def get_adapter(stack: str) -> Adapter | None:

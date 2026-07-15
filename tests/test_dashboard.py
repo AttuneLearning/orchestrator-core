@@ -538,6 +538,18 @@ def test_actions_expired_row_not_actionable(settings, pool):
     expired = repo.list_pending_actions(pool, status="expired")
     assert len(expired) == 1 and expired[0]["id"] == row["id"]
 
-    # not actionable: approve/deny on an expired id must fail (only 'pending' resolves)
-    with pytest.raises(Exception):
-        client.post(f"/actions/{row['id']}/approve", follow_redirects=False)
+    # NIT 2: approve/deny on an expired row must fail gracefully (not in 'pending'
+    # status). The handler catches ValueError and redirects back to /actions instead
+    # of raising a 500 error (fail-closed TOCTOU handling).
+    r = client.post(f"/actions/{row['id']}/approve", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/actions"
+
+    # Row is still expired, not transitioned to approved
+    expired = repo.list_pending_actions(pool, status="expired")
+    assert len(expired) == 1 and expired[0]["id"] == row["id"]
+
+    # Same for deny
+    r = client.post(f"/actions/{row['id']}/deny", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/actions"

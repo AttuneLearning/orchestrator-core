@@ -53,16 +53,43 @@ _WORK_STEP = {
 # function -> the loop's step-2 "sync" line. Dev owns its issue branch and merges main into it;
 # QA builds a fresh ephemeral verify branch PER ISSUE (in the work step), so it has no persistent
 # branch to pre-sync; leads render verdicts over MCP and have no working tree.
+#
+# The dev sync step embeds one reconcile sentence (WP-20, plan step 4): by default it is the
+# STATIC npm-ci text below (byte-identical to the pre-workflow-profile docs — the drift check's
+# hard bar). When `settings.workflow_profile == "enabled"` AND an effective profile resolves for
+# the team's worktree, `_dev_sync_step` renders that sentence FROM the profile's `prepare` actions
+# instead — see `_render_prepare_clause` / `_dev_sync_step` below.
+_SYNC_STEP_DEV_PREFIX = (
+    "**Sync the integration branch FIRST — `git merge --no-edit main` into your issue "
+    "branch.** This is how cross-team work reaches you: landed API contracts "
+    "(`packages/contracts`), shared test/gate config, and other teams' merged changes live "
+    "on `main`, and you only see them after merging it in. Do this every cycle before "
+    "working so you build on current `main`, not a stale fork. Conflicts: prefer `main` for "
+    "shared contract/config files; for a genuine code conflict resolve minimally or report "
+    "a blocker via `comms_send`. "
+)
+_SYNC_STEP_DEV_SUFFIX = " LOCAL only — never push."
+# The static reconcile clause (pre-workflow-profile text, unchanged). Used whenever the flag is
+# "legacy", no profile resolves for the team's worktree, or profile loading/rendering raises.
+_RECONCILE_STATIC = (
+    "**If the merge changed `package-lock.json`, run `npm ci` "
+    "before typecheck** so a newly-added dependency is installed — a stale `node_modules` "
+    "yields false 'Cannot find module' errors (a bounce, not a real failure)."
+)
+# builtin action name -> (shell command it wraps, default when_changed globs if the action
+# itself leaves when_changed empty). Mirrors orchestrator.workflow.adapters.node's
+# node-deps-reconcile, whose actual reconcile globbing lives inside apply/npm_deps.py rather
+# than in the action dict. Rendering this builtin with its real (or default) globs reproduces
+# `_RECONCILE_STATIC` exactly for the stock node profile.
+_BUILTIN_RECONCILE = {
+    "node-deps-reconcile": {
+        "command": "npm ci",
+        "default_when_changed": ("package-lock.json",),
+        "rationale": ("so a newly-added dependency is installed — a stale `node_modules` "
+                      "yields false 'Cannot find module' errors (a bounce, not a real failure)."),
+    },
+}
 _SYNC_STEP = {
-    "dev": ("**Sync the integration branch FIRST — `git merge --no-edit main` into your issue "
-            "branch.** This is how cross-team work reaches you: landed API contracts "
-            "(`packages/contracts`), shared test/gate config, and other teams' merged changes live "
-            "on `main`, and you only see them after merging it in. Do this every cycle before "
-            "working so you build on current `main`, not a stale fork. Conflicts: prefer `main` for "
-            "shared contract/config files; for a genuine code conflict resolve minimally or report "
-            "a blocker via `comms_send`. **If the merge changed `package-lock.json`, run `npm ci` "
-            "before typecheck** so a newly-added dependency is installed — a stale `node_modules` "
-            "yields false 'Cannot find module' errors (a bounce, not a real failure). LOCAL only — never push."),
     "qa": ("**Do NOT keep a long-lived branch or pre-merge `main` here.** This worktree is "
            "EPHEMERAL: you rebuild a clean verify branch from the issue's own branch for each issue "
            "in step 5 (force-reset, discards the prior cycle), so nothing accumulates and a "
@@ -201,18 +228,96 @@ _TIER_NOTE_MIDRUN = ("\n> **Mid-run checks (remedial tier):** the engine samples
                      "moved to `off_rails`.\n")
 
 
+def _format_globs(globs: tuple[str, ...]) -> str:
+    """Render a tuple of glob strings as a backtick-quoted, human-joined list."""
+    quoted = [f"`{g}`" for g in globs]
+    if len(quoted) <= 1:
+        return quoted[0] if quoted else ""
+    return ", ".join(quoted[:-1]) + f", and {quoted[-1]}"
+
+
+def _render_prepare_clause(action: Any) -> str:
+    """Render one profile `prepare` action as a single reconcile-sentence clause.
+
+    A known builtin (currently `node-deps-reconcile`) renders its named,
+    real-shell-command sentence (using the action's own `when_changed`, or the
+    builtin's default globs if the action leaves it empty — matching how the
+    node adapter's own reconcile logic, in `apply/npm_deps.py`, resolves its
+    trigger file internally rather than via the action dict). An unknown
+    builtin or a `run:` action derives both the trigger file(s) and the
+    command straight from the action. Returns "" if the action has neither
+    `run` nor `builtin` set (shouldn't happen for a validated profile).
+    """
+    builtin = getattr(action, "builtin", "") or ""
+    run = getattr(action, "run", "") or ""
+    when_changed = tuple(getattr(action, "when_changed", ()) or ())
+
+    if builtin in _BUILTIN_RECONCILE:
+        info = _BUILTIN_RECONCILE[builtin]
+        globs = when_changed or info["default_when_changed"]
+        glob_str = _format_globs(globs)
+        return (f"**If the merge changed {glob_str}, run `{info['command']}` before "
+                f"typecheck** {info['rationale']}")
+    if builtin:
+        if when_changed:
+            return (f"**If the merge changed {_format_globs(when_changed)}, run the "
+                    f"`{builtin}` reconcile step before typecheck.**")
+        return f"**Run the `{builtin}` reconcile step before typecheck.**"
+    if run:
+        if when_changed:
+            return (f"**If the merge changed {_format_globs(when_changed)}, run "
+                    f"`{run}` before typecheck.**")
+        return f"**Run `{run}` before typecheck.**"
+    return ""
+
+
+def _dev_sync_step(settings: Any, team: str) -> str:
+    """Build the dev sync-step text for `team`, deriving the reconcile clause
+    from the effective workflow profile's `prepare` actions when the profile
+    system is active, else falling back to the static default clause.
+
+    Fail-safe (hard acceptance bar, WP-20): `settings` being `None`,
+    `settings.workflow_profile` not being `"enabled"`, no worktree resolving
+    for `team` (via `settings.verify_worktrees`), no `prepare` actions for
+    role "dev" (role-agnostic fallback per `WorkflowStep.actions_for`), or
+    ANY exception while loading/rendering the profile — all fall back to
+    `_RECONCILE_STATIC`, which reproduces today's docs byte-for-byte.
+    """
+    reconcile = _RECONCILE_STATIC
+    if settings is not None and str(getattr(settings, "workflow_profile", "legacy")) == "enabled":
+        worktree = (getattr(settings, "verify_worktrees", None) or {}).get(team)
+        if worktree:
+            try:
+                from orchestrator.workflow import loader as _wf_loader
+                profile = _wf_loader.load_effective(settings, worktree, role="dev")
+                actions = profile.step("prepare").actions_for("dev")
+                clauses = [c for c in (_render_prepare_clause(a) for a in actions) if c]
+                if clauses:
+                    reconcile = " ".join(clauses)
+            except Exception:
+                reconcile = _RECONCILE_STATIC
+    return _SYNC_STEP_DEV_PREFIX + reconcile + _SYNC_STEP_DEV_SUFFIX
+
+
 def render_agent_doc(*, vendor: str, team: str, function: str, agent_id: int,
                      rules: list[dict[str, Any]],
                      internal_parallelism: bool = False,
-                     midrun_checks: bool = False) -> str:
+                     midrun_checks: bool = False,
+                     settings: Any = None) -> str:
     """Render one vendor's instruction file from the protocol template + rules.
 
     `internal_parallelism` / `midrun_checks` come from the project's decomposition
     tier (orchestrator.decomposition): high lifts the per-issue subagent ban for dev
-    workers; remedial adds a mid-run drift-advisory note. Both default off (mid tier)."""
+    workers; remedial adds a mid-run drift-advisory note. Both default off (mid tier).
+
+    `settings` (optional, default None) is a Settings-like object; when it carries
+    `workflow_profile == "enabled"` and a worktree resolves for `team` (WP-20), the
+    dev sync step's reconcile sentence is rendered from the effective profile
+    instead of the static default text. `settings=None` (the default — used by
+    every existing caller/test) always yields the static text unchanged."""
     owned_gates, owned_desc = _OWNED.get(function, ("(none)", "—"))
     work_step = _WORK_STEP.get(function, "do your gate's work, then report_work + gate_decision.")
-    sync_step = _SYNC_STEP.get(function, _SYNC_STEP["dev"])
+    sync_step = _SYNC_STEP.get(function) or _dev_sync_step(settings, team)
     boundary_extra = _BOUNDARY.get(function, "Keep changes minimal and in-lane.")
     if function == "dev" and team in _LANE_BOUNDARY:
         boundary_extra = f"{boundary_extra}\n- {_LANE_BOUNDARY[team]}"
@@ -239,11 +344,27 @@ def filename_for(vendor: str) -> str:
 def render_for(pool, roster, team: str, function: str, agent_id: int,
                vendors=("claude", "codex", "qwen"),
                internal_parallelism: bool = False,
-               midrun_checks: bool = False) -> dict[str, str]:
+               midrun_checks: bool = False,
+               settings: Any = None) -> dict[str, str]:
     """Fetch the applicable accepted ADRs for (team, its repos) and render each
     vendor's file. Returns {filename: content}. (The thin DB-backed entry point.)
-    `internal_parallelism`/`midrun_checks` come from the project's decomposition tier."""
+    `internal_parallelism`/`midrun_checks` come from the project's decomposition tier.
+
+    `settings` (WP-20) feeds the dev sync step's profile-driven reconcile sentence
+    (see `render_agent_doc`/`_dev_sync_step`). When omitted (the CLI's
+    `render-agent-docs` call site does not pass one), it is auto-loaded via
+    `orchestrator.config.load_settings()` — the same active-instance resolution
+    (`ORCH_INSTANCE` env / `config/instances.yaml`) the CLI itself already applied
+    before dispatching here, so no separate wiring is needed at the call site. Any
+    failure loading it (e.g. no `config/` present, as in some test setups) leaves
+    `settings=None`, which keeps the reconcile sentence at its static default text."""
     from . import repository as repo
+    if settings is None:
+        try:
+            from . import config as _config
+            settings = _config.load_settings()
+        except Exception:
+            settings = None
     accepted = repo.list_adrs(pool, status="accepted")
     t = roster.resolve(team)
     repos = list(t.repos) if t else []
@@ -254,7 +375,8 @@ def render_for(pool, roster, team: str, function: str, agent_id: int,
                                                 function=function, agent_id=agent_id,
                                                 rules=applicable,
                                                 internal_parallelism=internal_parallelism,
-                                                midrun_checks=midrun_checks)
+                                                midrun_checks=midrun_checks,
+                                                settings=settings)
     return out
 
 

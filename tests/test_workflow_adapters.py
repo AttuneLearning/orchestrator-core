@@ -191,11 +191,12 @@ class TestPythonAdapter:
         steps = adapter.default_steps()
         assert steps == {}
 
-    def test_python_builtins_empty(self):
-        """Python adapter has no builtins yet."""
+    def test_python_builtins_has_probe_tcp(self):
+        """Python adapter inherits probe-tcp from base."""
         adapter = PythonAdapter()
         builtins = adapter.builtins()
-        assert builtins == {}
+        assert "probe-tcp" in builtins
+        assert callable(builtins["probe-tcp"])
 
 
 class TestGoAdapter:
@@ -207,11 +208,12 @@ class TestGoAdapter:
         steps = adapter.default_steps()
         assert steps == {}
 
-    def test_go_builtins_empty(self):
-        """Go adapter has no builtins yet."""
+    def test_go_builtins_has_probe_tcp(self):
+        """Go adapter inherits probe-tcp from base."""
         adapter = GoAdapter()
         builtins = adapter.builtins()
-        assert builtins == {}
+        assert "probe-tcp" in builtins
+        assert callable(builtins["probe-tcp"])
 
 
 class TestBaseAdapter:
@@ -222,10 +224,12 @@ class TestBaseAdapter:
         adapter = Adapter()
         assert adapter.default_steps() == {}
 
-    def test_adapter_builtins_empty(self):
-        """Base Adapter.builtins() returns empty dict."""
+    def test_adapter_builtins_has_probe_tcp(self):
+        """Base Adapter.builtins() includes probe-tcp."""
         adapter = Adapter()
-        assert adapter.builtins() == {}
+        builtins = adapter.builtins()
+        assert "probe-tcp" in builtins
+        assert callable(builtins["probe-tcp"])
 
 
 class TestWorkflowYaml:

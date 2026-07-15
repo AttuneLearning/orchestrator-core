@@ -59,15 +59,19 @@ class NodeAdapter(Adapter):
         node-deps-reconcile: wraps npm_deps.ensure_deps_current to detect
         package-lock.json changes and reinstall node_modules only when needed.
 
+        Also includes the base probe-tcp builtin for service health checks.
+
         Returns:
             dict mapping builtin name to handler function.
         """
-        return {
-            "node-deps-reconcile": self._node_deps_reconcile,
-        }
+        # Get the base builtins (including probe-tcp)
+        base_builtins = super().builtins()
+        # Add Node-specific builtins
+        base_builtins["node-deps-reconcile"] = self._node_deps_reconcile
+        return base_builtins
 
     @staticmethod
-    def _node_deps_reconcile(worktree: str | Path) -> dict[str, Any]:
+    def _node_deps_reconcile(worktree: str | Path, action: Any = None) -> dict[str, Any]:
         """Reconcile node_modules with package-lock.json.
 
         Wraps orchestrator.apply.npm_deps.ensure_deps_current, which detects
@@ -75,6 +79,9 @@ class NodeAdapter(Adapter):
 
         Args:
             worktree: Path to the Node.js project root.
+            action: the driving RequiredAction — ignored (this builtin takes
+                no parameters); accepted for parity with the builtin contract
+                `fn(worktree, action) -> dict` (runner._run_builtin).
 
         Returns:
             dict with at least {ok: bool, reason: str}.

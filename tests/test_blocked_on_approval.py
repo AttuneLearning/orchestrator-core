@@ -295,8 +295,9 @@ def test_apply_path_escalate_then_approve_executes_action(gitrepo, pool):
     issue_row = _verification_issue(pool)
     issue = Issue(id=issue_row.id, goal_id=issue_row.goal_id, title="t", team="backend")
 
-    (gitrepo / ".orchestrator").mkdir(parents=True, exist_ok=True)
-    (gitrepo / ".orchestrator" / "workflow.yaml").write_text(
+    _checkout_issue_branch(gitrepo, issue.id)
+    _write_and_commit_profile(
+        gitrepo,
         'prepare:\n  - run: "touch apply-marker.txt"\n    on_fail: block\n'
     )
     settings = _settings(gitrepo)
@@ -332,8 +333,9 @@ def test_apply_path_without_pool_stays_pending_only(gitrepo):
     from orchestrator.models import Issue
 
     issue = Issue(id=999999, goal_id=1, title="t", team="backend")
-    (gitrepo / ".orchestrator").mkdir(parents=True, exist_ok=True)
-    (gitrepo / ".orchestrator" / "workflow.yaml").write_text(
+    _checkout_issue_branch(gitrepo, issue.id)
+    _write_and_commit_profile(
+        gitrepo,
         'prepare:\n  - run: "touch no-pool-marker.txt"\n    on_fail: block\n'
     )
     settings = _settings(gitrepo)

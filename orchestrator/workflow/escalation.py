@@ -160,8 +160,16 @@ def handle_escalation(
         denied = _newest_denied_row(pool, issue_id, step, action_str)
 
         if approved is not None and (denied is None or approved["created_at"] >= denied["created_at"]):
-            repo.consume_approved_action(pool, approved["id"])
-            return "approved"
+            try:
+                repo.consume_approved_action(pool, approved["id"])
+                return "approved"
+            except ValueError:
+                # Concurrent-consume race: another worker consumed this row between
+                # our find_approved_action and consume. The UPDATE is atomic (only
+                # updates if status='approved'), so the loser simply gets ValueError.
+                # Return "pending" so the loser re-escalates cleanly on its next poll —
+                # same behavior as an already-consumed approval.
+                return "pending"
 
         if denied is not None:
             return "denied"

@@ -523,7 +523,7 @@ class TestBuiltinDispatch:
 
         class FakeAdapter:
             def builtins(self):
-                def _noop_ok(worktree):
+                def _noop_ok(worktree, action):
                     calls.append(worktree)
                     return {"ok": True, "reason": "fine"}
 
@@ -543,12 +543,40 @@ class TestBuiltinDispatch:
         assert result.results[0].detail["reason"] == "fine"
         assert calls == [tmp_path]
 
+    def test_builtin_receives_the_driving_action_with_args(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The builtin contract is fn(worktree, action) -> dict — a builtin
+        reads parameters (e.g. a probe's endpoint) off action.args, not off
+        the builtin name (WP-18 Gate D: the contextvar/prefix-dict scheme is
+        gone; args is the one true channel)."""
+        seen_actions = []
+
+        class FakeAdapter:
+            def builtins(self):
+                def _echo_args(worktree, action):
+                    seen_actions.append(action)
+                    return {"ok": True, "reason": action.args}
+
+                return {"echo-args": _echo_args}
+
+        monkeypatch.setattr(runner, "get_adapter", lambda stack: FakeAdapter())
+
+        action = RequiredAction(builtin="echo-args", args="mongo=localhost:27017", on_fail="block")
+        profile = Profile(stack="fake", steps={"prepare": WorkflowStep(name="prepare", actions=(action,))})
+
+        result = run_step(tmp_path, profile, "prepare", None, Permissions())
+
+        assert result.status == "ok"
+        assert result.results[0].detail["reason"] == "mongo=localhost:27017"
+        assert seen_actions == [action]
+
     def test_builtin_failure_honors_on_fail_block(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         class FakeAdapter:
             def builtins(self):
-                return {"noop-fail": lambda worktree: {"ok": False, "reason": "boom"}}
+                return {"noop-fail": lambda worktree, action: {"ok": False, "reason": "boom"}}
 
         monkeypatch.setattr(runner, "get_adapter", lambda stack: FakeAdapter())
 
@@ -591,7 +619,7 @@ class TestBuiltinDispatch:
     ) -> None:
         class FakeAdapter:
             def builtins(self):
-                def _boom(worktree):
+                def _boom(worktree, action):
                     raise RuntimeError("kaboom")
 
                 return {"boom": _boom}

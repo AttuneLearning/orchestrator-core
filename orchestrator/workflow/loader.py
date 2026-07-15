@@ -33,7 +33,7 @@ import yaml
 
 from orchestrator.workflow import adapters
 from orchestrator.workflow.merge import ProfileError, merge_layers, parse_profile_dict
-from orchestrator.workflow.models import Profile
+from orchestrator.workflow.models import Profile, RequiredAction, WorkflowStep
 from orchestrator.workflow.permissions import Permissions
 
 # Engine defaults ship inside the installed package. Resolved relative to THIS
@@ -43,6 +43,63 @@ from orchestrator.workflow.permissions import Permissions
 # repo/package root — equivalent to `Path(orchestrator.__file__).parent.parent`.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULTS_WORKFLOW_YAML = _PACKAGE_ROOT / "defaults" / "workflow.yaml"
+
+# Default service endpoints (host:port) for well-known services
+_DEFAULT_SERVICE_ENDPOINTS = {
+    "mongo": "localhost:27017",
+    "redis": "localhost:6379",
+    "s3-mock": "localhost:9000",
+    "postgres": "localhost:5432",
+}
+
+
+def _expand_services_step(
+    profile: Profile, service_endpoints_override: dict[str, str] | None = None
+) -> Profile:
+    """Expand a Profile's services scalar into a services WorkflowStep.
+
+    If the profile has no services, returns it unchanged. If services are
+    present, creates a `services` step with probe-tcp actions for each service.
+
+    Args:
+        profile: The Profile with a services tuple (possibly empty).
+        service_endpoints_override: Optional dict mapping service names to
+            "host:port" overrides (e.g., {"mongo": "10.0.0.5:27017"}).
+            Workspace manifest layer wins over defaults.
+
+    Returns:
+        The same profile, with a new or replaced `services` WorkflowStep.
+    """
+    if not profile.services:
+        return profile
+
+    endpoints = dict(_DEFAULT_SERVICE_ENDPOINTS)
+    if service_endpoints_override:
+        endpoints.update(service_endpoints_override)
+
+    # Build probe actions for each service
+    actions = []
+    for service_name in profile.services:
+        endpoint = endpoints.get(service_name, "localhost:0")
+        action = RequiredAction(
+            builtin="probe-tcp",
+            args=f"{service_name}={endpoint}",
+            on_fail="escalate",
+            timeout=5,
+            source="default",
+        )
+        actions.append(action)
+
+    services_step = WorkflowStep(name="services", actions=tuple(actions))
+    steps = dict(profile.steps)
+    steps["services"] = services_step
+
+    return Profile(
+        stack=profile.stack,
+        services=profile.services,
+        steps=steps,
+        warnings=profile.warnings,
+    )
 
 
 def _load_yaml_dict(path: Path) -> dict[str, Any]:
@@ -97,6 +154,13 @@ def load_effective(settings: Any, worktree: str | Path, role: str | None = None)
         try:
             repo_raw = _load_yaml_dict(repo_path)
             repo_normalized = parse_profile_dict(repo_raw, "repo")
+            # Warn if repo layer tries to set service_endpoints (repo can't override)
+            if repo_raw.get("service_endpoints"):
+                warnings.append(
+                    "repo-layer service_endpoints: ignored (workspace manifest overrides only)"
+                )
+                # Remove it from normalized so it doesn't affect the merge
+                repo_normalized.pop("service_endpoints", None)
         except Exception as exc:
             warnings.append(
                 f"repo workflow profile at {repo_path} ignored ({type(exc).__name__}): {exc}"
@@ -149,6 +213,15 @@ def load_effective(settings: Any, worktree: str | Path, role: str | None = None)
     profile = merge_layers(defaults_normalized, repo_normalized, workspace_normalized)
     if warnings:
         profile = dataclasses.replace(profile, warnings=profile.warnings + tuple(warnings))
+
+    # Expand the services scalar (if any) into a services step with probe actions.
+    # Service endpoints can be overridden via the workspace manifest's
+    # service_endpoints field (which is not a standard step, so merge.py ignores it).
+    service_endpoints_override = None
+    if workspace_normalized:
+        service_endpoints_override = workspace_normalized.get("service_endpoints", {})
+    profile = _expand_services_step(profile, service_endpoints_override)
+
     return profile
 
 

@@ -255,16 +255,25 @@ def _verify_run_enabled(
     pool: ConnectionPool, settings: Any, issue: Any, issue_id: int,
     wt: str, verify_branch: str,
 ) -> dict[str, Any]:
-    """`workflow_profile: enabled` path for `verify_run` (WP-08/WP-13).
+    """`workflow_profile: enabled` path for `verify_run` (WP-08/WP-13/WP-18).
 
-    Runs the `prepare` then `verify` steps of the effective workflow Profile
-    (Phase A: `orchestrator.workflow.loader`/`runner`) in place of the inline
-    `ensure_deps_current` call + hardcoded `npm run typecheck && npm test`.
+    Runs the `services` (if declared), `prepare`, then `verify` steps of the
+    effective workflow Profile (Phase A/D: `orchestrator.workflow.loader`/
+    `runner`) in place of the inline `ensure_deps_current` call + hardcoded
+    `npm run typecheck && npm test`. Services readiness gates the build (plan
+    step 4 acceptance: "verify fails fast with a clear message if a required
+    service is down") — a `services` step with no actions (no services
+    declared) is a no-op, and the function proceeds straight to `prepare`.
+    A down default/engine-declared probe fails the step immediately (see
+    `_services_escalation_cb`) rather than parking on the approval queue; only
+    a repo-authored probe (source == "repo") can produce `blocked_on_approval`
+    for this step, same as any other custom action.
+
     Emits the SAME event kinds/payload shapes the legacy path emits for the
     same outcomes (`deps_reinstalled`, `tests_run`) so downstream consumers
     (gate decisions, `_has_machine_verification`, dashboards) see no
     difference on the happy/fail paths. A `blocked_on_approval` outcome from
-    either step never becomes a failed `tests_run` event — instead the real
+    any step never becomes a failed `tests_run` event — instead the real
     persistence (WP-12's `escalation.make_escalation_cb`, wired below, calling
     through to `repository.create_pending_action`) records the ONE
     `action_escalated` event for a NEW pending row; this function's own
@@ -279,6 +288,58 @@ def _verify_run_enabled(
     perms = load_permissions(settings)
     profile = load_effective(settings, wt, role="qa")
     requested_by = f"verify_run:{issue.team or ''}"
+
+    services_detail: dict[str, Any] = {}
+    services_blocked: dict[str, Any] = {}
+    services_phase_seen: dict[str, str] = {}
+    services_escalation_base = make_escalation_cb(pool, issue_id, wt, "services", requested_by)
+
+    def _services_cb(kind: str, payload: dict[str, Any]) -> None:
+        nonlocal services_detail, services_blocked
+        if kind in ("executed", "failed", "refused"):
+            services_detail = _strip_envelope(payload)
+        elif kind == "escalated":
+            services_blocked = {"step": "services", "action": _action_label(payload),
+                                 "phase": services_phase_seen.get("phase", "authorize")}
+
+    def _services_escalation_cb(action: Any, phase: str) -> str:
+        # A down default/engine-declared service (mongo/redis/...) is an
+        # environment problem, not an approval question — plan step 4's
+        # acceptance is "verify fails fast with a clear message", not "wait
+        # on the /actions queue". Deny immediately so run_step turns this
+        # into a real "failed" StepResult; only a repo-authored probe
+        # (source == "repo") goes through the normal pending-approval flow,
+        # same as any other custom action.
+        if action.source != "repo":
+            return "denied"
+        services_phase_seen["phase"] = phase
+        return services_escalation_base(action, phase)
+
+    if profile.step("services").actions_for("qa"):
+        services_result = run_step(wt, profile, "services", "qa", perms,
+                                    event_cb=_services_cb, escalation_cb=_services_escalation_cb)
+
+        if services_result.status == "blocked_on_approval":
+            return {
+                "passed": None, "status": "blocked_on_approval",
+                "step": services_blocked.get("step", "services"),
+                "action": services_blocked.get("action", services_result.reason),
+                "phase": services_blocked.get("phase", services_phase_seen.get("phase", "authorize")),
+                "note": _BLOCKED_NOTE,
+            }
+
+        if services_result.status == "failed":
+            reason = services_detail.get("reason") or services_result.reason
+            message = f"service not ready: {reason}"
+            payload = {
+                "machine": True, "cmd": "services",
+                "returncode": 1, "duration_s": 0.0, "branch": verify_branch,
+                "stdout_tail": "", "stderr_tail": message[-800:],
+                "deps": services_detail,
+            }
+            payload.update(_agent_stamp(pool, issue))
+            repo.append_log(pool, issue_id, "tests_run", payload)
+            return {"passed": False, "returncode": 1, "duration_s": 0.0, "tail": message}
 
     prepare_detail: dict[str, Any] = {}
     blocked: dict[str, Any] = {}
@@ -380,6 +441,14 @@ def _verify_run_enabled(
                 err = failed_detail.get("stderr", "") or ""
                 cmd = result.action.run or result.action.builtin or ""
                 break
+
+    # For denied actions (which never execute), ensure cmd names what was denied
+    # and include the denial reason in stderr so the persisted event is self-naming (WP-19 NIT).
+    if verify_result.status == "failed" and not cmd and verify_result.results:
+        last_result = verify_result.results[-1]
+        cmd = last_result.action.run or last_result.action.builtin or ""
+        if not err:
+            err = verify_result.reason  # e.g. "denied: custom-command"
 
     if returncode is None:
         returncode = 1 if verify_result.status == "failed" else 0
@@ -717,8 +786,36 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
         # `git checkout -B` abort with "local changes would be overwritten", which
         # otherwise permanently wedges every subsequent verify for the team until
         # the worktree is cleaned by hand. reset+clean (no -x: keep node_modules).
-        _git(wt, "reset", "--hard")
-        _git(wt, "clean", "-fd")
+        if settings.workflow_profile == "enabled":
+            # Profile-driven cleanup (Phase D of the Workflow Profile cutover) —
+            # replaces the inline reset/clean below. Load the profile from the
+            # worktree as-is (pre-checkout state); if profile loading fails, fall
+            # back to defaults so cleanup always runs.
+            profile = load_effective(settings, wt, role="qa")
+            perms = load_permissions(settings)
+
+            # Wire event_cb to log cleanup events (verify_run convention).
+            cleanup_detail: dict[str, Any] = {}
+            def _cleanup_cb(kind: str, payload: dict[str, Any]) -> None:
+                nonlocal cleanup_detail
+                if kind in ("executed", "failed", "refused"):
+                    cleanup_detail = _strip_envelope(payload)
+
+            cleanup_result = run_step(wt, profile, "cleanup", "qa", perms,
+                                      event_cb=_cleanup_cb)
+
+            if cleanup_result.status == "blocked_on_approval":
+                return {"passed": False, "returncode": 1, "duration_s": 0.0,
+                        "tail": f"cleanup blocked on approval: {cleanup_result.reason}"}
+
+            if cleanup_result.status == "failed":
+                return {"passed": False, "returncode": 1, "duration_s": 0.0,
+                        "tail": f"cleanup failed: {cleanup_result.reason}"}
+        else:
+            # Legacy path: inline reset/clean (unchanged).
+            _git(wt, "reset", "--hard")
+            _git(wt, "clean", "-fd")
+
         co = _git(wt, "checkout", "-B", verify_branch, branch)
         if co.returncode != 0:
             raise ValueError(f"verify checkout failed: {co.stderr[:300]}")

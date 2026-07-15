@@ -322,3 +322,42 @@ class TestNoIssueId:
         assert len(matching) == 1
         assert matching[0]["from_team"] == "engine"
         assert matching[0]["issue_id"] is None
+
+
+class TestConcurrentConsumeRace:
+    """NIT 1: concurrent-consume race in handle_escalation.
+
+    The approved path calls consume_approved_action, which raises ValueError
+    if another worker consumed the row between find_approved_action and consume
+    (atomic UPDATE guarantees no double-execution; the loser just errors).
+    Fix: catch ValueError and return "pending" so the loser re-escalates
+    cleanly on its next poll — same behavior as already-consumed approval."""
+
+    def test_concurrent_consume_returns_pending_instead_of_raising(self, pool) -> None:
+        issue = _make_issue(pool)
+
+        # Approve a row
+        handle_escalation(pool, issue.id, "/tmp/wt", "verify", "race-cmd", "run", "dev", "authorize")
+        pending = [
+            r for r in repo.list_pending_actions(pool, status="pending")
+            if r["issue_id"] == issue.id
+        ][0]
+        repo.resolve_pending_action(pool, pending["id"], "approved", resolved_by="alice")
+
+        # Consume it directly (simulating another worker winning the race)
+        repo.consume_approved_action(pool, pending["id"])
+
+        # The loser calls handle_escalation for the same triple; should get "pending"
+        # (a new pending row), not raise ValueError
+        decision = handle_escalation(
+            pool, issue.id, "/tmp/wt", "verify", "race-cmd", "run", "dev", "authorize",
+        )
+
+        assert decision == "pending"
+
+        # A new pending row was created (re-escalation)
+        pending_rows = [
+            r for r in repo.list_pending_actions(pool, status="pending")
+            if r["issue_id"] == issue.id and r["action"] == "race-cmd"
+        ]
+        assert len(pending_rows) == 1

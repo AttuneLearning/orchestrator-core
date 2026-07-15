@@ -921,12 +921,24 @@ def create_app(pool: Optional[ConnectionPool] = None,
 
     @app.post("/actions/{action_id}/approve")
     def action_approve(action_id: int):
-        repo.resolve_pending_action(pool, action_id, "approved", resolved_by="dashboard")
+        try:
+            repo.resolve_pending_action(pool, action_id, "approved", resolved_by="dashboard")
+        except ValueError:
+            # Row is not pending (e.g., expired or already resolved between page render
+            # and button click). Fail closed: redirect back to /actions so the user sees
+            # the current state instead of a 500 error.
+            pass
         return RedirectResponse("/actions", status_code=303)
 
     @app.post("/actions/{action_id}/deny")
     def action_deny(action_id: int):
-        repo.resolve_pending_action(pool, action_id, "denied", resolved_by="dashboard")
+        try:
+            repo.resolve_pending_action(pool, action_id, "denied", resolved_by="dashboard")
+        except ValueError:
+            # Row is not pending (e.g., expired or already resolved between page render
+            # and button click). Fail closed: redirect back to /actions so the user sees
+            # the current state instead of a 500 error.
+            pass
         return RedirectResponse("/actions", status_code=303)
 
     @app.post("/issues/{issue_id}/directive")

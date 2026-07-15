@@ -233,9 +233,17 @@ def test_apply_legacy_never_calls_workflow_package(target_repo, monkeypatch):
 
 
 def test_apply_enabled_ok_path(target_repo, monkeypatch):
-    """Enabled mode: prepare ok + verify ok -> passed=True with proper keys."""
-    script = {"prepare": StepResult(status="ok"), "verify": StepResult(status="ok")}
+    """Enabled mode: cleanup ok + prepare ok + verify ok -> passed=True with proper keys."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="ok"),
+        "verify": StepResult(status="ok"),
+    }
     events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
         "prepare": [("executed", _action_payload(
             "allow", builtin="node-deps-reconcile",
             ok=True, reason="", installed=False, returncode=0,
@@ -270,13 +278,22 @@ def test_apply_enabled_ok_path(target_repo, monkeypatch):
 
 
 def test_apply_enabled_prepare_failed(target_repo, monkeypatch):
-    """Enabled mode: prepare failed -> passed=False with error + deps detail."""
-    script = {"prepare": StepResult(status="failed",
-                                     reason="failed: npm ci: exit code 1")}
-    events = {"prepare": [("failed", _action_payload(
-        "allow", builtin="node-deps-reconcile",
-        ok=False, reason="npm ci failed", returncode=1, stderr_tail="boom",
-    ))]}
+    """Enabled mode: cleanup ok + prepare failed -> passed=False with error + deps detail."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="failed",
+                             reason="failed: npm ci: exit code 1"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("failed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=False, reason="npm ci failed", returncode=1, stderr_tail="boom",
+        ))],
+    }
 
     from orchestrator.apply import worktree as wt_module
     monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)
@@ -300,12 +317,21 @@ def test_apply_enabled_prepare_failed(target_repo, monkeypatch):
 
 
 def test_apply_enabled_prepare_blocked(target_repo, monkeypatch):
-    """Enabled mode: prepare escalates -> passed=None + status=blocked_on_approval."""
-    script = {"prepare": StepResult(status="blocked_on_approval",
-                                     reason="awaiting approval: custom-setup")}
-    events = {"prepare": [("escalated", _action_payload(
-        "escalate", run="custom-setup", decision="pending",
-    ))]}
+    """Enabled mode: cleanup ok + prepare escalates -> passed=None + status=blocked_on_approval."""
+    script = {
+        "cleanup": StepResult(status="ok"),
+        "prepare": StepResult(status="blocked_on_approval",
+                             reason="awaiting approval: custom-setup"),
+    }
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("escalated", _action_payload(
+            "escalate", run="custom-setup", decision="pending",
+        ))],
+    }
 
     from orchestrator.apply import worktree as wt_module
     monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)
@@ -328,16 +354,27 @@ def test_apply_enabled_prepare_blocked(target_repo, monkeypatch):
 
 
 def test_apply_enabled_verify_failed(target_repo, monkeypatch):
-    """Enabled mode: verify failed -> passed=False with returncode from verify step."""
+    """Enabled mode: cleanup ok + prepare ok + verify failed -> passed=False with returncode from verify step."""
     script = {
+        "cleanup": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="failed", reason="failed: verify: exit code 1"),
     }
-    events = {"verify": [("failed", _action_payload(
-        "allow", run="npm run test",
-        ok=False, reason="exit code 1", returncode=1,
-        stdout="test failed output\n", stderr="error message\n",
-    ))]}
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [("failed", _action_payload(
+            "allow", run="npm run test",
+            ok=False, reason="exit code 1", returncode=1,
+            stdout="test failed output\n", stderr="error message\n",
+        ))],
+    }
 
     from orchestrator.apply import worktree as wt_module
     monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)
@@ -359,15 +396,26 @@ def test_apply_enabled_verify_failed(target_repo, monkeypatch):
 
 
 def test_apply_enabled_verify_blocked(target_repo, monkeypatch):
-    """Enabled mode: verify escalates -> passed=None + status=blocked_on_approval."""
+    """Enabled mode: cleanup ok + prepare ok + verify escalates -> passed=None + status=blocked_on_approval."""
     script = {
+        "cleanup": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="blocked_on_approval",
-                              reason="awaiting approval: deploy-prod"),
+                             reason="awaiting approval: deploy-prod"),
     }
-    events = {"verify": [("escalated", _action_payload(
-        "escalate", run="deploy-prod", decision="pending",
-    ))]}
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
+            ok=True, reason="", returncode=0,
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [("escalated", _action_payload(
+            "escalate", run="deploy-prod", decision="pending",
+        ))],
+    }
 
     from orchestrator.apply import worktree as wt_module
     monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)
@@ -389,26 +437,37 @@ def test_apply_enabled_verify_blocked(target_repo, monkeypatch):
 
 
 def test_apply_enabled_verify_failed_action_with_warn_reports_failed(target_repo, monkeypatch):
-    """Enabled mode: verify step status is "ok" but an action failed with on_fail: warn
+    """Enabled mode: cleanup ok + prepare ok + verify step status is "ok" but an action failed with on_fail: warn
     -> passed=False with returncode from the failed action, not synthesized from status."""
     script = {
+        "cleanup": StepResult(status="ok"),
         "prepare": StepResult(status="ok"),
         "verify": StepResult(status="ok", results=[]),
     }
     # First action fails but is allowed to warn (on_fail: warn)
     # Second action succeeds
-    events = {"verify": [
-        ("failed", _action_payload(
-            "allow", run="npm run lint",
-            ok=False, reason="lint errors", returncode=2, on_fail="warn",
-            stdout="lint output\n", stderr="warnings\n",
-        )),
-        ("executed", _action_payload(
-            "allow", run="npm run test",
+    events = {
+        "cleanup": [("executed", _action_payload(
+            "allow", run="git reset --hard && git clean -fd",
             ok=True, reason="", returncode=0,
-            stdout="tests pass\n", stderr="",
-        )),
-    ]}
+        ))],
+        "prepare": [("executed", _action_payload(
+            "allow", builtin="node-deps-reconcile",
+            ok=True, reason="", returncode=0,
+        ))],
+        "verify": [
+            ("failed", _action_payload(
+                "allow", run="npm run lint",
+                ok=False, reason="lint errors", returncode=2, on_fail="warn",
+                stdout="lint output\n", stderr="warnings\n",
+            )),
+            ("executed", _action_payload(
+                "allow", run="npm run test",
+                ok=True, reason="", returncode=0,
+                stdout="tests pass\n", stderr="",
+            )),
+        ],
+    }
 
     from orchestrator.apply import worktree as wt_module
     monkeypatch.setattr(wt_module, "load_effective", lambda *a, **k: None)

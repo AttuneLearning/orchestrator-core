@@ -142,6 +142,12 @@ def _resolve_escalation(
 def _run_builtin(worktree: str | Path, profile: Profile, action: RequiredAction) -> dict[str, Any]:
     """Execute a builtin action via the profile's stack adapter.
 
+    A builtin handler's contract is `fn(worktree, action) -> dict` — the
+    driving `RequiredAction` is always passed through (not just the worktree
+    path) so a handler can read parameters off `action.args` (e.g.
+    `probe-tcp`'s endpoint spec); handlers that need nothing beyond the
+    worktree simply ignore the second argument.
+
     Returns a JSON-safe dict with at least `ok`/`reason`. Never raises — an
     unknown stack, unknown builtin name, or an exception from the builtin
     itself all become a `{"ok": False, "reason": ...}` result.
@@ -155,7 +161,7 @@ def _run_builtin(worktree: str | Path, profile: Profile, action: RequiredAction)
         return {"ok": False, "reason": f"unknown builtin: {action.builtin!r}"}
 
     try:
-        result = fn(worktree)
+        result = fn(worktree, action)
     except Exception as exc:  # builtins are adapter code; never let them crash the runner
         return {"ok": False, "reason": f"builtin {action.builtin!r} raised: {exc}"}
 

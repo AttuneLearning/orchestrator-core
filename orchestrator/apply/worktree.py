@@ -62,13 +62,19 @@ def _apply_in_worktree_enabled(
     issue: Issue, wt: str | Path, settings: Settings, sha: str, committed: bool,
     pool: Optional[ConnectionPool] = None,
 ) -> dict[str, Any]:
-    """`workflow_profile: enabled` path for `_apply_in_worktree` (WP-09/WP-13).
+    """`workflow_profile: enabled` path for `_apply_in_worktree` (WP-09/WP-13/WP-18).
 
-    Runs the `prepare` then `verify` steps of the effective workflow Profile
-    (Phase A: `orchestrator.workflow.loader`/`runner`) in place of the inline
+    Runs the `cleanup` (if needed), `services` (if declared), `prepare` then
+    `verify` steps of the effective workflow Profile (Phase A/D:
+    `orchestrator.workflow.loader`/`runner`) in place of the inline
     `ensure_deps_current` call + hardcoded `settings.verify_cmd`. A
-    `blocked_on_approval` outcome from either step returns `passed=None` plus
-    `step`/`action`/`phase`/`note` (WP-13), same shape as verify_run's.
+    `blocked_on_approval` outcome from any step returns `passed=None` plus
+    `step`/`action`/`phase`/`note` (WP-13), same shape as verify_run's. A down
+    default/engine-declared service probe fails the step immediately (see
+    `_services_escalation_cb`) rather than blocking on approval — only a
+    repo-authored probe (source == "repo") can produce `blocked_on_approval`
+    for the services step; a profile with no services declared is a no-op
+    that proceeds straight to `prepare`.
     Unlike verify_run, this function does NOT log events itself (the caller
     apply_and_verify handles that) — so event_cb is always None.
 
@@ -99,6 +105,79 @@ def _apply_in_worktree_enabled(
             return base(action, phase)
 
         return _cb, phase_seen
+
+    # Run cleanup step first to ensure a clean worktree state before prepare+verify.
+    # Unlike verify_run, we don't log events (event_cb=None, per convention).
+    cleanup_result = run_step(wt, profile, "cleanup", "qa", perms, event_cb=None)
+    if cleanup_result.status == "blocked_on_approval":
+        action = cleanup_result.results[-1].action if cleanup_result.results else None
+        return {
+            "passed": None,
+            "status": "blocked_on_approval",
+            "reason": cleanup_result.reason,
+            "step": "cleanup",
+            "action": _action_ident(action) if action is not None else cleanup_result.reason,
+            "phase": "authorize",
+            "note": _BLOCKED_NOTE,
+            "branch": branch,
+            "commit": sha,
+        }
+
+    if cleanup_result.status == "failed":
+        return {
+            "passed": False,
+            "error": f"cleanup failed: {cleanup_result.reason}",
+            "branch": branch,
+            "commit": sha,
+            "committed": committed,
+            "deps": {},
+        }
+
+    # Services readiness gate (WP-18/plan step-4 wiring): a down default/
+    # engine-declared service is an environment problem, not an approval
+    # question, so a non-repo probe's on_fail=escalate is denied immediately
+    # (fails fast) instead of parking on the approval queue; only a
+    # repo-authored probe (source == "repo") goes through the normal
+    # pending-approval flow, same as any other custom action. A profile with
+    # no services declared (or a mocked/None profile, as some pure tests use)
+    # has no "services" actions, so this is skipped entirely — a no-op that
+    # proceeds straight to prepare.
+    services_base_cb, services_phase_seen = _make_escalation_cb("services")
+
+    def _services_escalation_cb(action: Any, phase: str) -> str:
+        if action.source != "repo":
+            return "denied"
+        if services_base_cb is None:
+            return "pending"
+        return services_base_cb(action, phase)
+
+    if profile is not None and profile.step("services").actions_for("qa"):
+        services_result = run_step(wt, profile, "services", "qa", perms, event_cb=None,
+                                  escalation_cb=_services_escalation_cb)
+
+        if services_result.status == "blocked_on_approval":
+            action = services_result.results[-1].action if services_result.results else None
+            return {
+                "passed": None,
+                "status": "blocked_on_approval",
+                "reason": services_result.reason,
+                "step": "services",
+                "action": _action_ident(action) if action is not None else services_result.reason,
+                "phase": services_phase_seen.get("phase", "authorize"),
+                "note": _BLOCKED_NOTE,
+                "branch": branch,
+                "commit": sha,
+            }
+
+        if services_result.status == "failed":
+            return {
+                "passed": False,
+                "error": f"service not ready: {services_result.reason}",
+                "branch": branch,
+                "commit": sha,
+                "committed": committed,
+                "deps": {},
+            }
 
     prepare_escalation_cb, prepare_phase_seen = _make_escalation_cb("prepare")
 
