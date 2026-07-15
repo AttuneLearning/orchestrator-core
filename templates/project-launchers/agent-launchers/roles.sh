@@ -62,6 +62,22 @@ resolve_role() {
       DEFAULT_RUNTIME="opencode"
       LOOP_AGENT=0
       ;;
+    backend-dev-worker-2|backend-dev-2|be-dev-2)
+      # OPTIONAL second backend dev lane for parallelism. Requires a registered
+      # agent (id 8) + its own worktree (wt-backend-dev-2) so it does NOT collide
+      # with agent 1. Launch: ./start-dev-worker.sh backend-2 <runtime>. Steer it to
+      # work independent of agent 1 (different goal/files) to avoid promote conflicts.
+      ROLE="backend-dev-worker-2"
+      AGENT_ID=8
+      TEAM="backend"
+      FUNCTION="dev"
+      GATE="implementation"
+      APP="apps/api"
+      WORKTREE="$WORKSPACE_ROOT/wt-backend-dev-2"
+      PROMPT_NAME="dev-worker"
+      DEFAULT_RUNTIME="opencode"
+      LOOP_AGENT=0
+      ;;
     frontend-dev-worker|frontend-dev|fe-dev)
       ROLE="frontend-dev-worker"
       AGENT_ID=3
