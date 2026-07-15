@@ -16,6 +16,7 @@ templates/project-launchers/agent-launchers/secrets.env
 # `orchestrator init` scaffolds the real (gitignored) files at install time.
 config/instances.yaml
 config/instances.d/
+config/settings.local.yaml
 config/roster.*.yaml
 !config/roster.example.pull.yaml
 !config/roster.monorepo.yaml

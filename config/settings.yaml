@@ -5,10 +5,15 @@
 reasoning_model: claude-opus-4-8
 database_url: postgresql://orchestrator:orchestrator@localhost:5432/orchestrator
 anthropic_api_key: ''
-reasoner: openai
-reasoner_base_url: http://10.100.90.132:8081/v1
-reasoner_model: qwen-local
-reasoner_api_key: blank
+# Reasoner backend: "" = auto (anthropic if a key is set, else the hermetic
+# stub — zero-config, no infra). Point a real reasoner via a model_profiles
+# entry + engine_reasoner.profile per instance, or override globally in
+# config/settings.local.yaml (gitignored, operator-local). Never hardcode a
+# private endpoint in this tracked file.
+reasoner: ''
+reasoner_base_url: ''
+reasoner_model: ''
+reasoner_api_key: ''
 reasoner_cli_cmd: cli
 # Overload resilience for reasoner=openai: retry primary, fall back to
 # reasoner_fallback_model, pause reasoner_path_pause_s, retry the whole path
@@ -21,10 +26,10 @@ reasoner_backoff_max: 30.0
 reasoner_path_pause_s: 60.0
 reasoner_path_cycles: 2
 reasoner_request_timeout_s: 60.0
-docs_reasoner: openai
-docs_reasoner_base_url: http://10.100.90.132:8081/v1
-docs_reasoner_model: qwen-local
-docs_reasoner_api_key: blank
+docs_reasoner: ''
+docs_reasoner_base_url: ''
+docs_reasoner_model: ''
+docs_reasoner_api_key: ''
 code_provider: stub
 code_base_url: ''
 code_model: ''
