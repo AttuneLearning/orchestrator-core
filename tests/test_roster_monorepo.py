@@ -23,12 +23,14 @@ def test_roster_file_selects_monorepo(monkeypatch):
     s = load_settings()
     assert s.roster_file == "config/roster.monorepo.yaml"
     r = load_roster(s.roster)
-    # repos repointed to monorepo package paths (ADR-scoping strings)
+    # repos are monorepo package paths (ADR-scoping strings), not independent repos
     assert r.resolve("backend").repos == ("apps/api",)
     assert r.resolve("frontend").repos == ("apps/web",)
-    assert r.resolve("contracts").repos == ("packages/contracts",)
-    # aliases preserved across the variant
-    assert r.resolve("contract").id == "contracts"
+    # standard 7-agent lineup: be/fe/sr each dev+qa, plus the orch-manager lead
+    assert r.resolve("be").id == "backend"
+    assert r.resolve("fe").id == "frontend"
+    assert r.resolve("sr").id == "senior"
     assert r.resolve("orch-monitor").id == "orchestration"
-    # same teams/pull model otherwise
-    assert {st.function for st in r.resolve("backend").sub_teams} == {"dev", "qa", "lead"}
+    assert {st.function for st in r.resolve("backend").sub_teams} == {"dev", "qa"}
+    assert {st.function for st in r.resolve("senior").sub_teams} == {"dev", "qa"}
+    assert {st.id for st in r.resolve("orchestration").sub_teams} == {"orch-manager"}

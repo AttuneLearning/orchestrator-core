@@ -1,33 +1,27 @@
 # =============================================================================
-# Roster (MONOREPO variant) — for AttuneLearning/cadencelms (apps/api, apps/web,
-# packages/contracts in ONE repo). Identical to the independent-repos roster
-# except `repos:` are now PACKAGE PATHS within the monorepo (these strings only
-# scope ADR rules — adr_rules._repos_match). Pull workers clone the single
-# monorepo and work in a git worktree scoped to their team's package path.
+# Roster — STANDARD MONOREPO EXAMPLE (tracked template; safe to publish).
 #
-# Selected for the cadencelms instance in config/instances.yaml. ROSTER_FILE
-# remains available as an explicit environment override.
+# The reference monorepo topology: one repo with package paths (apps/api,
+# apps/web, packages/*), and the standard 7-agent lineup:
+#
+#   1. orch-manager  (orchestration lead / monitor — coordinates, never a worker)
+#   2. backend-dev   3. backend-qa
+#   4. frontend-dev  5. frontend-qa
+#   6. senior-dev    7. senior-qa   (on-demand escalation team)
+#
+# `repos:` are PACKAGE PATHS within the monorepo — these strings only scope ADR
+# rules (adr_rules._repos_match); pull workers clone the single repo and work in
+# a git worktree scoped to their package path. Copy this to
+# config/roster.<project>.yaml (gitignored) and edit for a real project.
 # =============================================================================
 
 roles:
-  frontend:
-    name: Frontend
-    sub_roles: [ui-development, design-system, accessibility, performance, state-data-layer]
   backend:
     name: Backend
     sub_roles: [api-development, app-data, auth, integrations, background-jobs]
-  mobile:
-    name: Mobile
-    sub_roles: [ios, android, cross-platform, app-distribution]
-  cloud:
-    name: Cloud / Infrastructure
-    sub_roles: [architecture, cicd, observability, security-compliance, cost-optimization]
-  data-warehousing:
-    name: Data Warehousing
-    sub_roles: [etl-pipelines, analytics-bi, data-governance, ml-ai, streaming]
-  qa:
-    name: QA
-    sub_roles: [manual-qa, test-automation, performance-testing, security-testing]
+  frontend:
+    name: Frontend
+    sub_roles: [ui-development, design-system, accessibility, performance, state-data-layer]
   platform:
     name: Platform
     sub_roles: [developer-experience, sdk-api-design, internal-tools, documentation]
@@ -40,12 +34,13 @@ enabled_skills: [comms, adr, memory, context, reflect, refine]
 default_runtime: api   # api | cli | external (per-sub_team runtime overrides this)
 
 active_teams:
+  # --- 2,3: backend (owns apps/api) ----------------------------------------
   - id: backend
     name: Backend
-    alias: api
+    alias: be
     role: backend
     issue_prefix: API-ISS
-    repos: [apps/api]            # monorepo package path (was api-repo)
+    repos: [apps/api]            # monorepo package path
     sub_teams:
       - id: backend-dev
         name: Backend-Dev
@@ -59,47 +54,14 @@ active_teams:
         mode: pull
         runtime: external
         issue_prefix: BQA
-      - id: backend-lead
-        name: Backend-Lead
-        function: lead
-        mode: verdict
-        runtime: api
-        issue_prefix: BLEAD
-  - id: qa
-    name: QA
-    alias: quality
-    role: qa
-    issue_prefix: QA-ISS
-    repos: []          # spans all packages -> project-wide rules only
-    sub_teams:
-      - id: qa-dev
-        name: QA-Dev
-        function: dev
-        issue_prefix: QA-ISS
-      - id: qa-qa
-        name: QA-QA
-        function: qa
-        issue_prefix: QA-QA
-  - id: platform
-    name: Platform
-    alias: plat
-    role: platform
-    issue_prefix: PLAT-ISS
-    sub_teams:
-      - id: platform-dev
-        name: Platform-Dev
-        function: dev
-        issue_prefix: PLAT-ISS
-      - id: platform-qa
-        name: Platform-QA
-        function: qa
-        issue_prefix: PLAT-QA
+
+  # --- 4,5: frontend (owns apps/web) ---------------------------------------
   - id: frontend
     name: Frontend
-    alias: ui
+    alias: fe
     role: frontend
     issue_prefix: UI-ISS
-    repos: [apps/web]            # monorepo package path (was web-repo)
+    repos: [apps/web]            # monorepo package path
     sub_teams:
       - id: frontend-dev
         name: Frontend-Dev
@@ -112,30 +74,32 @@ active_teams:
         function: qa
         mode: pull
         runtime: external
-        issue_prefix: UI-QA
-      - id: frontend-lead
-        name: Frontend-Lead
-        function: lead
-        mode: verdict
-        runtime: api
-        issue_prefix: ULEAD
-  # Shared API contracts package — owns packages/contracts (the @cadencelms/contracts
-  # SSOT). Backend typically owns it; listed so ADR rules can scope to it.
-  - id: contracts
-    name: Contracts
-    alias: contract
+        issue_prefix: UIQA
+
+  # --- 6,7: senior / escalation (spans all packages; on-demand) ------------
+  - id: senior
+    name: Senior / Escalation
+    alias: sr
     role: platform
-    issue_prefix: CON-ISS
-    repos: [packages/contracts]
+    issue_prefix: SR-ISS
+    repos: []                    # spans all packages -> project-wide rules only
     sub_teams:
-      - id: contracts-lead
-        name: Contracts-Lead
-        function: lead
-        mode: verdict
-        runtime: api
-        issue_prefix: CON-ISS
-  # Orchestration-monitor: human-drained inbox for process/architecture questions
-  # (alias 'orch-monitor'/'monitor'); engine never decomposes its messages.
+      - id: senior-dev
+        name: Senior-Dev
+        function: dev
+        mode: pull
+        runtime: external
+        issue_prefix: SR-ISS
+      - id: senior-qa
+        name: Senior-QA
+        function: qa
+        mode: pull
+        runtime: external
+        issue_prefix: SRQA
+
+  # --- 1: orch-manager (orchestration lead / human-drained monitor inbox) ---
+  # The coordinator. Renders decisions (mode: verdict); the engine never
+  # decomposes its messages. Aliased orch-monitor / monitor.
   - id: orchestration
     name: Orchestration / Monitor
     alias: orch-monitor
@@ -143,18 +107,19 @@ active_teams:
     issue_prefix: ORCH-ISS
     repos: []
     sub_teams:
-      - id: orchestration-lead
-        name: Orchestration-Lead
+      - id: orch-manager
+        name: Orch-Manager
         function: lead
         mode: verdict
         runtime: api
         issue_prefix: ORCH-ISS
 
 aliases:
+  be: backend
   api: backend
+  fe: frontend
   ui: frontend
-  quality: qa
-  plat: platform
-  contract: contracts
+  sr: senior
+  escalation: senior
   orch-monitor: orchestration
   monitor: orchestration
