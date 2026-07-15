@@ -46,10 +46,13 @@ thresholds:
   max_children_per_parent: 5
 contract_gate_enabled: false
 auto_promote_enabled: true
-promote_repo_path: /home/adam/github/cadencelms-working/cadencelms
+# Product-checkout paths are per-project — set them per instance in
+# config/instances.yaml (settings.promote_repo_path / docs_path), or globally in
+# config/settings.local.yaml. Never hardcode a real path in this tracked file.
+promote_repo_path: ''
 promote_branch: main
 auto_rebase_downstream: true
-docs_path: /home/adam/github/cadencelms-working/docs
+docs_path: ''
 embed_api_key: ''
 default_pipeline: pull-1
 docs_reasoner_cli_cmd: ''
