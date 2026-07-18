@@ -112,6 +112,15 @@ class Settings:
     apply_enabled: bool = False
     apply_repo_path: str = ""
     verify_cmd: str = ""
+    # Structured verification (framework-wide false-negative hardening). When
+    # verify_report_path is set, the harness gates on the parsed test report
+    # (JUnit XML by default), NOT the process exit code — so a flaky non-zero
+    # exit with zero failed tests is retried once then flagged, never a silent
+    # decline. Unset -> exit-code behavior is unchanged (fail-safe, opt-in).
+    verify_report_path: str = ""            # relative to the verify worktree, or absolute
+    verify_report_format: str = "junit"     # junit | (phase 2: vitest-json/pytest-json/gotest-json)
+    verify_flake_retries: int = 1           # clean re-runs of a flaky_exit before flagging a human
+    verify_ignore_unhandled: list[str] = field(default_factory=list)  # extra regexes, merged with defaults
 
     # Coordinator DB backups. The engine runs this best-effort after e2e gate
     # success and goal completion. The CLI/script can run it manually too.
@@ -340,6 +349,10 @@ def load_settings(instance: str | None = None) -> Settings:
             val = {}
         return _deep_merge(default, val)
 
+    def pick_list(yaml_key: str, default: list) -> list:
+        val = s_yaml.get(yaml_key, default)
+        return list(val) if isinstance(val, list) else list(default)
+
     # A selected instance's roster is authoritative over an ambient ROSTER_FILE env
     # (selecting the dev group must pick that group's roster, not the shell default).
     if instance and s_yaml.get("roster_file"):
@@ -407,6 +420,10 @@ def load_settings(instance: str | None = None) -> Settings:
         apply_enabled=pick_bool("APPLY_ENABLED", "apply_enabled", False),
         apply_repo_path=pick("APPLY_REPO_PATH", "apply_repo_path", ""),
         verify_cmd=pick("VERIFY_CMD", "verify_cmd", ""),
+        verify_report_path=pick("VERIFY_REPORT_PATH", "verify_report_path", ""),
+        verify_report_format=pick("VERIFY_REPORT_FORMAT", "verify_report_format", "junit"),
+        verify_flake_retries=int(pick("VERIFY_FLAKE_RETRIES", "verify_flake_retries", "1")),
+        verify_ignore_unhandled=pick_list("verify_ignore_unhandled", []),
         database_backup_enabled=pick_bool("ORCH_DB_BACKUP_ENABLED", "database_backup_enabled", True),
         database_backup_dir=pick("ORCH_DB_BACKUP_DIR", "database_backup_dir", "backups/orchestrator-db"),
         auto_promote_enabled=pick_bool("AUTO_PROMOTE_ENABLED", "auto_promote_enabled", False),

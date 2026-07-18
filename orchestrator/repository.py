@@ -567,6 +567,7 @@ def events_since(pool: ConnectionPool, after_id: int = 0,
 _AGENT_ACTIVITY_TYPES = (
     "state_change", "gate_enter", "gate_pass", "gate_decline", "code_committed",
     "tests_run", "reclaimed", "directive", "code_generated", "comms_response",
+    "verify_flaky",
 )
 
 
@@ -582,6 +583,7 @@ def _activity_label(row: dict[str, Any]) -> str:
         "code_committed": "committed code", "tests_run": "ran tests",
         "reclaimed": "reclaimed (went stale)", "directive": "resumed (directive)",
         "code_generated": "generated code", "comms_response": "sent response",
+        "verify_flaky": "verify flaky (green tests, nonzero exit)",
     }.get(et, et)
 
 
@@ -1013,17 +1015,20 @@ def worker_tier_stats(pool: ConnectionPool) -> list[dict[str, Any]]:
             "                        AND (payload->>'machine')::bool) AS verifies, "
             "       COUNT(*) FILTER (WHERE event_type = 'tests_run' "
             "                        AND (payload->>'machine')::bool "
-            "                        AND (payload->>'returncode')::int = 0) AS verify_green, "
+            "                        AND (CASE WHEN payload ? 'tests_failed_n' "
+            "                                  THEN (payload->>'tests_failed_n')::int = 0 "
+            "                                  ELSE (payload->>'returncode')::int = 0 END)) AS verify_green, "
+            "       COUNT(*) FILTER (WHERE event_type = 'verify_flaky') AS verify_flaky, "
             "       ROUND(AVG((payload->>'duration_s')::float) FILTER "
             "             (WHERE payload ? 'duration_s')::numeric, 1) AS avg_verify_s, "
             "       COUNT(*) FILTER (WHERE event_type = 'gate_pass') AS gate_pass, "
             "       COUNT(*) FILTER (WHERE event_type = 'gate_decline') AS gate_decline "
             "FROM issue_events "
             "WHERE payload ? 'agent_runtime' "
-            "  AND event_type IN ('code_committed','tests_run','gate_pass','gate_decline') "
+            "  AND event_type IN ('code_committed','tests_run','gate_pass','gate_decline','verify_flaky') "
             "GROUP BY 1, 2 ORDER BY 2, 1"
         ).fetchall()
-    cols = ["runtime", "team", "commits", "verifies", "verify_green",
+    cols = ["runtime", "team", "commits", "verifies", "verify_green", "verify_flaky",
             "avg_verify_s", "gate_pass", "gate_decline"]
     return [dict(zip(cols, r)) for r in rows]
 

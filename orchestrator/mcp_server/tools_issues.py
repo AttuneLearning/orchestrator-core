@@ -4,6 +4,7 @@ create_subissue / append_log. Thin wrappers over repository.py."""
 from __future__ import annotations
 
 from dataclasses import asdict
+import os
 import re
 import subprocess
 import time
@@ -13,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from psycopg_pool import ConnectionPool
 
 from .. import repository as repo
+from .. import verify_report
 from ..apply.npm_deps import ensure_deps_current
 from ..config import load_settings
 from ..pipelines import load_pipelines
@@ -873,23 +875,77 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
                     "duration_s": 0.0,
                     "tail": f"dependency install failed before verify: {deps['reason']}"}
         cmd = settings.verify_cmd or "npm run typecheck && npm test"
-        started = time.monotonic()
-        try:
-            proc = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True,
-                                  text=True, timeout=900)
-            returncode, out, err = proc.returncode, proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired as exc:
-            returncode = 124
-            out = (exc.stdout or b"").decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            err = f"verify timed out after 900s"
-        duration = round(time.monotonic() - started, 1)
-        payload = {
-            "machine": True, "cmd": cmd, "returncode": returncode,
-            "duration_s": duration, "branch": verify_branch,
-            "stdout_tail": out[-1200:], "stderr_tail": err[-800:],
-            "deps": deps,
-        }
-        payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
-        repo.append_log(pool, issue_id, "tests_run", payload)
-        return {"passed": returncode == 0, "returncode": returncode,
+        # Structured-verification inputs (fail-safe: no report_path -> exit-code gating).
+        ignore = list(verify_report.DEFAULT_IGNORE_UNHANDLED) + list(
+            settings.verify_ignore_unhandled or [])
+        report_path = settings.verify_report_path or ""
+        if report_path and not os.path.isabs(report_path):
+            report_path = os.path.join(wt, report_path)
+        report_fmt = settings.verify_report_format or "junit"
+
+        def _run_once() -> tuple[int, str, str, float]:
+            # Remove any stale report so a parse can never read a prior run's result.
+            if report_path:
+                try:
+                    os.remove(report_path)
+                except OSError:
+                    pass
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True,
+                                      text=True, timeout=900)
+                rc, o, e = proc.returncode, proc.stdout, proc.stderr
+            except subprocess.TimeoutExpired as exc:
+                rc = 124
+                o = (exc.stdout or b"").decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+                e = "verify timed out after 900s"
+            return rc, o, e, round(time.monotonic() - started, 1)
+
+        def _stamp(rc, o, e, dur, report, classification, attempt):
+            payload = {
+                "machine": True, "cmd": cmd, "returncode": rc,
+                "duration_s": dur, "branch": verify_branch,
+                "stdout_tail": o[-1200:], "stderr_tail": e[-800:], "deps": deps,
+                "classification": classification, "attempt": attempt,
+            }
+            if report is not None:
+                payload.update({"tests_n": report.tests,
+                                "tests_failed_n": report.failed,
+                                "suites_failed_n": report.suites_failed})
+            payload.update(_agent_stamp(pool, issue))  # GAP-5 telemetry
+            repo.append_log(pool, issue_id, "tests_run", payload)
+
+        attempt = 1
+        returncode, out, err, duration = _run_once()
+        report = verify_report.parse_report(report_path, report_fmt)
+        passed, classification = verify_report.classify(returncode, report, ignore)
+        _stamp(returncode, out, err, duration, report, classification, attempt)
+
+        # flaky_exit = all tests green but a non-zero process exit. Retry once
+        # cleanly before ever declining (a decline would burn the retry budget
+        # and can mark a green deliverable `failed`).
+        if passed is None and (settings.verify_flake_retries or 0) >= 1:
+            repo.append_log(pool, issue_id, "verify_flaky", {
+                "machine": True, "branch": verify_branch, "attempt": attempt,
+                "returncode": returncode,
+                "note": "non-zero exit with zero failed tests — retrying once",
+                **_agent_stamp(pool, issue)})
+            attempt += 1
+            returncode, out, err, duration = _run_once()
+            report = verify_report.parse_report(report_path, report_fmt)
+            passed, classification = verify_report.classify(returncode, report, ignore)
+            _stamp(returncode, out, err, duration, report, classification, attempt)
+
+        if passed is None:
+            # Still flaky after the retry: do NOT decline. Surface to the lead —
+            # same non-failure contract as blocked_on_approval (heartbeat + re-poll).
+            repo.append_log(pool, issue_id, "verify_flaky", {
+                "machine": True, "branch": verify_branch, "attempt": attempt,
+                "returncode": returncode, "note": "flaky_inconclusive after retry",
+                **_agent_stamp(pool, issue)})
+            return {"passed": None, "status": "flaky_inconclusive",
+                    "returncode": returncode, "duration_s": duration,
+                    "tail": out[-600:] or err[-600:]}
+
+        return {"passed": passed, "returncode": returncode,
                 "duration_s": duration, "tail": out[-600:] or err[-600:]}
