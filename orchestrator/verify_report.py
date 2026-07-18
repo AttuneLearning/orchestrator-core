@@ -17,6 +17,8 @@ Design contract (see IMPL-PLAN-verify-false-negatives.md):
 """
 from __future__ import annotations
 
+import glob as _glob
+import os
 import re
 from dataclasses import dataclass, field
 from xml.etree import ElementTree as ET
@@ -51,25 +53,56 @@ def matches_any(text: str, patterns) -> bool:
     return any(re.search(p, text) for p in (patterns or []))
 
 
+def _report_files(path: str) -> list[str]:
+    """Resolve `path` to the set of report files to aggregate.
+
+    Monorepos that run `npm run test --workspaces` emit ONE report per workspace,
+    so a single verdict must sum across all of them. `path` may be:
+      - a plain file            -> [that file]
+      - a directory             -> every *.xml under it (recursive)
+      - a glob (contains * ? [) -> its matches
+    """
+    if any(ch in path for ch in "*?["):
+        return sorted(_glob.glob(path, recursive=True))
+    if os.path.isdir(path):
+        return sorted(_glob.glob(os.path.join(path, "**", "*.xml"), recursive=True))
+    if os.path.isfile(path):
+        return [path]
+    return []
+
+
 def parse_report(path: str, fmt: str = "junit") -> "VerifyReport | None":
-    """Parse a machine test report. Returns None when the report is absent or
-    unparseable so the caller can FAIL-SAFE to the exit code (never fail-open)."""
+    """Parse machine test report(s), aggregating across a dir/glob so a monorepo's
+    per-workspace reports produce ONE verdict. Returns None when nothing is found
+    or nothing parses, so the caller can FAIL-SAFE to the exit code (never
+    fail-open)."""
     if not path:
         return None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = fh.read()
-    except OSError:
-        return None
     fmt = (fmt or "junit").lower()
-    try:
-        if fmt == "junit":
-            return _parse_junit(data)
-        # Phase 2: "vitest-json" / "pytest-json" / "gotest-json" plug in here and
-        # can populate .unhandled. Unknown format -> None (fail-safe).
+    files = _report_files(path)
+    if not files:
         return None
-    except Exception:
-        return None
+    agg = VerifyReport()
+    parsed_any = False
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                data = fh.read()
+            one = _parse_junit(data) if fmt == "junit" else None
+            # Phase 2: "vitest-json"/"pytest-json"/"gotest-json" plug in above and
+            # may populate .unhandled. Unknown format -> None (fail-safe).
+        except Exception:  # unreadable or unparseable -> skip this file (fail-safe)
+            one = None
+        if one is None:
+            continue
+        parsed_any = True
+        agg.tests += one.tests
+        agg.failures += one.failures
+        agg.errors += one.errors
+        agg.skipped += one.skipped
+        agg.suites_failed += one.suites_failed
+        agg.unhandled.extend(one.unhandled)
+    return agg if parsed_any else None
 
 
 def _parse_junit(data: str) -> "VerifyReport | None":

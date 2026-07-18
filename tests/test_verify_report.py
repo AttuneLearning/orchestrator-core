@@ -42,6 +42,36 @@ def test_parse_missing_file_is_none():
     assert vr.parse_report("/no/such/report.xml") is None
 
 
+def test_aggregate_directory_of_reports(tmp_path):
+    # Monorepo: one JUnit file per workspace -> summed into one verdict.
+    (tmp_path / "api.xml").write_text('<testsuite tests="1000" failures="0" errors="0"/>')
+    (tmp_path / "web.xml").write_text('<testsuite tests="300" failures="0" errors="0"/>')
+    (tmp_path / "contracts.xml").write_text('<testsuite tests="50" failures="0" errors="0"/>')
+    rep = vr.parse_report(str(tmp_path))
+    assert rep is not None and rep.tests == 1350 and rep.failed == 0
+
+
+def test_aggregate_catches_failure_in_one_workspace(tmp_path):
+    # The core reason aggregation matters: a failure in ANY workspace must count.
+    (tmp_path / "api.xml").write_text('<testsuite tests="1000" failures="0" errors="0"/>')
+    (tmp_path / "web.xml").write_text('<testsuite tests="300" failures="2" errors="0"/>')
+    rep = vr.parse_report(str(tmp_path))
+    assert rep.tests == 1300 and rep.failed == 2 and rep.suites_failed == 1
+    passed, cls = vr.classify(0, rep, vr.DEFAULT_IGNORE_UNHANDLED)
+    assert passed is False and cls == "failed"
+
+
+def test_aggregate_glob(tmp_path):
+    (tmp_path / "a.xml").write_text('<testsuite tests="5" failures="0"/>')
+    (tmp_path / "b.xml").write_text('<testsuite tests="7" failures="0"/>')
+    rep = vr.parse_report(str(tmp_path / "*.xml"))
+    assert rep.tests == 12
+
+
+def test_empty_directory_is_none(tmp_path):
+    assert vr.parse_report(str(tmp_path)) is None
+
+
 def test_parse_empty_path_is_none():
     assert vr.parse_report("") is None
 
