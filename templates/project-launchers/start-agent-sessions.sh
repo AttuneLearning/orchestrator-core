@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start ONE tmux session ("__PROJECT_NAME__") with 7 WINDOWS — one per role — each cd'd
+# Start ONE tmux session ("__PROJECT_NAME__") with 8 WINDOWS — one per role — each cd'd
 # into the right worktree and showing a banner (identity + launch command). Attach
 # once and switch windows with Ctrl-b <n>. It does NOT start the CLI agents; you
 # launch them yourself in each window.
@@ -16,6 +16,7 @@
 #   4 fe-qa    frontend qa   (a4)  wt-frontend-qa    -> $WS/start-qa-worker.sh frontend
 #   5 sr-dev   senior   dev  (a5)  wt-senior-dev     -> $WS/start-senior-dev.sh (on escalation)
 #   6 sr-qa    senior   qa   (a6)  wt-senior-qa      -> $WS/start-senior-qa.sh (on escalation)
+#   7 be-dev-2 backend  dev  (a8)  wt-backend-dev-2  -> $WS/start-dev-worker.sh backend-2 (optional lane)
 set -u
 SESSION=__PROJECT_NAME__
 WS=__WORKSPACE_ROOT__
@@ -38,6 +39,11 @@ EOF
 ════ BACKEND DEV — agent 1 (Qwen Code) ════
 Worktree : wt-backend-dev   Coordinator: __PROJECT_NAME__ (serve --instance __PROJECT_NAME__)
 Launch   : $WS/start-dev-worker.sh backend  # add --issue <id> to pin a task
+EOF
+  cat > "$BAN/be-dev-2.txt" <<EOF
+════ BACKEND DEV — SECOND LANE — agent 8 (opencode) ════
+Worktree : wt-backend-dev-2   Coordinator: __PROJECT_NAME__ (serve --instance __PROJECT_NAME__)
+Launch   : $WS/start-dev-worker.sh backend-2  # optional parallel lane; steer to independent goals/files
 EOF
   cat > "$BAN/be-qa.txt" <<EOF
 ════ BACKEND QA — agent 2 (Codex) ════
@@ -94,9 +100,10 @@ start() {
   _win 4 fe-qa  "$WS/wt-frontend-qa"  fe-qa
   _win 5 sr-dev "$WS/wt-senior-dev"   sr-dev
   _win 6 sr-qa  "$WS/wt-senior-qa"    sr-qa
+  _win 7 be-dev-2 "$WS/wt-backend-dev-2" be-dev-2
   tmux select-window -t "$SESSION:0"
-  echo "session '$SESSION' created with 7 windows (0 orch, 1 be-dev, 2 be-qa, 3 fe-dev, 4 fe-qa, 5 sr-dev, 6 sr-qa)."
-  echo "Attach:  tmux attach -t $SESSION      Switch windows: Ctrl-b <0-6>   Detach: Ctrl-b d"
+  echo "session '$SESSION' created with 8 windows (0 orch, 1 be-dev, 2 be-qa, 3 fe-dev, 4 fe-qa, 5 sr-dev, 6 sr-qa, 7 be-dev-2)."
+  echo "Attach:  tmux attach -t $SESSION      Switch windows: Ctrl-b <0-7>   Detach: Ctrl-b d"
 }
 
 case "${1:-start}" in

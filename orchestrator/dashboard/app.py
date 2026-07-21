@@ -730,10 +730,25 @@ def create_app(pool: Optional[ConnectionPool] = None,
 
     def _worker_window(team: str, function: str) -> str:
         # Registered agents map to tmux windows by convention: be-dev, be-qa,
-        # fe-dev, fe-qa, sr-dev (matches start-agent-sessions.sh window names).
+        # fe-dev, fe-qa, sr-dev, sr-qa (matches start-agent-sessions.sh window names).
         prefix = {"backend": "be", "frontend": "fe", "senior": "sr"}.get(
             team, (team or "wt")[:2])
         return f"{prefix}-{function}"
+
+    def _worker_windows(agents: list[dict]) -> dict:
+        # Map each agent -> its tmux window. Agents that share (team, function) —
+        # e.g. the second backend-dev lane (roles.sh backend-dev-worker-2, its own
+        # wt-backend-dev-2 worktree) — get -2/-3 suffixes in id order, so each lane
+        # maps to its own window: be-dev, be-dev-2, … This mirrors the extra
+        # be-dev-2 window in start-agent-sessions.sh.
+        out: dict = {}
+        seen: dict = {}
+        for a in sorted(agents, key=lambda x: x.get("id") or 0):
+            base = _worker_window(a.get("team", ""), a.get("function", ""))
+            n = seen.get(base, 0)
+            seen[base] = n + 1
+            out[a["id"]] = base if n == 0 else f"{base}-{n + 1}"
+        return out
 
     def _capture_pane(session: str, window: str, lines: int) -> tuple[bool, str]:
         if not shutil.which("tmux"):
@@ -758,9 +773,11 @@ def create_app(pool: Optional[ConnectionPool] = None,
     def workers_panes(lines: int = 200):
         lines = max(20, min(int(lines), 2000))  # clamp to tmux scrollback
         session = _tmux_session()
+        agents = agents_with_staleness(pool)
+        win_for = _worker_windows(agents)
         out = {}
-        for a in agents_with_staleness(pool):
-            win = _worker_window(a.get("team", ""), a.get("function", ""))
+        for a in agents:
+            win = win_for[a["id"]]
             ok, text = _capture_pane(session, win, lines)
             out[str(a["id"])] = {"window": win, "ok": ok, "text": text,
                                  "status": a.get("status"), "stale": a.get("stale")}
