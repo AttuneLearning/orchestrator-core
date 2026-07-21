@@ -2205,6 +2205,38 @@ _LIFECYCLE_EVENT_COLS = ["id", "op_id", "contract_id", "method", "path", "action
                          "reason", "actor", "source_ref", "content_hash", "created_at"]
 
 
+def _activating_route_drift(pool: ConnectionPool, settings, changes, accept: bool):
+    """Canonical-route gate (step 8b) for preview/apply.
+
+    A contract moved INTO a satisfying state (agree/reinstate) must have a
+    backing route in the code scan; otherwise we'd agree an endpoint that does
+    not exist. Superseding/retiring/deprecating is never gated (pre-existing
+    drift on a contract you are retiring is exactly what you are resolving).
+
+    Opt-in: ``settings is None`` -> no-op (unchanged behaviour, hermetic tests).
+    Fail-safe: a missing/unreadable product tree yields no findings. Returns
+    ``(conflicts, warnings)``; when ``accept`` is True the findings are demoted
+    to warnings so an administrator can proceed deliberately.
+    """
+    if settings is None:
+        return [], []
+    from . import contract_lifecycle as lifecycle
+    from . import contract_drift
+    activating = [c["contract_id"] for c in changes
+                  if isinstance(c, dict) and isinstance(c.get("contract_id"), int)
+                  and lifecycle.ACTION_TO_STATUS.get(c.get("action")) in _SATISFIED]
+    if not activating:
+        return [], []
+    drift = contract_drift.drift_for_contracts(pool, settings, activating)
+    msgs = [f"route check: contract #{f['contract_id']} {f['method']} {f['path']} "
+            "has no backing route (unbacked)"
+            for f in drift["blocking"] + drift["advisory"]
+            if f.get("category") == "unbacked_contract"]
+    if not msgs:
+        return [], []
+    return ([], msgs) if accept else (msgs, [])
+
+
 def contract_lifecycle_preview(
     pool: ConnectionPool,
     project: str,
@@ -2215,10 +2247,16 @@ def contract_lifecycle_preview(
     changes: list[dict[str, Any]],
     expected: Optional[dict[str, str]] = None,
     expected_project: str = _CONFIGURED_PROJECT,
+    settings=None,
+    accept_route_drift: bool = False,
 ) -> dict[str, Any]:
     """Read-only. Loads the affected contracts, validates via
     contract_lifecycle.validate_batch, classifies destructive changes, and
-    reports concurrency tokens. NO writes, no transaction that mutates."""
+    reports concurrency tokens. NO writes, no transaction that mutates.
+
+    When ``settings`` is supplied, also runs the canonical-route gate (8b):
+    contracts being activated must have a backing route or the batch is invalid
+    (see _activating_route_drift). Opt-in + fail-safe."""
     from . import contract_lifecycle as lifecycle
 
     conflicts = []
@@ -2254,6 +2292,12 @@ def contract_lifecycle_preview(
     normalized, batch_conflicts, warnings = lifecycle.validate_batch(
         changes, contracts_by_id, project)
     conflicts.extend(batch_conflicts)
+
+    # Canonical-route gate (8b): opt-in, fail-safe.
+    route_conflicts, route_warnings = _activating_route_drift(
+        pool, settings, changes, accept_route_drift)
+    conflicts.extend(route_conflicts)
+    warnings = list(warnings) + route_warnings
 
     # Classify destructive changes.
     destructive = any(c["destructive"] for c in normalized)
@@ -2322,10 +2366,21 @@ def contract_lifecycle_apply(
     source: str = "",
     confirm_project: Optional[str] = None,
     expected_project: str = _CONFIGURED_PROJECT,
+    settings=None,
+    accept_route_drift: bool = False,
 ) -> dict[str, Any]:
     """Atomic, idempotent admin apply of a lifecycle batch. ONE
-    with pool.connection() as conn, conn.transaction(): block."""
+    with pool.connection() as conn, conn.transaction(): block.
+
+    When ``settings`` is supplied, the canonical-route gate (8b) runs first
+    (outside the transaction, so no filesystem I/O is done under the row locks):
+    activating a contract whose route has no backing implementation is rejected
+    as a conflict unless ``accept_route_drift`` is set. Opt-in + fail-safe."""
     from . import contract_lifecycle as lifecycle
+
+    # Canonical-route gate (8b) — computed before the transaction (fail-safe).
+    route_conflicts, route_warnings = _activating_route_drift(
+        pool, settings, changes, accept_route_drift)
 
     with pool.connection() as conn, conn.transaction():
         # 1. Idempotency replay (first, before any lock/validation).
@@ -2379,9 +2434,11 @@ def contract_lifecycle_apply(
             response["audit_op_id"] = op_id
             return response
 
-        # 4. Validate under lock.
+        # 4. Validate under lock (plus the 8b canonical-route gate).
         normalized, conflicts, warnings = lifecycle.validate_batch(
             changes, contracts_by_id, project)
+        conflicts = list(conflicts) + route_conflicts
+        warnings = list(warnings) + route_warnings
         if conflicts:
             response = {
                 "result": "conflict",

@@ -40,7 +40,7 @@ def build_server() -> FastMCP:
     tools_memory.register(mcp, pool)
     tools_skills.register(mcp, pool)
     tools_status.register(mcp, pool, settings)
-    tools_contracts.register(mcp, pool, actor_role=server_role)
+    tools_contracts.register(mcp, pool, actor_role=server_role, settings=settings)
     tools_docs.register(mcp, pool)
     # Zero-touch grounding: build the orch-monitor KB on first connect if empty.
     try:

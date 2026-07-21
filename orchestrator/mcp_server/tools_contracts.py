@@ -40,7 +40,8 @@ def _require_admin(actor_role: str) -> None:
         )
 
 
-def register(mcp: FastMCP, pool: ConnectionPool, actor_role: str = "") -> None:
+def register(mcp: FastMCP, pool: ConnectionPool, actor_role: str = "",
+             settings=None) -> None:
 
     @mcp.tool()
     def contracts_for_issue(issue_id: int) -> dict[str, Any]:
@@ -113,14 +114,18 @@ def register(mcp: FastMCP, pool: ConnectionPool, actor_role: str = "") -> None:
         project: str, operation_id: str, reason: str,
         changes: list[dict[str, Any]],
         expected: Optional[dict[str, str]] = None,
+        accept_route_drift: bool = False,
     ) -> dict[str, Any]:
         """ADMIN ONLY. Dry-run a contract lifecycle batch: validation conflicts,
-        advisory warnings, affected contracts, whether confirmation is required."""
+        advisory warnings, affected contracts, whether confirmation is required.
+        Also runs the canonical-route gate (activating an unbacked route is a
+        conflict unless accept_route_drift=True)."""
         _require_admin(actor_role)
         return repo.contract_lifecycle_preview(
             pool, project, operation_id,
             actor=os.environ.get("ORCH_ACTOR", "orch-manager"),
-            actor_role=actor_role, reason=reason, changes=changes, expected=expected)
+            actor_role=actor_role, reason=reason, changes=changes, expected=expected,
+            settings=settings, accept_route_drift=accept_route_drift)
 
     @mcp.tool()
     def contract_lifecycle_apply(
@@ -129,17 +134,20 @@ def register(mcp: FastMCP, pool: ConnectionPool, actor_role: str = "") -> None:
         expected: Optional[dict[str, str]] = None,
         preview_token: Optional[str] = None,
         confirm_project: Optional[str] = None,
+        accept_route_drift: bool = False,
     ) -> dict[str, Any]:
         """ADMIN ONLY. Atomically apply a lifecycle batch (idempotent by
         operation_id). Destructive batches (supersede/retire, or deprecate of an
         agreed/live contract) require confirm_project == the configured project name,
-        else result='rejected' reason='confirmation_required'."""
+        else result='rejected' reason='confirmation_required'. Activating an
+        unbacked route is a conflict unless accept_route_drift=True."""
         _require_admin(actor_role)
         return repo.contract_lifecycle_apply(
             pool, project, operation_id,
             actor=os.environ.get("ORCH_ACTOR", "orch-manager"),
             actor_role=actor_role, reason=reason, changes=changes, expected=expected,
-            source="mcp", confirm_project=confirm_project)
+            source="mcp", confirm_project=confirm_project,
+            settings=settings, accept_route_drift=accept_route_drift)
 
     @mcp.tool()
     def contract_lifecycle_history(

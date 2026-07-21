@@ -1346,7 +1346,8 @@ def create_app(pool: Optional[ConnectionPool] = None,
         result = repo.contract_lifecycle_preview(pool, project, operation_id,
                                                   actor="dashboard-admin",
                                                   actor_role="orch-manager",
-                                                  reason=reason, changes=parsed)
+                                                  reason=reason, changes=parsed,
+                                                  settings=settings)
         return HTMLResponse(templates.contract_lifecycle_preview(result))
 
     @app.post("/contracts/lifecycle/apply", response_class=HTMLResponse)
@@ -1366,7 +1367,8 @@ def create_app(pool: Optional[ConnectionPool] = None,
                                                 actor_role="orch-manager",
                                                 reason=reason, changes=parsed,
                                                 source="dashboard",
-                                                confirm_project=confirm_project or None)
+                                                confirm_project=confirm_project or None,
+                                                settings=settings)
         # Only redirect on successful apply; otherwise show the result inline
         if result.get("result") == "applied":
             return RedirectResponse("/contracts", status_code=303)

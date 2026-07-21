@@ -493,3 +493,29 @@ def run_drift_check(pool: ConnectionPool, settings: Settings) -> dict:
         "audit_path": audit_path,
         "fe_root": fe_root,
     }
+
+
+def drift_for_contracts(
+    pool: ConnectionPool,
+    settings: Settings,
+    contract_ids,
+) -> dict:
+    """Fail-safe, scoped drift lookup for the apply-time canonical-route gate.
+
+    Runs the full drift check and returns only the findings whose ``contract_id``
+    is in ``contract_ids``, split into blocking/advisory. NEVER raises: if the
+    product repo / audit is unavailable (e.g. a hermetic test env with no
+    checkout), returns empty findings with ``ok=False`` so callers no-op and
+    behaviour is unchanged. This keeps the lifecycle apply hermetic and robust —
+    a missing or unreadable product tree can never block a legitimate change.
+    """
+    ids = set(contract_ids)
+    try:
+        result = run_drift_check(pool, settings)
+    except Exception:  # noqa: BLE001 - route check must never break apply
+        return {"blocking": [], "advisory": [], "ok": False}
+    blocking, advisory = [], []
+    for f in result.get("findings", []):
+        if f.get("contract_id") in ids:
+            (blocking if f.get("severity") == "blocking" else advisory).append(f)
+    return {"blocking": blocking, "advisory": advisory, "ok": True}
