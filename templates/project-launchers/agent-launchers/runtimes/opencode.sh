@@ -60,10 +60,13 @@ fi
 
 # Loop by default, INCLUDING interactive: run-agent-loop keeps the agent cycling
 # (re-launches the command each cycle) instead of stopping after one session.
-# LOOP_AGENT=1 keeps non-interactive roles looping too.
+# The loop's on/off + cadence are owned by the dashboard (loop_enabled +
+# poll_interval_seconds). LOOP_AGENT=1 routes non-interactive roles through it too;
+# interactive (TUI) always routes so the human's session relaunches per policy.
 if [ -n "${AGENT_ID:-}" ] && { [ "$LAUNCH_MODE" = "interactive" ] || [ "${LOOP_AGENT:-0}" = "1" ]; }; then
   export ORCH_DASHBOARD="$DASHBOARD"
-  export AGENT_POLL="${AGENT_POLL:-${AGENT_POLL_DEFAULT:-90}}"
+  export AGENT_POLL="${AGENT_POLL:-${AGENT_POLL_DEFAULT:-90}}"   # fallback cadence only
+  [ "$LAUNCH_MODE" = "interactive" ] && export AGENT_LOOP_INTERACTIVE=1
   if [ "${IDLE_STOP:-0}" -gt 0 ]; then
     export AGENT_IDLE_STOP="$IDLE_STOP"
   fi

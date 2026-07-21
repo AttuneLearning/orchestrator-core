@@ -10,7 +10,14 @@ Usage:
     gather-models.py                 # all providers with a resolvable key
     gather-models.py orch_model      # one provider id
     gather-models.py opencode        # all providers for a harness
+    gather-models.py codex           # refresh codex from the openai provider
     gather-models.py --dry-run ...   # show what would change, do not write
+
+A provider with `source: codex_cache` reads codex's own OAuth-refreshed model
+cache (~/.codex/models_cache.json) instead of a keyed /v1/models fetch — codex
+authenticates via ChatGPT OAuth and has no platform API key. A provider with
+`bare_model: true` (the codex case) stores the plain model id for `-m`;
+everything else stores the provider-routed `<pid>/<model>` id opencode needs.
 """
 
 from __future__ import annotations
@@ -22,9 +29,14 @@ import sys
 import urllib.request
 
 # Non-text model ids to drop (embeddings, rerank, tts, image, routers, ...).
+# The second line covers OpenAI-catalog non-chat families (dall-e, moderation,
+# legacy completion, audio/realtime/transcribe, search-preview, computer-use,
+# sora) so the codex menu gathered from api.openai.com stays chat-only.
 _SKIP = re.compile(
     r"(embed|rerank|tts|voicedesign|whisper|image|stable-diffusion|wan2|"
-    r"mini-lm|mpnet|^bge|^e5-|^gte-|^all-|^router:|reranker)",
+    r"mini-lm|mpnet|^bge|^e5-|^gte-|^all-|^router:|reranker|"
+    r"dall-e|moderation|davinci|babbage|realtime|audio|transcribe|"
+    r"search-preview|computer-use|sora)",
     re.IGNORECASE,
 )
 _VENDOR_PREFIX = re.compile(r"^(openai-|anthropic-|alibaba-|nvidia-|meta-)")
@@ -48,6 +60,29 @@ def _fetch_models(base_url: str, api_key: str) -> list[str]:
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.load(resp)
     return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+
+
+def _read_codex_cache(path: str) -> list[tuple[str, str]]:
+    """Return (slug, note) for user-listable models from a codex models_cache.json.
+
+    codex authenticates via ChatGPT OAuth and refreshes this cache itself, so it
+    is the key-free source of the codex model menu. Only entries with
+    visibility 'list' are surfaced (hidden/deprecated/internal ones are skipped);
+    order is preserved so the first listed model can seed a sensible default.
+    """
+    with open(os.path.expanduser(path), encoding="utf-8") as fh:
+        data = json.load(fh)
+    out: list[tuple[str, str]] = []
+    for m in data.get("models", []):
+        if not isinstance(m, dict):
+            continue
+        slug = m.get("slug") or m.get("id")
+        if not slug or m.get("visibility") not in (None, "list"):
+            continue
+        name = m.get("display_name") or slug
+        desc = (m.get("description") or "").strip()
+        out.append((slug, f"{name} — {desc}" if desc else name))
+    return out
 
 
 def _shorten(model_id: str, taken: set[str]) -> str:
@@ -82,42 +117,67 @@ def main(argv: list[str]) -> int:
     changed = False
     for pid, pdef in selected.items():
         harness = pdef.get("harness")
-        base_url = pdef.get("base_url")
-        key_env = pdef.get("api_key_env", "")
-        key = os.environ.get(key_env, "")
-        if not base_url or not harness:
-            print(f"skip {pid}: missing base_url/harness", file=sys.stderr)
+        if not harness:
+            print(f"skip {pid}: missing harness", file=sys.stderr)
             continue
-        if not key:
-            print(f"skip {pid}: {key_env} not set in environment", file=sys.stderr)
-            continue
+        source = str(pdef.get("source") or "http")
+
+        # Collect (model_id, note) pairs from the provider's source, keeping the
+        # order the source lists them (used to seed a sensible default).
         try:
-            ids = _fetch_models(base_url, key)
+            if source == "codex_cache":
+                # codex is OAuth-authenticated — read its own cache, no key/URL.
+                entries = _read_codex_cache(
+                    pdef.get("cache_file") or "~/.codex/models_cache.json")
+            else:
+                base_url = pdef.get("base_url")
+                key_env = pdef.get("api_key_env", "")
+                key = os.environ.get(key_env, "")
+                if not base_url:
+                    print(f"skip {pid}: missing base_url", file=sys.stderr)
+                    continue
+                if not key:
+                    print(f"skip {pid}: {key_env} not set in environment", file=sys.stderr)
+                    continue
+                ids = sorted(i for i in _fetch_models(base_url, key) if not _SKIP.search(i))
+                entries = [(mid, f"{mid} via {pid}") for mid in ids]
         except Exception as exc:  # noqa: BLE001
-            print(f"skip {pid}: fetch failed ({exc})", file=sys.stderr)
+            print(f"skip {pid}: gather failed ({exc})", file=sys.stderr)
             continue
 
-        text_ids = sorted(i for i in ids if not _SKIP.search(i))
+        if not entries:
+            print(f"skip {pid}: no models returned", file=sys.stderr)
+            continue
+
+        # Native-auth harnesses (codex) consume a bare model id via -m; the
+        # opencode adapter wants the provider-routed `<pid>/<mid>` form.
+        bare = bool(pdef.get("bare_model"))
         hz = harnesses.setdefault(harness, {"provider": "opensource", "models": {}})
         models = hz.setdefault("models", {})
 
-        # Drop existing entries that belong to this provider, keep others.
+        # Drop the entries this provider owns, keep everything else. Ownership is
+        # the `provider:` marker (written below) OR, for legacy prefixed entries,
+        # a `<pid>/` model prefix. Bare entries carry no prefix, so the marker is
+        # what lets a re-run replace them cleanly.
         prefix = f"{pid}/"
         models = {k: v for k, v in models.items()
-                  if not str((v or {}).get("model", "")).startswith(prefix)}
+                  if (v or {}).get("provider") != pid
+                  and not str((v or {}).get("model", "")).startswith(prefix)}
 
         taken = set(models.keys())
         added = []
-        for mid in text_ids:
+        for mid, note in entries:
             short = _shorten(mid, taken)
             taken.add(short)
-            models[short] = {"model": f"{pid}/{mid}", "note": f"{mid} via {pid}"}
+            model_str = mid if bare else f"{pid}/{mid}"
+            models[short] = {"model": model_str, "note": note, "provider": pid}
             added.append(short)
 
         hz["models"] = dict(sorted(models.items()))
-        # keep a valid default
+        # Keep the current default if it survived; else prefer this provider's
+        # first source-listed model over an arbitrary alphabetical pick.
         if hz.get("default") not in hz["models"]:
-            hz["default"] = next(iter(hz["models"]), "")
+            hz["default"] = added[0] if added else next(iter(hz["models"]), "")
         changed = True
         print(f"{pid} ({harness}): {len(added)} models -> {', '.join(added)}")
 
@@ -131,15 +191,19 @@ def main(argv: list[str]) -> int:
 
     header = (
         "# agent-model.yaml — valid (harness x model) combinations.\n"
-        "# The `opencode` model lists are auto-generated by gather-models.py from\n"
-        "# live provider /v1/models; edit `providers:` or re-run gather to refresh.\n"
-        "# claude/codex use native auth and are hand-maintained.\n"
+        "# The `opencode` and `codex` model lists are auto-generated by\n"
+        "# gather-models.py from each provider's source (opencode: live provider\n"
+        "# /v1/models; codex: its OAuth-refreshed ~/.codex model cache). Edit\n"
+        "# `providers:` or re-run gather to refresh. codex stores bare model ids\n"
+        "# (native auth at runtime); opencode stores `<pid>/<model>` ids.\n"
+        "# claude uses native auth and is hand-maintained.\n"
         "# List all combos:  agent-launchers/resolve-model.py --list\n"
         "# -m goes BEFORE the runtime:  ./start-dev-worker.sh backend -m deepseek opencode\n\n"
     )
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(header)
-        yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False, width=100)
+        yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False,
+                       width=100, allow_unicode=True)
     print(f"\nwrote {path}")
     return 0
 

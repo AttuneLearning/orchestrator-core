@@ -76,16 +76,27 @@ If MCP tools are missing, restart through `./start-orch-manager.sh <runtime>`.
 If the MCP server points at another project, restart with the launcher or fix the
 runtime MCP config before taking coordinator actions.
 
-## First Tick Checklist
+## Management Loop — run EVERY tick (not just at startup)
 
-At the start of each management tick:
+Each tick, in this order. Do not skip a step because the last tick looked quiet.
 
-1. Check coordinator status.
-2. Check pending messages.
-3. Check active goals and blocked or stale issues.
-4. Check agent health, loops, and recent heartbeats.
-5. Decide whether to create/update goals, issues, ADRs, contracts, messages, or
-   dashboard state.
+1. **Alerts** — `get_alerts`; note flagged / off_rails / paused / stale.
+2. **Inbound comms (MANDATORY, every tick) — triage to zero:**
+   - `comms_check` — pending inbound *requests* (orchestration + orch-monitor).
+   - `comms_read` — inbound *responses* to questions we raised.
+   - For EACH message, before acting, re-check the referenced issue/goal with
+     `get_issue`/`list_issues` — blockers frequently self-resolve. Then drive it
+     to a terminal disposition:
+       - actionable → file/route an issue, reply, or apply a directive
+       - answered → consume it
+       - stale / overtaken-by-events (goal closed, dep landed, duplicate) → note why
+     …and call `mark_read(message_id)` so it drops off the queue.
+   - Definition of done for the tick: **no pending request left un-triaged.** A
+     non-empty `comms_check` at end of tick is an incomplete tick.
+3. **Progress** — `tail_events` (from last cursor) + goal/issue states.
+4. **Agent health** — loops, heartbeats, stale-but-working vs wedged.
+5. **Decide/act** — create/update goals, issues, ADRs, contracts, gate
+   decisions, or messages.
 
 Keep decisions visible through orchestrator records: ADRs, issue comments,
 messages, gate decisions, or dashboard state.

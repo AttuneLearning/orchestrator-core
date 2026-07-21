@@ -60,13 +60,14 @@ resolve_role() {
       WORKTREE="$WORKSPACE_ROOT/wt-backend-dev"
       PROMPT_NAME="dev-worker"
       DEFAULT_RUNTIME="opencode"
-      LOOP_AGENT=0
+      # Route through run-agent-loop.sh; the dashboard (loop_enabled +
+      # poll_interval_seconds) decides loop-vs-one-shot and cadence at runtime.
+      LOOP_AGENT=1
       ;;
     backend-dev-worker-2|backend-dev-2|be-dev-2)
-      # OPTIONAL second backend dev lane for parallelism. Requires a registered
-      # agent (id 8) + its own worktree (wt-backend-dev-2) so it does NOT collide
-      # with agent 1. Launch: ./start-dev-worker.sh backend-2 <runtime>. Steer it to
-      # work independent of agent 1 (different goal/files) to avoid promote conflicts.
+      # Second backend dev lane (agent 8) for parallelism — own agent_id + own
+      # worktree so it does NOT collide with agent 1 (wt-backend-dev). Steer it to
+      # work independent of agent 1 (e.g. different goal/files) to avoid promote conflicts.
       ROLE="backend-dev-worker-2"
       AGENT_ID=8
       TEAM="backend"
@@ -76,7 +77,9 @@ resolve_role() {
       WORKTREE="$WORKSPACE_ROOT/wt-backend-dev-2"
       PROMPT_NAME="dev-worker"
       DEFAULT_RUNTIME="opencode"
-      LOOP_AGENT=0
+      # Route through run-agent-loop.sh; the dashboard (loop_enabled +
+      # poll_interval_seconds) decides loop-vs-one-shot and cadence at runtime.
+      LOOP_AGENT=1
       ;;
     frontend-dev-worker|frontend-dev|fe-dev)
       ROLE="frontend-dev-worker"
@@ -88,7 +91,9 @@ resolve_role() {
       WORKTREE="$WORKSPACE_ROOT/wt-frontend-dev"
       PROMPT_NAME="dev-worker"
       DEFAULT_RUNTIME="opencode"
-      LOOP_AGENT=0
+      # Route through run-agent-loop.sh; the dashboard (loop_enabled +
+      # poll_interval_seconds) decides loop-vs-one-shot and cadence at runtime.
+      LOOP_AGENT=1
       ;;
     backend-qa-worker|backend-qa|be-qa)
       ROLE="backend-qa-worker"
@@ -144,7 +149,7 @@ resolve_role() {
       ;;
     *)
       echo "unknown role: $ROLE_INPUT" >&2
-      echo "known roles: orch-manager, backend-dev-manager, frontend-dev-manager, backend-dev-worker, frontend-dev-worker, backend-qa-worker, frontend-qa-worker, senior-dev, senior-qa" >&2
+      echo "known roles: orch-manager, backend-dev-manager, frontend-dev-manager, backend-dev-worker, backend-dev-worker-2, frontend-dev-worker, backend-qa-worker, frontend-qa-worker, senior-dev, senior-qa" >&2
       return 1
       ;;
   esac
