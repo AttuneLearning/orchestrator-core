@@ -213,7 +213,8 @@ if orch and project:
             "type": "local",
             "command": [f"{orch}/.venv/bin/python", "-m", "orchestrator.cli",
                         "--instance", project, "serve"],
-            "environment": {"PYTHONPATH": orch, "ORCH_INSTANCE": project},
+            "environment": {"PYTHONPATH": orch, "ORCH_INSTANCE": project,
+                             "ORCH_ROLE": os.environ.get("ROLE", "")},
             "enabled": True,
         }
     }
@@ -237,7 +238,8 @@ orch = os.environ["MJ_ORCH"]; project = os.environ["MJ_PROJECT"]
 cfg = {"mcpServers": {"orchestrator": {
     "command": f"{orch}/.venv/bin/python",
     "args": ["-m", "orchestrator.cli", "--instance", project, "serve"],
-    "env": {"PYTHONPATH": orch, "ORCH_INSTANCE": project},
+    "env": {"PYTHONPATH": orch, "ORCH_INSTANCE": project,
+            "ORCH_ROLE": os.environ.get("ROLE", "")},
 }}}
 with open(os.environ["MJ_OUT"], "w", encoding="utf-8") as fh:
     json.dump(cfg, fh, indent=2)

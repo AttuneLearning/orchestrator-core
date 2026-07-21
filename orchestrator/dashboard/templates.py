@@ -728,7 +728,8 @@ def orch_monitor(messages: list[dict[str, Any]],
 
 _CONTRACT_BADGE = {"up-to-date": "accepted", "awaiting acceptance": "proposed",
                    "drifted": "drifted", "removal pending": "drifted",
-                   "missing": "proposed", "deprecated": "accepted"}
+                   "missing": "proposed", "deprecated": "accepted",
+                   "superseded": "drifted", "retired": "drifted", "rejected": "drifted"}
 
 
 def _contract_fields(d: Optional[dict[str, Any]], status_key: str) -> str:
@@ -749,6 +750,7 @@ def _contract_fields(d: Optional[dict[str, Any]], status_key: str) -> str:
             + kv("request_ref", d.get("request_ref")) + kv("response_dto", d.get("response_dto"))
             + kv("auth", d.get("auth")) + kv("owner_team", d.get("owner_team"))
             + kv("version", d.get("version")) + kv("status", d.get(status_key))
+            + kv("superseded_by", d.get("superseded_by_contract_id"))
             + kv("source_ref", d.get("source_ref"))
             + kv_link("type_ref", d.get("type_ref"))
             + kv("content_hash", (d.get("content_hash") or "")[:16] or None))
@@ -792,7 +794,7 @@ def _contract_card(row: dict[str, Any]) -> str:
     )
 
 
-def contracts(overview: list[dict[str, Any]]) -> str:
+def contracts(overview: list[dict[str, Any]], bulk_result: Optional[dict[str, Any]] = None) -> str:
     """Contract master-data page: per-endpoint current|proposed diff + accept
     actions, with a batch 'create work' side panel and a state summary."""
     from collections import Counter
@@ -824,11 +826,159 @@ def contracts(overview: list[dict[str, Any]]) -> str:
     main = f"<h1>Contracts</h1>{controls}{cards}{ut}"
     summary = "".join(f"<div class='msg'>{escape(s)}: <b>{n}</b></div>"
                       for s, n in sorted(counts.items())) or "<p class='muted'>No contracts.</p>"
+    result_html = ""
+    if bulk_result:
+        if bulk_result.get("error"):
+            result_html = (f"<div class='msg' style='border-color:var(--bad);color:var(--bad)'>"
+                           f"{escape(str(bulk_result['error']))}</div>")
+        elif bulk_result.get("message"):
+            result_html = f"<div class='msg'>{escape(str(bulk_result['message']))}</div>"
     side = ("<aside class='side'><h2>Changes</h2>"
             "<form method='post' action='/contracts/create_work'>"
             "<button class='ok'>Create goals &amp; issues from changes</button></form>"
+            "<h2>Administrator contract audit</h2>"
+            "<p class='muted'>Current source of truth: <code>packages/contracts/contracts.audit.json</code>. "
+            "Type the repository name to enable either explicit action.</p>"
+            "<form method='post' action='/contracts/import-last-updated'>"
+            "<input id='contract-repo-confirmation' name='repository_confirmation' "
+            "required autocomplete='off' placeholder='cadencelms-working' "
+            "aria-describedby='contract-repo-help' "
+            "style='width:100%;margin:4px 0 8px' "
+            "oninput=\"var ok=this.value==='cadencelms-working';"
+            "this.form.querySelectorAll('button').forEach(function(b){b.disabled=!ok});"
+            "document.getElementById('contract-repo-help').textContent=ok?'Ready to run.':'Type cadencelms-working exactly.'\">"
+            "<span id='contract-repo-help' class='muted'>Type cadencelms-working exactly.</span><br>"
+            "<button class='ok' type='submit' disabled>Import the last updated file</button>"
+            "<button class='alt' type='submit' formaction='/contracts/refresh-and-approve' "
+            "style='margin-top:6px' disabled>Refresh the current contracts file, then approve the import</button></form>"
+            f"{result_html}"
             f"<div style='margin-top:10px'>{summary}</div></aside>")
     return page("Contracts", f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
+
+
+def contract_lifecycle_preview(result: dict[str, Any]) -> str:
+    """Render a lifecycle preview: validity, conflicts, warnings, affected contracts,
+    and confirmation input if destructive."""
+    valid = result.get("valid", False)
+    conflicts = result.get("conflicts", [])
+    warnings = result.get("warnings", [])
+    affected = result.get("affected", [])
+    destructive = result.get("destructive", False)
+    confirmation_required = result.get("confirmation_required", False)
+
+    # Status banner
+    if not valid:
+        status = "<div class='banner'>Preview failed — conflicts detected.</div>"
+    else:
+        status = "<div style='background:rgba(63,185,80,.12);border:1px solid var(--ok);color:var(--ok);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-weight:600'>Preview valid — ready to apply.</div>"
+
+    # Conflicts (blocking)
+    conflicts_html = ""
+    if conflicts:
+        rows = "".join(
+            f"<div class='muted' style='padding:4px 0;border-bottom:1px solid var(--line)'>"
+            f"{escape(c)}</div>"
+            for c in conflicts
+        )
+        conflicts_html = (
+            f"<h2>Conflicts (blocking)</h2>"
+            f"<div style='background:rgba(248,81,73,.1);padding:8px 10px;border-radius:6px'>{rows}</div>"
+        )
+
+    # Warnings (advisory)
+    warnings_html = ""
+    if warnings:
+        rows = "".join(
+            f"<div class='muted' style='padding:4px 0;border-bottom:1px solid var(--line)'>"
+            f"{escape(w)}</div>"
+            for w in warnings
+        )
+        warnings_html = (
+            f"<h2>Warnings (advisory)</h2>"
+            f"<div style='background:rgba(210,153,34,.1);padding:8px 10px;border-radius:6px'>{rows}</div>"
+        )
+
+    # Affected contracts table
+    affected_html = ""
+    if affected:
+        rows = "".join(
+            f"<tr><td>{escape(a['method'])} {escape(a['path'])}</td>"
+            f"<td>{escape(a['from_status'])} → {escape(a['to_status'])}</td>"
+            f"<td>{escape(a['action'])}</td>"
+            f"<td>{'yes' if a.get('destructive') else 'no'}</td></tr>"
+            for a in affected
+        )
+        affected_html = (
+            f"<h2>Affected contracts ({len(affected)})</h2>"
+            "<table style='width:100%'><tr><th>Endpoint</th><th>Status change</th>"
+            f"<th>Action</th><th>Destructive</th></tr>{rows}</table>"
+        )
+
+    # Confirmation input (if destructive)
+    confirm_html = ""
+    if confirmation_required:
+        changes_json = escape(json.dumps(result.get("normalized_changes", []), default=str))
+        confirm_html = (
+            f"<h2>Confirm destructive batch</h2>"
+            f"<p class='muted'>This batch includes destructive changes (supersede, retire, or deprecate "
+            f"of an active contract). Type the project name to enable the Apply button.</p>"
+            f"<form method='post' action='/contracts/lifecycle/apply'>"
+            f"<input type='hidden' name='changes' value='{changes_json}'>"
+            f"<input type='hidden' name='operation_id' value='{escape(result.get('operation_id', ''))}'>"
+            f"<input type='hidden' name='reason' value='{escape(result.get('reason', ''))}'>"
+            f"<input type='hidden' name='project' value='{escape(result.get('project', ''))}'>"
+            f"<input name='confirm_project' required autocomplete='off' placeholder='cadencelms-working' "
+            f"style='width:100%;margin:4px 0 8px;padding:6px;background:var(--panel);color:var(--ink);"
+            f"border:1px solid var(--line);border-radius:5px' "
+            f"oninput=\"var ok=this.value==='cadencelms-working';"
+            f"this.form.querySelectorAll('button').forEach(function(b){{b.disabled=!ok}});\">"
+            f"<br><button class='ok' type='submit' disabled>Apply batch</button> "
+            f"<a href='/contracts'>Cancel</a></form>"
+        )
+
+    body = (
+        f"<h1>Contract Lifecycle Preview</h1>"
+        f"{status}"
+        f"{conflicts_html}"
+        f"{warnings_html}"
+        f"{affected_html}"
+        f"{confirm_html}"
+        f"<p><a href='/contracts'>Back to contracts</a></p>"
+    )
+    return page("Contract Lifecycle Preview", body)
+
+
+def contract_lifecycle_history(events: list[dict[str, Any]]) -> str:
+    """Render append-only lifecycle history as a read-only table."""
+    if not events:
+        body = (
+            f"<h1>Contract Lifecycle History</h1>"
+            f"<p class='muted'>No lifecycle events recorded.</p>"
+            f"<p><a href='/contracts'>Back to contracts</a></p>"
+        )
+        return page("Contract Lifecycle History", body)
+
+    rows = "".join(
+        f"<tr><td>{escape(str(e.get('created_at', ''))[:19].replace('T', ' '))}</td>"
+        f"<td>#{e.get('contract_id', '')}</td>"
+        f"<td>{escape(e.get('method', '') or '')} {escape(e.get('path', '') or '')}</td>"
+        f"<td>{escape(e.get('action', ''))}</td>"
+        f"<td>{escape(e.get('from_status', '') or '—')} → {escape(e.get('to_status', ''))}</td>"
+        f"<td>{escape(e.get('actor', ''))}</td>"
+        f"<td>{escape(e.get('reason', '') or '—')}</td>"
+        f"<td>#{e.get('op_id', '')}</td></tr>"
+        for e in events
+    )
+
+    body = (
+        f"<h1>Contract Lifecycle History</h1>"
+        f"<div style='overflow-x:auto'>"
+        f"<table style='width:100%'><tr><th>When</th><th>Contract</th><th>Endpoint</th>"
+        f"<th>Action</th><th>Status change</th><th>Actor</th><th>Reason</th><th>Op</th></tr>"
+        f"{rows}</table></div>"
+        f"<p><a href='/contracts'>Back to contracts</a></p>"
+    )
+    return page("Contract Lifecycle History", body)
 
 
 def _counts_cards(label: str, counts: dict[str, int]) -> str:

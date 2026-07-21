@@ -1,5 +1,6 @@
 """Issue MCP tools — list / get / claim / update_state / gate_decision /
-create_subissue / append_log. Thin wrappers over repository.py."""
+create_issue / create_goal_child / create_subissue / append_log. Thin wrappers
+over repository.py."""
 
 from __future__ import annotations
 
@@ -58,6 +59,19 @@ def _out_of_lane(team: str, files: list[str]) -> list[str]:
 
 def _valid_issue_branch(issue_id: int, branch: str) -> bool:
     return branch == f"issue-{issue_id}"
+
+
+def _require_orch_manager(actor_role: str) -> None:
+    """Authorize coordinator-only issue creation tools.
+
+    ``actor_role`` is captured when the per-session MCP server is built from
+    the launcher's environment.  It is deliberately not exposed as a tool
+    parameter, so a worker cannot elevate itself by sending a different value.
+    """
+    if (actor_role or "").strip().lower() != "orch-manager":
+        raise PermissionError(
+            "only the orch-manager session may create top-level or goal-child issues"
+        )
 
 
 # G4: an issue is "ready" (claimable at the implementation gate) only if its spec
@@ -471,11 +485,65 @@ def _verify_run_enabled(
             "duration_s": duration, "tail": tail}
 
 
-def register(mcp: FastMCP, pool: ConnectionPool, settings=None) -> None:
+def register(mcp: FastMCP, pool: ConnectionPool, settings=None,
+             actor_role: str = "") -> None:
     # Accept the caller's (instance-resolved) settings so the G1 commit check runs
     # against the RIGHT repo; fall back to load_settings() for standalone use.
     settings = settings if settings is not None else load_settings()
     pipelines = load_pipelines(settings.pipelines)
+
+    @mcp.tool()
+    def create_issue(goal_id: int, title: str, description: str = "",
+                     team: str = "backend", pipeline: Optional[str] = None) -> dict[str, Any]:
+        """Create a top-level issue in a goal (parent_id is NULL).
+
+        Every issue belongs to a goal.  This is the coordinator's explicit
+        root-issue API; workers must use the normal pull/decomposition flow.
+        """
+        _require_orch_manager(actor_role)
+        goal = repo.get_goal(pool, goal_id)
+        if goal is None:
+            raise ValueError(f"no goal {goal_id}")
+        effective_pipeline = pipeline or goal.pipeline
+        # Existing goals may intentionally use a project-defined pipeline that
+        # is not in the global worker-pipeline file (for example a coordination
+        # planning lane). Preserve that goal's pipeline; validate only an
+        # explicitly supplied override.
+        if pipeline is not None and effective_pipeline not in pipelines:
+            raise ValueError(
+                f"unknown pipeline {effective_pipeline!r}; available: "
+                f"{', '.join(sorted(pipelines))}"
+            )
+        issue = repo.create_issue(
+            pool, goal_id=goal.id, title=title, description=description,
+            team=team, pipeline=effective_pipeline, parent_id=None, depth=0,
+        )
+        return asdict(issue)
+
+    @mcp.tool()
+    def create_goal_child(goal_id: int, title: str, description: str = "",
+                          team: str = "backend", pipeline: Optional[str] = None) -> dict[str, Any]:
+        """Create an issue directly under a goal (no issue parent).
+
+        This is an explicit name for the same root-level relationship represented
+        by ``create_issue``.  It exists to prevent callers from confusing a goal
+        id with an issue id, which is unsafe because both use integer identifiers.
+        """
+        _require_orch_manager(actor_role)
+        goal = repo.get_goal(pool, goal_id)
+        if goal is None:
+            raise ValueError(f"no goal {goal_id}")
+        effective_pipeline = pipeline or goal.pipeline
+        if pipeline is not None and effective_pipeline not in pipelines:
+            raise ValueError(
+                f"unknown pipeline {effective_pipeline!r}; available: "
+                f"{', '.join(sorted(pipelines))}"
+            )
+        issue = repo.create_issue(
+            pool, goal_id=goal.id, title=title, description=description,
+            team=team, pipeline=effective_pipeline, parent_id=None, depth=0,
+        )
+        return asdict(issue)
 
     @mcp.tool()
     def list_issues(goal_id: Optional[int] = None,

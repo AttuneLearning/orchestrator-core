@@ -30,6 +30,7 @@ qwen mcp add orchestrator "$ORCH/.venv/bin/python" \
   -t stdio \
   -e "PYTHONPATH=$ORCH" \
   -e "ORCH_INSTANCE=$PROJECT" \
+  -e "ORCH_ROLE=$ROLE" \
   --trust \
   -- -m orchestrator.cli --instance "$PROJECT" serve >/dev/null
 qwen mcp approve orchestrator >/dev/null 2>&1 || true

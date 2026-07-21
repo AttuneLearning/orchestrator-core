@@ -11,7 +11,10 @@ issue_events row in the same transaction as the issues update.
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from psycopg.rows import class_row, dict_row
@@ -1504,9 +1507,25 @@ def list_responses(pool: ConnectionPool, to_team: Optional[str] = None,
 
 
 def mark_message_read(pool: ConnectionPool, message_id: int) -> None:
-    """Mark a message consumed so it drops out of my_queue (read_at = now())."""
+    """Mark a message consumed so it drops out of the inbox.
+
+    Consuming a message stamps read_at (drops it from my_queue). For an inbound
+    *request* still awaiting triage, consuming it IS its terminal disposition, so
+    also advance status pending -> archived; otherwise the request stays
+    status='pending' forever and keeps resurfacing in comms_check /
+    pending_messages (read_at alone does not clear that queue). Responses
+    (kind='response', status='sent') are consumed via read_at and are left
+    untouched by the status clause. The guard (kind='request' AND
+    status='pending') makes this a no-op on already-triaged/archived requests, so
+    it never races the engine's auto-triage of team-addressed requests."""
     with pool.connection() as conn:
-        conn.execute("UPDATE messages SET read_at = now() WHERE id = %s", (message_id,))
+        conn.execute(
+            "UPDATE messages SET read_at = now(), "
+            "status = CASE WHEN kind = 'request' AND status = 'pending' "
+            "THEN 'archived' ELSE status END "
+            "WHERE id = %s",
+            (message_id,),
+        )
 
 
 def latest_issue_events(
@@ -1579,9 +1598,25 @@ def respond_to_message(pool: ConnectionPool, message_id: int, body: str,
 
 _CONTRACT_COLS = ["id", "method", "path", "request_ref", "response_dto", "auth",
                   "owner_team", "status", "version", "content_hash", "source_ref",
-                  "type_ref", "created_at", "updated_at"]
+                  "type_ref", "superseded_by_contract_id", "created_at", "updated_at"]
 _CONTRACT_SELECT = "SELECT " + ", ".join(_CONTRACT_COLS) + " FROM contracts"
 _SATISFIED = ("agreed", "live")
+_CONFIGURED_PROJECT = "cadencelms-working"
+
+# These notification endpoints are intentionally not part of the CadenceLMS
+# contract registry.  They are framework/UI notifications rather than the
+# product API surface, and importing them made the registry look larger than
+# the route/type contract set it is meant to coordinate.
+_BULK_IMPORT_EXCLUDED = {
+    ("GET", "/notifications"),
+    ("PATCH", "/notifications/:id/read"),
+    ("POST", "/notifications/read-all"),
+    ("GET", "/users/me/notifications"),
+    ("GET", "/users/me/notifications/:id"),
+    ("PATCH", "/users/me/notifications/:id"),
+    ("POST", "/users/me/notifications/mark-all-read"),
+    ("GET", "/users/me/notifications/unread-count"),
+}
 
 
 def _contract_hash(method: str, path: str, request_ref: str, response_dto: str) -> str:
@@ -1808,6 +1843,231 @@ def stage_from_seed(pool: ConnectionPool, rows: list[dict[str, Any]],
     return counts
 
 
+def bulk_rebuild_contracts(pool: ConnectionPool, rows: list[dict[str, Any]],
+                           repository_name: str,
+                           expected_repository: str = "cadencelms-working",
+                           source_ref: Optional[str] = None) -> dict[str, Any]:
+    """Reconcile the accepted contract store from a complete seed in one admin
+    operation.
+
+    This is deliberately separate from ``contract_propose``: it is a bounded,
+    idempotent administrative import, not a way for workers to evade proposal
+    limits.  The dashboard supplies the human confirmation string, but this
+    function repeats the exact server-side check so callers cannot accidentally
+    turn the action into an unrestricted import endpoint.
+
+    Existing ``agreed``/``live`` status is preserved.  New and changed shapes
+    become ``agreed`` because this action is the explicitly approved admin
+    rebuild requested from the Contracts page.  Full-seed removals are marked
+    deprecated.  Invalid or duplicate endpoint keys are reported as conflicts
+    before any database work starts.
+    """
+    if (repository_name or "").strip() != expected_repository:
+        raise ValueError(f"type {expected_repository} exactly to confirm this admin import")
+    if not isinstance(rows, list):
+        raise ValueError("contract seed must be a JSON array")
+
+    normalized: list[dict[str, Any]] = []
+    conflicts: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for i, raw in enumerate(rows):
+        if not isinstance(raw, dict):
+            conflicts.append(f"row {i + 1}: expected an object")
+            continue
+        method = str(raw.get("method", "")).strip().upper()
+        path = str(raw.get("path", "")).strip()
+        key = (method, path)
+        if not method or not path or not path.startswith("/"):
+            conflicts.append(f"row {i + 1}: invalid method/path")
+            continue
+        if key in _BULK_IMPORT_EXCLUDED:
+            continue
+        if key in seen:
+            conflicts.append(f"duplicate endpoint: {method} {path}")
+            continue
+        seen.add(key)
+        item = dict(raw)
+        item["method"], item["path"] = method, path
+        if source_ref and not item.get("source_ref"):
+            item["source_ref"] = source_ref
+        normalized.append(item)
+    if conflicts:
+        return {"imported": 0, "agreed": 0, "skipped": 0, "deprecated": 0,
+                "conflicts": conflicts, "excluded": len(rows) - len(normalized)}
+
+    # stage_from_seed is idempotent and performs the complete-set diff.  Capture
+    # statuses before accepting proposals so a live contract is never downgraded.
+    before = {(c["method"], c["path"]): c for c in list_contracts(pool)}
+    staged = stage_from_seed(pool, normalized, full=True)
+    agreed = imported = deprecated = 0
+    for proposal in list_proposals(pool, "pending"):
+        key = (proposal["method"], proposal["path"])
+        if proposal["change_type"] == "remove":
+            accept_proposal(pool, *key)
+            deprecated += 1
+            continue
+        prior = before.get(key)
+        target = prior["status"] if prior and prior["status"] in _SATISFIED else "agreed"
+        accept_proposal(pool, *key, status=target)
+        imported += 1
+        agreed += 1
+    return {"imported": imported, "agreed": agreed, "skipped": staged["skip"],
+            "deprecated": deprecated, "conflicts": [],
+            "excluded": len(rows) - len(normalized), "staged": staged}
+
+
+def _contract_audit_repo_root(repo_path: str | Path) -> Path:
+    """Resolve the repository root used by the current-contract audit."""
+    root = Path(repo_path).expanduser().resolve()
+    candidates = (root, root / "wt-backend-dev", root.parent / "wt-backend-dev", root.parent)
+    # A configured monorepo checkout may have an older contracts directory while
+    # the active backend worktree owns the current audit. Prefer an existing
+    # audit artifact before falling back to the first structurally valid tree.
+    candidates = tuple(dict.fromkeys(candidates))
+    candidates = tuple(sorted(
+        candidates,
+        key=lambda candidate: not (candidate / "packages/contracts/contracts.audit.json").is_file(),
+    ))
+    for candidate in candidates:
+        if (candidate / "apps/api/src/routes").is_dir() and (candidate / "packages/contracts").is_dir():
+            return candidate
+    raise ValueError(f"no CadenceLMS API/contracts tree found under {root}")
+
+
+def resolve_contract_audit_repo(repo_path: str | Path) -> Path:
+    """Public resolver for dashboard/actions that operate on the audit artifact."""
+    return _contract_audit_repo_root(repo_path)
+
+
+def _parse_current_route_file(path: Path, repo_root: Path) -> list[dict[str, Any]]:
+    """Extract concrete Express route declarations without executing API code.
+
+    The audit intentionally records implementation evidence, not runtime traffic.
+    This parser follows the same route declaration convention as the API's
+    divergence analyzer: router.<verb>("/path", ...).
+    """
+    source = path.read_text(encoding="utf-8")
+    file_auth = bool(re.search(r"router\.use\(\s*authenticate\b", source))
+    out: list[dict[str, Any]] = []
+    pattern = re.compile(r"router\.(get|post|put|patch|delete)\s*\(\s*['\"]([^'\"]+)['\"]")
+    for match in pattern.finditer(source):
+        method, route_path = match.group(1).upper(), match.group(2)
+        line = source.count("\n", 0, match.start()) + 1
+        # Inspect only this declaration's line window for middleware evidence;
+        # file-level auth covers the common router.use(authenticate) pattern.
+        window = source[match.start(): source.find("\n", match.start()) if source.find("\n", match.start()) >= 0 else len(source)]
+        validate = re.search(r"validateRequest\s*\([^)]*\b(body|query|params)\s*:\s*([A-Za-z0-9_.]+)", window)
+        request_ref = validate.group(2) if validate else ""
+        authenticated = file_auth or bool(re.search(r"\bauthenticate\b|\bauthorize\s*\(", window))
+        out.append({
+            "method": method,
+            "path": route_path,
+            "request_ref": request_ref,
+            "response_dto": "",
+            "auth": "jwt" if authenticated else "none",
+            "owner_team": "backend",
+            "status": "live",
+            "version": "1.0",
+            "source_ref": f"{path.relative_to(repo_root)}:{line}",
+            "type_ref": "",
+        })
+    return out
+
+
+def refresh_contract_audit(repo_path: str | Path) -> dict[str, Any]:
+    """Build and persist the current implementation contract snapshot.
+
+    Output is a predictable, reviewable JSON object at
+    ``packages/contracts/contracts.audit.json``.  The file contains metadata,
+    endpoint rows, and explicit coverage gaps.  It is deliberately separate
+    from the historical ``contracts.seed.json`` and does not mutate the
+    orchestrator contract store.
+    """
+    root = _contract_audit_repo_root(repo_path)
+    routes_dir = root / "apps/api/src/routes"
+    audit_path = root / "packages/contracts/contracts.audit.json"
+    previous: dict[tuple[str, str], dict[str, Any]] = {}
+    for candidate in (audit_path, root / "packages/contracts/contracts.seed.json"):
+        if not candidate.is_file():
+            continue
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            prior_rows = raw.get("contracts", []) if isinstance(raw, dict) else raw
+            if isinstance(prior_rows, list):
+                previous = {(str(r.get("method", "")).upper(), str(r.get("path", ""))): r
+                            for r in prior_rows if isinstance(r, dict)}
+                break
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    rows: list[dict[str, Any]] = []
+    for route_file in sorted(routes_dir.glob("*.routes.ts")):
+        rows.extend(_parse_current_route_file(route_file, root))
+    seen: set[tuple[str, str]] = set()
+    conflicts: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        key = (row["method"], row["path"])
+        if key in seen:
+            conflicts.append(f"duplicate endpoint: {key[0]} {key[1]}")
+            continue
+        seen.add(key)
+        old = previous.get(key, {})
+        # Keep evidence that remains useful across a route-source refresh, but
+        # always replace implementation location/auth/request evidence from code.
+        row["type_ref"] = old.get("type_ref", "") or ""
+        row["response_dto"] = old.get("response_dto", "") or ""
+        normalized.append(row)
+    normalized.sort(key=lambda r: (r["path"], r["method"]))
+    unresolved_response = sum(1 for r in normalized if not r["response_dto"])
+    unresolved_type = sum(1 for r in normalized if not r["type_ref"])
+    payload = {
+        "schema_version": "1.0",
+        "kind": "cadencelms.contracts.current-audit",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repository": root.name,
+        "source": {
+            "routes": "apps/api/src/routes/*.routes.ts",
+            "validators": "apps/api/src/validators/*.ts",
+            "dto_inventory": "apps/api/src/dto/**/*.ts",
+            "shared_types": "packages/contracts/types/*.ts",
+        },
+        "summary": {
+            "implemented_routes": len(normalized),
+            "unique_endpoint_keys": len(seen),
+            "duplicate_endpoint_keys": len(conflicts),
+            "unresolved_response_dto": unresolved_response,
+            "unresolved_type_ref": unresolved_type,
+        },
+        "gaps": {
+            "duplicate_endpoints": conflicts,
+            "response_dto_mapping": "Controller response mapping requires explicit evidence; blank means unresolved.",
+            "type_ref_mapping": "Blank type_ref means no prior shared-type mapping was available.",
+        },
+        "contracts": normalized,
+    }
+    audit_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return {"path": str(audit_path), "root": str(root), "rows": normalized,
+            "summary": payload["summary"], "gaps": payload["gaps"]}
+
+
+def load_contract_audit(repo_path: str | Path) -> dict[str, Any]:
+    """Load the last generated audit file, refusing ambiguous bare seed arrays."""
+    root = _contract_audit_repo_root(repo_path)
+    path = root / "packages/contracts/contracts.audit.json"
+    if not path.is_file():
+        raise ValueError(f"no current contract audit file found at {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read contract audit file: {exc}") from exc
+    rows = payload.get("contracts") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("contract audit file must contain a contracts array")
+    return {"path": str(path), "root": str(root), "rows": rows,
+            "summary": payload.get("summary", {}), "gaps": payload.get("gaps", {})}
+
+
 def accept_proposal(pool: ConnectionPool, method: str, path: str,
                     status: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Apply the pending proposal to the accepted store: add/modify upserts the
@@ -1883,6 +2143,8 @@ def _contract_state(contract: Optional[dict], proposal: Optional[dict]) -> str:
         return "missing"
     if contract["status"] in _SATISFIED:
         return "up-to-date"
+    if contract["status"] in ("superseded", "retired", "rejected"):
+        return contract["status"]
     if contract["status"] == "deprecated":
         return "deprecated"
     return "awaiting acceptance"
@@ -1931,6 +2193,386 @@ def mark_contract_deps_satisfied(pool: ConnectionPool, issue_id: int) -> None:
         conn.execute(
             "UPDATE issue_contract_deps SET satisfied = TRUE WHERE issue_id = %s",
             (issue_id,))
+
+
+# --- contract lifecycle (migration 0023, admin-driven reconciliation) -------- #
+
+_LIFECYCLE_OP_COLS = ["id", "project", "operation_id", "actor", "actor_role",
+                      "reason", "source", "result", "requested", "response",
+                      "created_at"]
+_LIFECYCLE_EVENT_COLS = ["id", "op_id", "contract_id", "method", "path", "action",
+                         "from_status", "to_status", "superseded_by_contract_id",
+                         "reason", "actor", "source_ref", "content_hash", "created_at"]
+
+
+def contract_lifecycle_preview(
+    pool: ConnectionPool,
+    project: str,
+    operation_id: str,
+    actor: str,
+    actor_role: str,
+    reason: str,
+    changes: list[dict[str, Any]],
+    expected: Optional[dict[str, str]] = None,
+    expected_project: str = _CONFIGURED_PROJECT,
+) -> dict[str, Any]:
+    """Read-only. Loads the affected contracts, validates via
+    contract_lifecycle.validate_batch, classifies destructive changes, and
+    reports concurrency tokens. NO writes, no transaction that mutates."""
+    from . import contract_lifecycle as lifecycle
+
+    conflicts = []
+
+    # Project passthrough validation.
+    if project.strip() != expected_project:
+        conflicts.append(f"project '{project}' does not match configured project")
+
+    # Load all referenced contracts (both contract_id and replacement_contract_id).
+    contract_ids = set()
+    for change in changes:
+        if isinstance(change, dict):
+            cid = change.get("contract_id")
+            if isinstance(cid, int):
+                contract_ids.add(cid)
+            rid = change.get("replacement_contract_id")
+            if isinstance(rid, int):
+                contract_ids.add(rid)
+
+    contracts_by_id: dict[int, dict[str, Any]] = {}
+    if contract_ids:
+        with pool.connection() as conn:
+            rows = conn.execute(
+                _CONTRACT_SELECT + " WHERE id = ANY(%s) ORDER BY id",
+                (list(contract_ids),),
+            ).fetchall()
+        contracts_by_id = {
+            row[0]: dict(zip(_CONTRACT_COLS, row))
+            for row in rows
+        }
+
+    # Validate the batch.
+    normalized, batch_conflicts, warnings = lifecycle.validate_batch(
+        changes, contracts_by_id, project)
+    conflicts.extend(batch_conflicts)
+
+    # Classify destructive changes.
+    destructive = any(c["destructive"] for c in normalized)
+
+    # Build affected list with concurrency tokens.
+    affected = []
+    for change in normalized:
+        contract = contracts_by_id.get(change["contract_id"], {})
+        affected.append({
+            "contract_id": change["contract_id"],
+            "method": change["method"],
+            "path": change["path"],
+            "from_status": change["from_status"],
+            "to_status": change["to_status"],
+            "action": change["action"],
+            "destructive": change["destructive"],
+            "token": contract.get("updated_at", "").isoformat()
+                if isinstance(contract.get("updated_at"), datetime) else
+                (contract.get("updated_at") or ""),
+        })
+
+    # Check for token staleness (advisory).
+    token_stale_issues = []
+    if expected:
+        for change in normalized:
+            contract = contracts_by_id.get(change["contract_id"], {})
+            exp_token = expected.get(str(change["contract_id"]))
+            live_token = contract.get("updated_at", "").isoformat() \
+                if isinstance(contract.get("updated_at"), datetime) else \
+                (contract.get("updated_at") or "")
+            if exp_token and live_token and exp_token != live_token:
+                token_stale_issues.append(change["contract_id"])
+
+    # Compute preview_token (digest over operation_id, normalized, tokens).
+    import hashlib
+    preview_data = (
+        operation_id +
+        json.dumps(normalized, default=str, sort_keys=True) +
+        json.dumps([a["token"] for a in affected], sort_keys=True)
+    )
+    preview_token = hashlib.sha256(preview_data.encode()).hexdigest()
+
+    return {
+        "valid": not conflicts,
+        "project": project,
+        "operation_id": operation_id,
+        "normalized_changes": normalized,
+        "conflicts": conflicts,
+        "warnings": warnings,
+        "affected": affected,
+        "destructive": destructive,
+        "confirmation_required": destructive,
+        "preview_token": preview_token,
+    }
+
+
+def contract_lifecycle_apply(
+    pool: ConnectionPool,
+    project: str,
+    operation_id: str,
+    actor: str,
+    actor_role: str,
+    reason: str,
+    changes: list[dict[str, Any]],
+    expected: Optional[dict[str, str]] = None,
+    source: str = "",
+    confirm_project: Optional[str] = None,
+    expected_project: str = _CONFIGURED_PROJECT,
+) -> dict[str, Any]:
+    """Atomic, idempotent admin apply of a lifecycle batch. ONE
+    with pool.connection() as conn, conn.transaction(): block."""
+    from . import contract_lifecycle as lifecycle
+
+    with pool.connection() as conn, conn.transaction():
+        # 1. Idempotency replay (first, before any lock/validation).
+        existing = conn.execute(
+            "SELECT response FROM contract_lifecycle_ops "
+            "WHERE project=%s AND operation_id=%s",
+            (project, operation_id),
+        ).fetchone()
+        if existing is not None:
+            return existing[0]
+
+        # 2. Load + lock all referenced contracts.
+        contract_ids = set()
+        for change in changes:
+            if isinstance(change, dict):
+                cid = change.get("contract_id")
+                if isinstance(cid, int):
+                    contract_ids.add(cid)
+                rid = change.get("replacement_contract_id")
+                if isinstance(rid, int):
+                    contract_ids.add(rid)
+
+        contracts_by_id: dict[int, dict[str, Any]] = {}
+        if contract_ids:
+            rows = conn.execute(
+                _CONTRACT_SELECT + " WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
+                (list(contract_ids),),
+            ).fetchall()
+            contracts_by_id = {
+                row[0]: dict(zip(_CONTRACT_COLS, row))
+                for row in rows
+            }
+
+        # 3. Project passthrough gate.
+        if project.strip() != expected_project:
+            response = {
+                "result": "rejected",
+                "reason": "project_mismatch",
+                "project": project,
+                "operation_id": operation_id,
+            }
+            op_id = conn.execute(
+                "INSERT INTO contract_lifecycle_ops "
+                "(project, operation_id, actor, actor_role, reason, source, "
+                "result, requested, response) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
+                (project, operation_id, actor, actor_role, reason, source,
+                 "rejected", Jsonb(changes), Jsonb(response)),
+            ).fetchone()[0]
+            response["audit_op_id"] = op_id
+            return response
+
+        # 4. Validate under lock.
+        normalized, conflicts, warnings = lifecycle.validate_batch(
+            changes, contracts_by_id, project)
+        if conflicts:
+            response = {
+                "result": "conflict",
+                "reason": "validation_failed",
+                "operation_id": operation_id,
+                "conflicts": conflicts,
+                "warnings": warnings,
+            }
+            op_id = conn.execute(
+                "INSERT INTO contract_lifecycle_ops "
+                "(project, operation_id, actor, actor_role, reason, source, "
+                "result, requested, response) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
+                (project, operation_id, actor, actor_role, reason, source,
+                 "conflict", Jsonb(changes), Jsonb(response)),
+            ).fetchone()[0]
+            response["audit_op_id"] = op_id
+            return response
+
+        # 5. Destructive confirmation gate.
+        destructive = any(c["destructive"] for c in normalized)
+        if destructive and (confirm_project or "").strip() != expected_project:
+            response = {
+                "result": "rejected",
+                "reason": "confirmation_required",
+                "operation_id": operation_id,
+                "destructive_changes": [c["contract_id"] for c in normalized
+                                       if c["destructive"]],
+            }
+            op_id = conn.execute(
+                "INSERT INTO contract_lifecycle_ops "
+                "(project, operation_id, actor, actor_role, reason, source, "
+                "result, requested, response) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id",
+                (project, operation_id, actor, actor_role, reason, source,
+                 "rejected", Jsonb(changes), Jsonb(response)),
+            ).fetchone()[0]
+            response["audit_op_id"] = op_id
+            return response
+
+        # 6. Concurrency re-check.
+        if expected:
+            stale = []
+            for change in normalized:
+                contract = contracts_by_id.get(change["contract_id"], {})
+                exp_token = expected.get(str(change["contract_id"]))
+                live_token = contract.get("updated_at").isoformat() \
+                    if isinstance(contract.get("updated_at"), datetime) else \
+                    (contract.get("updated_at") or "")
+                if exp_token and live_token and exp_token != live_token:
+                    stale.append(change["contract_id"])
+            if stale:
+                response = {
+                    "result": "conflict",
+                    "reason": "stale_token",
+                    "operation_id": operation_id,
+                    "stale": stale,
+                }
+                op_id = conn.execute(
+                    "INSERT INTO contract_lifecycle_ops "
+                    "(project, operation_id, actor, actor_role, reason, source, "
+                    "result, requested, response) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "RETURNING id",
+                    (project, operation_id, actor, actor_role, reason, source,
+                     "conflict", Jsonb(changes), Jsonb(response)),
+                ).fetchone()[0]
+                response["audit_op_id"] = op_id
+                return response
+
+        # 7&8. Apply each change, then insert ops row with final response.
+        # Insert the ops row first to get its id, then insert events.
+        op_row = conn.execute(
+            "INSERT INTO contract_lifecycle_ops "
+            "(project, operation_id, actor, actor_role, reason, source, "
+            "result, requested, response) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "RETURNING id",
+            (project, operation_id, actor, actor_role, reason, source,
+             "applied", Jsonb(normalized), Jsonb({})),
+        ).fetchone()
+        op_id = op_row[0]
+
+        changed = []
+        for change in normalized:
+            contract = contracts_by_id.get(change["contract_id"], {})
+
+            # Update the contract.
+            conn.execute(
+                "UPDATE contracts SET status=%s, superseded_by_contract_id=%s, updated_at=now() "
+                "WHERE id=%s",
+                (change["to_status"],
+                 change.get("replacement_contract_id"),
+                 change["contract_id"]),
+            )
+
+            # Insert event.
+            conn.execute(
+                "INSERT INTO contract_lifecycle_events "
+                "(op_id, contract_id, method, path, action, from_status, to_status, "
+                "superseded_by_contract_id, reason, actor, source_ref, content_hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (op_id, change["contract_id"], change["method"], change["path"],
+                 change["action"], change["from_status"], change["to_status"],
+                 change.get("replacement_contract_id"),
+                 reason, actor, change.get("source_ref"), change.get("content_hash")),
+            )
+
+            changed.append({
+                "contract_id": change["contract_id"],
+                "method": change["method"],
+                "path": change["path"],
+                "action": change["action"],
+                "from_status": change["from_status"],
+                "to_status": change["to_status"],
+                "superseded_by_contract_id": change.get("replacement_contract_id"),
+            })
+
+        # Build final response.
+        response = {
+            "result": "applied",
+            "operation_id": operation_id,
+            "project": project,
+            "audit_op_id": op_id,
+            "changed": changed,
+            "unchanged": [],
+            "warnings": warnings,
+            "destructive": destructive,
+            "confirmed": {
+                "required": destructive,
+                "value_matched": destructive and
+                    (confirm_project or "").strip() == expected_project,
+            },
+        }
+
+        # Update the ops row with the final response.
+        conn.execute(
+            "UPDATE contract_lifecycle_ops SET response=%s WHERE id=%s",
+            (Jsonb(response), op_id),
+        )
+
+    return response
+
+
+def contract_lifecycle_history(
+    pool: ConnectionPool,
+    contract_id: Optional[int] = None,
+    operation_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Read-only. Return append-only lifecycle events joined to their ops row for
+    actor/reason/source/project. Filter by contract_id and/or operation_id
+    (operation_id here means the TEXT op key; join ops on op.operation_id).
+    Ordered by e.created_at DESC, e.id DESC."""
+    with pool.connection() as conn:
+        clauses = []
+        params = []
+        if contract_id is not None:
+            clauses.append("e.contract_id = %s")
+            params.append(contract_id)
+        if operation_id is not None:
+            clauses.append("o.operation_id = %s")
+            params.append(operation_id)
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        rows = conn.execute(
+            "SELECT e.id, e.op_id, e.contract_id, e.method, e.path, e.action, "
+            "e.from_status, e.to_status, e.superseded_by_contract_id, e.reason, "
+            "e.actor, e.source_ref, e.content_hash, e.created_at, "
+            "o.actor, o.reason, o.source, o.project, o.operation_id, o.result "
+            "FROM contract_lifecycle_events e "
+            "JOIN contract_lifecycle_ops o ON o.id = e.op_id " +
+            where +
+            " ORDER BY e.created_at DESC, e.id DESC",
+            params,
+        ).fetchall()
+
+    # Build result dicts. Event cols first, then joined op fields.
+    event_cols = ["id", "op_id", "contract_id", "method", "path", "action",
+                  "from_status", "to_status", "superseded_by_contract_id",
+                  "reason", "actor", "source_ref", "content_hash", "created_at"]
+    op_cols = ["actor", "reason", "source", "project", "operation_id", "result"]
+
+    result = []
+    for row in rows:
+        d = dict(zip(event_cols + op_cols, row))
+        result.append(d)
+
+    return result
 
 
 # --------------------------------------------------------------------------- #

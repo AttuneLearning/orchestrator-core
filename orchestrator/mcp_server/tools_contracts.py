@@ -15,6 +15,7 @@ Thin wrappers over orchestrator.repository (the single write path).
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Optional
 
@@ -27,7 +28,19 @@ from .. import repository as repo
 _ENDPOINT_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/[\w:{}./-]*)")
 
 
-def register(mcp: FastMCP, pool: ConnectionPool) -> None:
+def _require_admin(actor_role: str) -> None:
+    """Authorize admin-only contract lifecycle tools.
+
+    ``actor_role`` is captured from the trusted session env in build_server()
+    and is never a tool arg, so a worker cannot elevate itself (GAP-2: contract
+    mutation is not on the general worker surface)."""
+    if (actor_role or "").strip().lower() != "orch-manager":
+        raise PermissionError(
+            "only the orch-manager session may run contract lifecycle operations"
+        )
+
+
+def register(mcp: FastMCP, pool: ConnectionPool, actor_role: str = "") -> None:
 
     @mcp.tool()
     def contracts_for_issue(issue_id: int) -> dict[str, Any]:
@@ -94,3 +107,46 @@ def register(mcp: FastMCP, pool: ConnectionPool) -> None:
         contracts that apply to YOUR issue use contracts_for_issue(issue_id) —
         it is scoped and far cheaper than pulling the whole store."""
         return repo.list_contracts(pool, status=status, owner_team=owner_team)
+
+    @mcp.tool()
+    def contract_lifecycle_preview(
+        project: str, operation_id: str, reason: str,
+        changes: list[dict[str, Any]],
+        expected: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """ADMIN ONLY. Dry-run a contract lifecycle batch: validation conflicts,
+        advisory warnings, affected contracts, whether confirmation is required."""
+        _require_admin(actor_role)
+        return repo.contract_lifecycle_preview(
+            pool, project, operation_id,
+            actor=os.environ.get("ORCH_ACTOR", "orch-manager"),
+            actor_role=actor_role, reason=reason, changes=changes, expected=expected)
+
+    @mcp.tool()
+    def contract_lifecycle_apply(
+        project: str, operation_id: str, reason: str,
+        changes: list[dict[str, Any]],
+        expected: Optional[dict[str, str]] = None,
+        preview_token: Optional[str] = None,
+        confirm_project: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """ADMIN ONLY. Atomically apply a lifecycle batch (idempotent by
+        operation_id). Destructive batches (supersede/retire, or deprecate of an
+        agreed/live contract) require confirm_project == the configured project name,
+        else result='rejected' reason='confirmation_required'."""
+        _require_admin(actor_role)
+        return repo.contract_lifecycle_apply(
+            pool, project, operation_id,
+            actor=os.environ.get("ORCH_ACTOR", "orch-manager"),
+            actor_role=actor_role, reason=reason, changes=changes, expected=expected,
+            source="mcp", confirm_project=confirm_project)
+
+    @mcp.tool()
+    def contract_lifecycle_history(
+        contract_id: Optional[int] = None, operation_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """ADMIN ONLY. Read the append-only lifecycle history for a contract and/or
+        operation id."""
+        _require_admin(actor_role)
+        return repo.contract_lifecycle_history(
+            pool, contract_id=contract_id, operation_id=operation_id)

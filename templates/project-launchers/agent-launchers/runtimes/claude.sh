@@ -60,8 +60,10 @@ if [ "${ORCH_LAUNCH_DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
-# Interactive mode drives a TUI by hand, so it skips the headless poll loop.
-if [ "${LOOP_AGENT:-0}" = "1" ] && [ -n "${AGENT_ID:-}" ] && [ "$LAUNCH_MODE" != "interactive" ]; then
+# Loop by default, INCLUDING interactive: run-agent-loop keeps the agent cycling
+# (re-launches the command each cycle) instead of stopping after one session.
+# LOOP_AGENT=1 keeps non-interactive roles looping too.
+if [ -n "${AGENT_ID:-}" ] && { [ "$LAUNCH_MODE" = "interactive" ] || [ "${LOOP_AGENT:-0}" = "1" ]; }; then
   export ORCH_DASHBOARD="$DASHBOARD"
   export AGENT_POLL="${AGENT_POLL:-${AGENT_POLL_DEFAULT:-90}}"
   if [ "${IDLE_STOP:-0}" -gt 0 ]; then

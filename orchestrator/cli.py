@@ -527,6 +527,25 @@ def _cmd_import_contracts(args, settings) -> int:
     return 0
 
 
+def _cmd_contracts_lifecycle_apply(args, settings) -> int:
+    """Apply a contract lifecycle batch through the single audited/idempotent
+    repository path (never direct SQL). --file is a JSON array of change objects
+    ({contract_id, action, replacement_contract_id?, source_ref?})."""
+    pool = get_pool(settings)
+    with open(args.file) as fh:
+        changes = json.load(fh)
+    if not isinstance(changes, list):
+        print("error: --file must be a JSON array of change objects", file=sys.stderr)
+        return 1
+    result = repo.contract_lifecycle_apply(
+        pool, project=args.project, operation_id=args.op,
+        actor="cli-admin", actor_role="orch-manager", reason=args.reason,
+        changes=changes, source="cli",
+        confirm_project=args.confirm_project or None)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result.get("result") == "applied" else 1
+
+
 def _cmd_sync_contracts(args, settings) -> int:
     """Agent/CI contract tripwire.
 
@@ -1274,6 +1293,17 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--dry-run", action="store_true",
                     help="validate and report what would be staged without touching the DB")
     sc.set_defaults(func=_cmd_sync_contracts)
+
+    cla = sub.add_parser("contracts-lifecycle-apply",
+                         help="apply an audited, idempotent contract lifecycle batch")
+    cla.add_argument("--op", required=True, help="operation_id (idempotency key)")
+    cla.add_argument("--file", required=True, help="path to the JSON change batch")
+    cla.add_argument("--project", default="cadencelms-working",
+                     help="audited project passthrough (must match the configured project)")
+    cla.add_argument("--reason", default="", help="human reason recorded in the audit")
+    cla.add_argument("--confirm-project", dest="confirm_project", default="",
+                     help="type the project name to confirm destructive batches")
+    cla.set_defaults(func=_cmd_contracts_lifecycle_apply)
 
     bkp = sub.add_parser("backup-db",
                          help="backup the selected orchestrator coordinator database")

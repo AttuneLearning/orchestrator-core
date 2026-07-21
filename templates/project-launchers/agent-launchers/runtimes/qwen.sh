@@ -20,6 +20,7 @@ if [ "${ROLE:-}" = "orch-manager" ]; then
     -t stdio \
     -e "PYTHONPATH=$ORCH" \
     -e "ORCH_INSTANCE=$PROJECT" \
+    -e "ORCH_ROLE=$ROLE" \
     --trust \
     -- -m orchestrator.cli --instance "$PROJECT" serve >/dev/null
   if [ "$LAUNCH_MODE" = "interactive" ]; then

@@ -105,6 +105,14 @@ GAP-1 verified), `verify_run` (harness-executed), `gate_decision` (evidence-
 required), `comms_send`, `adr_suggest` (dedup + rate limit), `contract_propose`
 (rate limit), `create_subissue`, `append_log`.
 
+Coordinator-only creation: the per-session `orch-manager` MCP server may call
+`create_issue` or its explicit alias `create_goal_child` to create a root issue
+directly in a goal (`parent_id = NULL`, `depth = 0`). These tools require the
+trusted `ORCH_ROLE=orch-manager` launcher identity; the role is not a caller-
+supplied argument, and missing/non-coordinator identity is denied. This avoids
+the goal-id/issue-id integer collision that previously routed a goal child under
+an unrelated issue.
+
 **Removed from workers on purpose** (self-approval holes that produced ~1,500
 junk ADRs): `adr_create`, `adr_approve`, `adr_update`, `contract_agree`,
 `contract_upsert`. Approval is human-only: dashboard `/adrs` + `/contracts`, or

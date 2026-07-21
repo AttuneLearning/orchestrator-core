@@ -11,6 +11,7 @@ status tools via orchestrator.monitoring.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import shutil
@@ -858,7 +859,9 @@ def create_app(pool: Optional[ConnectionPool] = None,
 
     @app.get("/agents/{agent_id}/pause")
     def agent_pause_state(agent_id: int):
-        """JSON the pull worker polls to self-pace: seconds left on its cooldown."""
+        """JSON the pull worker polls to self-pace: seconds left on its cooldown,
+        plus the dashboard-owned loop policy (loop_enabled + poll_interval_seconds)
+        so the shell loop (run-agent-loop.sh) cadences and on/off from the DB."""
         from datetime import datetime, timezone
         a = repo.get_agent(pool, agent_id)
         pu = getattr(a, "paused_until", None) if a else None
@@ -867,7 +870,20 @@ def create_app(pool: Optional[ConnectionPool] = None,
             secs = max(0, int((pu - datetime.now(timezone.utc)).total_seconds()))
         return JSONResponse({"agent_id": agent_id,
                              "paused_until": pu.isoformat() if pu else None,
-                             "pause_seconds": secs})
+                             "pause_seconds": secs,
+                             "loop_enabled": bool(getattr(a, "loop_enabled", False)) if a else False,
+                             "poll_interval_seconds": int(getattr(a, "poll_interval_seconds", 300)) if a else 300})
+
+    @app.post("/agents/{agent_id}/heartbeat")
+    def agent_heartbeat(agent_id: int):
+        """Continuous liveness ping for the run-agent-loop.sh background sidecar.
+        Refreshes last_seen (and revives offline->idle) every ~60s WHILE a work
+        cycle runs, so a long model run / verify_run never crosses
+        agent_stale_seconds and gets falsely reclaimed mid-work. touch_agent
+        preserves 'busy'/'idle' status (only offline is promoted), so this never
+        clobbers an actively-working worker."""
+        repo.touch_agent(pool, agent_id)
+        return JSONResponse({"agent_id": agent_id, "ok": True})
 
     @app.get("/tiers", response_class=HTMLResponse)
     def tiers() -> str:
@@ -1047,8 +1063,80 @@ def create_app(pool: Optional[ConnectionPool] = None,
         return RedirectResponse("/orch/monitor", status_code=303)
 
     @app.get("/contracts", response_class=HTMLResponse)
-    def contracts_page() -> str:
-        return templates.contracts(repo.contracts_overview(pool))
+    def contracts_page(bulk_rebuild: str = "", bulk_error: str = "") -> str:
+        result = None
+        if bulk_rebuild:
+            result = {"message": bulk_rebuild}
+        if bulk_error:
+            result = {"error": bulk_error}
+        return templates.contracts(repo.contracts_overview(pool), result)
+
+    def _contract_audit_repo() -> Path:
+        configured = str(getattr(settings, "promote_repo_path", "") or
+                         getattr(settings, "apply_repo_path", "") or "").strip()
+        return repo.resolve_contract_audit_repo(Path(configured).expanduser() if configured else Path.cwd())
+
+    def _contract_import_result(result: dict, prefix: str) -> dict:
+        if result.get("conflicts"):
+            result["error"] = "Import stopped: " + "; ".join(result["conflicts"])
+        else:
+            result["message"] = (
+                f"{prefix}: {result['imported']} imported, {result['agreed']} agreed, "
+                f"{result['skipped']} unchanged, {result['deprecated']} deprecated, "
+                f"{result['excluded']} excluded.")
+        return result
+
+    def _admin_confirmation_error(repository_confirmation: str) -> Optional[HTMLResponse]:
+        expected = "cadencelms-working"
+        if (repository_confirmation or "").strip() != expected:
+            return HTMLResponse(templates.contracts(
+                repo.contracts_overview(pool),
+                {"error": f"Type {expected} exactly to run the admin rebuild."}),
+                status_code=400)
+        return None
+
+    @app.post("/contracts/import-last-updated", response_class=HTMLResponse)
+    def contracts_import_last_updated(repository_confirmation: str = Form("")):
+        """Import the existing current audit file without refreshing source code."""
+        error = _admin_confirmation_error(repository_confirmation)
+        if error:
+            return error
+        try:
+            audit = repo.load_contract_audit(_contract_audit_repo())
+            result = repo.bulk_rebuild_contracts(
+                pool, audit["rows"], repository_confirmation.strip(), source_ref=audit["path"])
+            result = _contract_import_result(result, f"Imported last updated audit file {audit['path']}")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            result = {"error": f"Admin import failed: {exc}"}
+        return HTMLResponse(templates.contracts(repo.contracts_overview(pool), result),
+                            status_code=400 if result.get("error") else 200)
+
+    @app.post("/contracts/refresh-and-approve", response_class=HTMLResponse)
+    def contracts_refresh_and_approve(repository_confirmation: str = Form("")):
+        """Refresh the source audit, then explicitly approve that fresh snapshot."""
+        error = _admin_confirmation_error(repository_confirmation)
+        if error:
+            return error
+        try:
+            audit = repo.refresh_contract_audit(_contract_audit_repo())
+            result = repo.bulk_rebuild_contracts(
+                pool, audit["rows"], repository_confirmation.strip(), source_ref=audit["path"])
+            result = _contract_import_result(
+                result, f"Refreshed {audit['path']} and approved the import")
+            if not result.get("error"):
+                result["message"] += (
+                    f" Snapshot: {audit['summary']['implemented_routes']} routes; "
+                    f"{audit['summary']['unresolved_response_dto']} response DTO mappings unresolved; "
+                    f"{audit['summary']['unresolved_type_ref']} type refs unresolved.")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            result = {"error": f"Refresh/import failed: {exc}"}
+        return HTMLResponse(templates.contracts(repo.contracts_overview(pool), result),
+                            status_code=400 if result.get("error") else 200)
+
+    @app.post("/contracts/bulk-rebuild", response_class=HTMLResponse)
+    def contracts_bulk_rebuild(repository_confirmation: str = Form("")):
+        """Compatibility URL for the former action; imports the last audit file."""
+        return contracts_import_last_updated(repository_confirmation)
 
     # -- Docs: shared dev docs in the DB (doc_* MCP tools + dashboard editor) -- #
     def _doc_body_html(doc: dict) -> str:
@@ -1223,6 +1311,54 @@ def create_app(pool: Optional[ConnectionPool] = None,
             if p["change_type"] in ("add", "modify"):
                 repo.accept_proposal(pool, p["method"], p["path"], status="agreed")
         return RedirectResponse("/contracts", status_code=303)
+
+    @app.get("/contracts/lifecycle/history", response_class=HTMLResponse)
+    def contracts_lifecycle_history(contract_id: int = 0, operation_id: str = "") -> str:
+        events = repo.contract_lifecycle_history(pool,
+                                                  contract_id=contract_id or None,
+                                                  operation_id=operation_id or None)
+        return templates.contract_lifecycle_history(events)
+
+    @app.post("/contracts/lifecycle/preview", response_class=HTMLResponse)
+    def contracts_lifecycle_preview(changes: str = Form(""), operation_id: str = Form(""),
+                                     reason: str = Form(""), project: str = Form("")) -> HTMLResponse:
+        try:
+            parsed = json.loads(changes)
+        except json.JSONDecodeError as e:
+            return HTMLResponse(templates.page(
+                "JSON Parse Error",
+                f"<h1>JSON Parse Error</h1><p>{templates.escape(str(e))}</p>"
+                "<p><a href='/contracts'>Back to contracts</a></p>"),
+                status_code=400)
+        result = repo.contract_lifecycle_preview(pool, project, operation_id,
+                                                  actor="dashboard-admin",
+                                                  actor_role="orch-manager",
+                                                  reason=reason, changes=parsed)
+        return HTMLResponse(templates.contract_lifecycle_preview(result))
+
+    @app.post("/contracts/lifecycle/apply", response_class=HTMLResponse)
+    def contracts_lifecycle_apply(changes: str = Form(""), operation_id: str = Form(""),
+                                   reason: str = Form(""), project: str = Form(""),
+                                   confirm_project: str = Form("")) -> HTMLResponse:
+        try:
+            parsed = json.loads(changes)
+        except json.JSONDecodeError as e:
+            return HTMLResponse(templates.page(
+                "JSON Parse Error",
+                f"<h1>JSON Parse Error</h1><p>{templates.escape(str(e))}</p>"
+                "<p><a href='/contracts'>Back to contracts</a></p>"),
+                status_code=400)
+        result = repo.contract_lifecycle_apply(pool, project, operation_id,
+                                                actor="dashboard-admin",
+                                                actor_role="orch-manager",
+                                                reason=reason, changes=parsed,
+                                                source="dashboard",
+                                                confirm_project=confirm_project or None)
+        # Only redirect on successful apply; otherwise show the result inline
+        if result.get("result") == "applied":
+            return RedirectResponse("/contracts", status_code=303)
+        return HTMLResponse(templates.contracts(repo.contracts_overview(pool),
+                                                 {"error": f"Apply failed: {result.get('reason', 'unknown')}"}))
 
     @app.get("/api/state")
     def api_state() -> JSONResponse:
