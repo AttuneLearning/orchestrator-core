@@ -2575,6 +2575,137 @@ def contract_lifecycle_history(
     return result
 
 
+_AMENDABLE_FIELDS = frozenset(
+    {"auth", "type_ref", "request_ref", "response_dto", "source_ref", "path"})
+
+
+def amend_contract_metadata(
+    pool: ConnectionPool,
+    project: str,
+    operation_id: str,
+    actor: str,
+    actor_role: str,
+    reason: str,
+    amendments: list[dict[str, Any]],
+    source: str = "",
+    expected_project: str = _CONFIGURED_PROJECT,
+) -> dict[str, Any]:
+    """Audited, idempotent correction of contract METADATA — no lifecycle
+    transition (status is unchanged).
+
+    Amends only the fields in ``_AMENDABLE_FIELDS`` (auth/type_ref/request_ref/
+    response_dto/source_ref/path). ``content_hash`` is recomputed whenever a hash
+    input (path/request_ref/response_dto) changes. ``path`` is part of
+    UNIQUE(method,path); a path change that would collide with another contract
+    is rejected. Recorded in the same contract_lifecycle_ops/events audit tables
+    (result='amended', action='amend', from_status==to_status). Idempotent on
+    (project, operation_id): a replay returns the original response.
+    """
+    with pool.connection() as conn, conn.transaction():
+        # Idempotency replay.
+        existing = conn.execute(
+            "SELECT response FROM contract_lifecycle_ops "
+            "WHERE project=%s AND operation_id=%s",
+            (project, operation_id),
+        ).fetchone()
+        if existing is not None:
+            return existing[0]
+
+        def _record(result: str, response: dict[str, Any]) -> int:
+            return conn.execute(
+                "INSERT INTO contract_lifecycle_ops "
+                "(project, operation_id, actor, actor_role, reason, source, "
+                "result, requested, response) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (project, operation_id, actor, actor_role, reason, source,
+                 result, Jsonb(amendments), Jsonb(response)),
+            ).fetchone()[0]
+
+        # Project passthrough gate.
+        if project.strip() != expected_project:
+            response = {"result": "rejected", "reason": "project_mismatch",
+                        "project": project, "operation_id": operation_id}
+            response["audit_op_id"] = _record("rejected", response)
+            return response
+
+        ids = [a["contract_id"] for a in amendments
+               if isinstance(a, dict) and isinstance(a.get("contract_id"), int)]
+        rows = conn.execute(
+            _CONTRACT_SELECT + " WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
+            (ids,),
+        ).fetchall()
+        by_id = {r[0]: dict(zip(_CONTRACT_COLS, r)) for r in rows}
+
+        # Validate.
+        conflicts: list[str] = []
+        for a in amendments:
+            cid = a.get("contract_id")
+            if cid not in by_id:
+                conflicts.append(f"unknown contract id {cid}")
+                continue
+            bad = set(a) - {"contract_id"} - _AMENDABLE_FIELDS
+            if bad:
+                conflicts.append(f"contract {cid}: non-amendable fields {sorted(bad)}")
+            if "path" in a:
+                method = by_id[cid]["method"]
+                clash = conn.execute(
+                    "SELECT id FROM contracts WHERE method=%s AND path=%s AND id<>%s",
+                    (method, a["path"], cid),
+                ).fetchone()
+                if clash:
+                    conflicts.append(
+                        f"contract {cid}: path {method} {a['path']} already used by "
+                        f"contract {clash[0]}")
+        if conflicts:
+            response = {"result": "conflict", "reason": "validation_failed",
+                        "operation_id": operation_id, "conflicts": conflicts}
+            response["audit_op_id"] = _record("conflict", response)
+            return response
+
+        # Apply.
+        op_id = _record("amended", {})
+        changed = []
+        for a in amendments:
+            cid = a["contract_id"]
+            c = by_id[cid]
+            updates = {k: a[k] for k in _AMENDABLE_FIELDS if k in a}
+            new_path = updates.get("path", c["path"])
+            new_req = updates.get("request_ref", c["request_ref"])
+            new_dto = updates.get("response_dto", c["response_dto"])
+            new_hash = _contract_hash(c["method"], new_path, new_req, new_dto)
+
+            set_cols, vals = [], []
+            for k, v in updates.items():
+                set_cols.append(f"{k} = %s")
+                vals.append(v)
+            set_cols.append("content_hash = %s")
+            vals.append(new_hash)
+            set_cols.append("updated_at = now()")
+            vals.append(cid)
+            conn.execute(
+                f"UPDATE contracts SET {', '.join(set_cols)} WHERE id = %s", vals)
+
+            conn.execute(
+                "INSERT INTO contract_lifecycle_events "
+                "(op_id, contract_id, method, path, action, from_status, to_status, "
+                "superseded_by_contract_id, reason, actor, source_ref, content_hash) "
+                "VALUES (%s, %s, %s, %s, 'amend', %s, %s, %s, %s, %s, %s, %s)",
+                (op_id, cid, c["method"], new_path, c["status"], c["status"],
+                 c["superseded_by_contract_id"], reason, actor,
+                 updates.get("source_ref", c["source_ref"]), new_hash),
+            )
+            changed.append({"contract_id": cid, "fields": sorted(updates),
+                            "path": new_path, "content_hash": new_hash})
+
+        response = {"result": "amended", "operation_id": operation_id,
+                    "project": project, "audit_op_id": op_id, "changed": changed}
+        conn.execute(
+            "UPDATE contract_lifecycle_ops SET response=%s WHERE id=%s",
+            (Jsonb(response), op_id))
+
+    return response
+
+
 # --------------------------------------------------------------------------- #
 # Internals
 # --------------------------------------------------------------------------- #
