@@ -149,6 +149,15 @@ def test_opencode_runtime_builds_config_and_command(settings, tmp_path, monkeypa
     )
     opencode_stub.chmod(0o755)
 
+    # In interactive/loop mode opencode.sh delegates to $WORKSPACE_ROOT/run-agent-loop.sh
+    # (deployed by setup-project in a real workspace). Provide a stub that mirrors the
+    # real wrapper's contract — args are (AGENT_ID, <opencode cmd...>) — by dropping the
+    # id and exec'ing the command once, so the interactive branch still reaches the
+    # opencode stub and writes its capture.
+    loop_stub = workspace / "run-agent-loop.sh"
+    loop_stub.write_text('#!/usr/bin/env bash\nset -euo pipefail\nshift  # drop AGENT_ID\nexec "$@"\n')
+    loop_stub.chmod(0o755)
+
     script = cli.REPO_ROOT / "templates" / "project-launchers" / "agent-launchers" / "runtimes" / "opencode.sh"
 
     base_env = os.environ.copy()
