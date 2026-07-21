@@ -1138,6 +1138,19 @@ def create_app(pool: Optional[ConnectionPool] = None,
         """Compatibility URL for the former action; imports the last audit file."""
         return contracts_import_last_updated(repository_confirmation)
 
+    @app.get("/contracts/drift", response_class=HTMLResponse)
+    def contracts_drift() -> str:
+        from .. import contract_drift
+        try:
+            report = contract_drift.run_drift_check(pool, settings)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return templates.contract_drift_report(
+                [], {"blocking": 0, "advisory": 0, "total": 0, "by_category": {}},
+                error=f"Drift check unavailable: {exc}")
+        return templates.contract_drift_report(
+            report["findings"], report["summary"],
+            audit_path=report["audit_path"], fe_root=report["fe_root"])
+
     # -- Docs: shared dev docs in the DB (doc_* MCP tools + dashboard editor) -- #
     def _doc_body_html(doc: dict) -> str:
         from . import docs as docsmod

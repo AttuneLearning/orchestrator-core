@@ -852,6 +852,10 @@ def contracts(overview: list[dict[str, Any]], bulk_result: Optional[dict[str, An
             "<button class='alt' type='submit' formaction='/contracts/refresh-and-approve' "
             "style='margin-top:6px' disabled>Refresh the current contracts file, then approve the import</button></form>"
             f"{result_html}"
+            "<h2>Consistency</h2>"
+            "<p class='muted'>Read-only drift report: registry vs routes/audit and the "
+            "frontend endpoint registry.</p>"
+            "<a class='alt' href='/contracts/drift'>View drift report</a>"
             f"<div style='margin-top:10px'>{summary}</div></aside>")
     return page("Contracts", f"<div class='cols'><div class='col-main'>{main}</div>{side}</div>")
 
@@ -979,6 +983,115 @@ def contract_lifecycle_history(events: list[dict[str, Any]]) -> str:
         f"<p><a href='/contracts'>Back to contracts</a></p>"
     )
     return page("Contract Lifecycle History", body)
+
+
+def contract_drift_report(findings: list[dict[str, Any]],
+                          summary: dict[str, Any],
+                          audit_path: str = "", fe_root: str = "",
+                          error: str = "") -> str:
+    """Render the read-only drift report: a blocking section and an advisory
+    section, each a table of findings, plus a counts header. Mirrors the
+    structure/escaping of contract_lifecycle_history()."""
+
+    # If error, show banner and return early
+    if error:
+        body = (
+            f"<h1>Contract Drift</h1>"
+            f"<div class='msg' style='border-color:var(--bad);color:var(--bad)'>"
+            f"{escape(error)}</div>"
+            f"<p><a href='/contracts'>Back to contracts</a></p>"
+        )
+        return page("Contract Drift", body)
+
+    # Header with audit path, FE root, and counts
+    blocking = summary.get("blocking", 0)
+    advisory = summary.get("advisory", 0)
+    total = summary.get("total", 0)
+
+    header = f"<h1>Contract Drift</h1>"
+
+    # Counts and sources info
+    info = (
+        f"<div class='msg'>Audit source: <code>{escape(audit_path)}</code></div>"
+        f"<div class='msg'>Frontend root: <code>{escape(fe_root)}</code></div>"
+        f"<div class='cards'>"
+        f"<div class='card'><div class='n'>{blocking}</div><div class='l'>blocking</div></div>"
+        f"<div class='card'><div class='n'>{advisory}</div><div class='l'>advisory</div></div>"
+        f"<div class='card'><div class='n'>{total}</div><div class='l'>total</div></div>"
+        f"</div>"
+    )
+
+    # Separate findings by severity
+    blocking_findings = [f for f in findings if f.get("severity") == "blocking"]
+    advisory_findings = [f for f in findings if f.get("severity") == "advisory"]
+
+    # Blocking findings section
+    if blocking_findings:
+        rows = "".join(
+            f"<tr><td>{escape(f.get('category', ''))}</td>"
+            f"<td>{escape(f.get('method', ''))}</td>"
+            f"<td>{escape(f.get('path', ''))}</td>"
+            f"<td>{'#' + str(f.get('contract_id')) if f.get('contract_id') else '—'}</td>"
+            f"<td>{escape(f.get('detail', ''))}</td></tr>"
+            for f in blocking_findings
+        )
+        blocking_html = (
+            f"<h2>Blocking ({len(blocking_findings)})</h2>"
+            f"<div style='overflow-x:auto'><table style='width:100%'>"
+            f"<tr><th>Category</th><th>Method</th><th>Path</th><th>Contract</th><th>Detail</th></tr>"
+            f"{rows}</table></div>"
+        )
+    else:
+        blocking_html = (
+            f"<h2>Blocking (0)</h2>"
+            f"<p class='muted'>None.</p>"
+        )
+
+    # Advisory findings section
+    if advisory_findings:
+        rows = "".join(
+            f"<tr><td>{escape(f.get('category', ''))}</td>"
+            f"<td>{escape(f.get('method', ''))}</td>"
+            f"<td>{escape(f.get('path', ''))}</td>"
+            f"<td>{'#' + str(f.get('contract_id')) if f.get('contract_id') else '—'}</td>"
+            f"<td>{escape(f.get('detail', ''))}</td></tr>"
+            for f in advisory_findings
+        )
+        advisory_html = (
+            f"<h2>Advisory ({len(advisory_findings)})</h2>"
+            f"<div style='overflow-x:auto'><table style='width:100%'>"
+            f"<tr><th>Category</th><th>Method</th><th>Path</th><th>Contract</th><th>Detail</th></tr>"
+            f"{rows}</table></div>"
+        )
+    else:
+        advisory_html = (
+            f"<h2>Advisory (0)</h2>"
+            f"<p class='muted'>None.</p>"
+        )
+
+    # By category summary
+    by_category = summary.get("by_category", {})
+    if by_category:
+        cat_items = "".join(
+            f"<li>{escape(cat)}: {count}</li>"
+            for cat, count in sorted(by_category.items())
+        )
+        category_html = (
+            f"<h2>By category</h2>"
+            f"<ul>{cat_items}</ul>"
+        )
+    else:
+        category_html = ""
+
+    body = (
+        f"{header}"
+        f"{info}"
+        f"{blocking_html}"
+        f"{advisory_html}"
+        f"{category_html}"
+        f"<p><a href='/contracts'>Back to contracts</a></p>"
+    )
+    return page("Contract Drift", body)
 
 
 def _counts_cards(label: str, counts: dict[str, int]) -> str:

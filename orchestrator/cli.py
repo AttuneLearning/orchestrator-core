@@ -605,6 +605,81 @@ def _cmd_sync_contracts(args, settings) -> int:
     return 0
 
 
+def _cmd_contracts_drift(args, settings) -> int:
+    """Read-only contract drift report for the active instance. Cross-references
+    the registry against contracts.audit.json and the frontend endpoint registry /
+    MSW mocks, printing a BLOCKING/ADVISORY report. Exits non-zero when blocking
+    findings exist and --strict is set."""
+    from . import contract_drift
+
+    pool = get_pool(settings)
+    try:
+        report = contract_drift.run_drift_check(pool, settings)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"drift check failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        # Human-readable report: header, BLOCKING section, ADVISORY section,
+        # then by-category summary.
+        findings = report["findings"]
+        summary = report["summary"]
+        audit_path = report.get("audit_path", "")
+        fe_root = report.get("fe_root", "")
+
+        # Header
+        print(f"Contract Drift Report")
+        if audit_path:
+            print(f"  audit: {audit_path}")
+        if fe_root:
+            print(f"  fe_root: {fe_root}")
+        print(f"  blocking: {summary['blocking']}, advisory: {summary['advisory']}, "
+              f"total: {summary['total']}")
+        print()
+
+        # Filter by severity
+        severity_filter = args.severity
+        blocking_findings = [f for f in findings if f["severity"] == "blocking"]
+        advisory_findings = [f for f in findings if f["severity"] == "advisory"]
+
+        # BLOCKING section
+        if severity_filter in ("blocking", "all"):
+            if blocking_findings:
+                print(f"BLOCKING ({len(blocking_findings)}):")
+                for finding in blocking_findings:
+                    contract_ref = f"(#{finding['contract_id']})" if finding["contract_id"] else "(—)"
+                    method = finding["method"] or "—"
+                    print(f"  [{finding['category']}] {method:6} {finding['path']:40} "
+                          f"{contract_ref:15} — {finding['detail']}")
+            else:
+                print("BLOCKING: None")
+            print()
+
+        # ADVISORY section
+        if severity_filter in ("advisory", "all"):
+            if advisory_findings:
+                print(f"ADVISORY ({len(advisory_findings)}):")
+                for finding in advisory_findings:
+                    contract_ref = f"(#{finding['contract_id']})" if finding["contract_id"] else "(—)"
+                    method = finding["method"] or "—"
+                    print(f"  [{finding['category']}] {method:6} {finding['path']:40} "
+                          f"{contract_ref:15} — {finding['detail']}")
+            else:
+                print("ADVISORY: None")
+            print()
+
+        # By-category summary
+        if summary.get("by_category"):
+            print("By category:")
+            for cat, count in sorted(summary["by_category"].items()):
+                print(f"  {cat}: {count}")
+
+    blocking = report["summary"]["blocking"]
+    return 1 if (args.strict and blocking) else 0
+
+
 def _cmd_backup_db(args, settings) -> int:
     from .backup import backup_database
 
@@ -1304,6 +1379,15 @@ def build_parser() -> argparse.ArgumentParser:
     cla.add_argument("--confirm-project", dest="confirm_project", default="",
                      help="type the project name to confirm destructive batches")
     cla.set_defaults(func=_cmd_contracts_lifecycle_apply)
+
+    cd = sub.add_parser("contracts-drift",
+                        help="read-only registry vs routes/audit/frontend drift report")
+    cd.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    cd.add_argument("--strict", action="store_true",
+                    help="exit 1 when blocking findings exist (CI gate)")
+    cd.add_argument("--severity", choices=("blocking", "advisory", "all"),
+                    default="all", help="filter printed findings (default: all)")
+    cd.set_defaults(func=_cmd_contracts_drift)
 
     bkp = sub.add_parser("backup-db",
                          help="backup the selected orchestrator coordinator database")
