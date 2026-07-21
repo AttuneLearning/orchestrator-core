@@ -20,7 +20,11 @@ ALLOWED: dict[str, set[str]] = {
     "proposed":   {"agreed", "rejected"},
     "agreed":     {"deprecated", "superseded", "retired"},
     "live":       {"deprecated", "superseded", "retired"},
-    "deprecated": {"superseded", "retired"},
+    # `deprecated -> agreed` is the `reinstate` recovery path: a live route that
+    # was deprecated in error can be restored to a satisfying state. Auditable
+    # like any other transition; non-destructive (moves back INTO the satisfied
+    # set), so it needs no confirmation.
+    "deprecated": {"agreed", "superseded", "retired"},
     "superseded": {"retired"},
     "retired":    set(),
     "rejected":   set(),
@@ -29,6 +33,7 @@ ALLOWED: dict[str, set[str]] = {
 # Map action names to their target statuses.
 ACTION_TO_STATUS: dict[str, str] = {
     "agree": "agreed",
+    "reinstate": "agreed",   # recover an erroneously-deprecated live route
     "reject": "rejected",
     "deprecate": "deprecated",
     "supersede": "superseded",
@@ -247,9 +252,10 @@ def validate_batch(
         )
 
     # Rule 10 (warning): canonical-route field completeness
-    # Only for action=="agree": contract must have non-empty response_dto and type_ref
+    # Any change landing in `agreed` (agree OR reinstate): contract should have
+    # non-empty response_dto and type_ref.
     for norm_change in normalized:
-        if norm_change["action"] == "agree":
+        if norm_change["to_status"] == "agreed":
             contract = contracts_by_id[norm_change["contract_id"]]
             response_dto = (contract.get("response_dto") or "").strip()
             type_ref = (contract.get("type_ref") or "").strip()

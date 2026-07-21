@@ -759,3 +759,54 @@ class TestValidateBatchIntegration:
         )
         # Both become active -> warning (not a conflict, but advisory)
         assert any("notification routes overlap" in w for w in warnings)
+
+
+# ==== reinstate (deprecated -> agreed) recovery path ====
+
+class TestReinstate:
+    """The `reinstate` action recovers an erroneously-deprecated live route."""
+
+    def test_reinstate_transition_allowed(self):
+        assert lifecycle.can_transition("deprecated", "agreed") is True
+
+    def test_reinstate_action_maps_to_agreed(self):
+        assert lifecycle.ACTION_TO_STATUS["reinstate"] == "agreed"
+
+    def test_reinstate_is_not_destructive(self):
+        # Moving back INTO the satisfied set needs no confirmation.
+        assert lifecycle.is_destructive("reinstate", "deprecated") is False
+
+    def test_reinstate_validates(self):
+        contracts = {1: _contract(1, path="/users/me/notifications",
+                                   status="deprecated")}
+        normalized, conflicts, warnings = lifecycle.validate_batch(
+            [_change(1, "reinstate")], contracts, "test-project")
+        assert conflicts == []
+        assert normalized[0]["to_status"] == "agreed"
+        assert normalized[0]["from_status"] == "deprecated"
+        assert normalized[0]["destructive"] is False
+
+    def test_reinstate_missing_metadata_warns(self):
+        # Rule 10 fires for anything landing in `agreed`, incl. reinstate.
+        contracts = {1: _contract(1, status="deprecated",
+                                  response_dto="", type_ref="")}
+        _, conflicts, warnings = lifecycle.validate_batch(
+            [_change(1, "reinstate")], contracts, "test-project")
+        assert conflicts == []
+        assert any("missing response_dto/type_ref" in w for w in warnings)
+
+    def test_reinstate_replacement_before_supersede(self):
+        # The #98 shape: reinstate the /users/me route and supersede the
+        # top-level one that points at it, in one batch.
+        contracts = {
+            3: _contract(3, path="/notifications", status="deprecated"),
+            6: _contract(6, path="/users/me/notifications", status="deprecated"),
+        }
+        normalized, conflicts, warnings = lifecycle.validate_batch(
+            [_change(6, "reinstate"),
+             _change(3, "supersede", replacement_contract_id=6)],
+            contracts, "cadencelms-working")
+        assert conflicts == []
+        # No post-batch active duplicate: #3 superseded, #6 agreed on a
+        # different normalized route.
+        assert not any("active duplicate" in c for c in conflicts)
