@@ -100,6 +100,18 @@ def _launcher_template_root(orchestrator_path: str | None = None) -> Path:
     return base / "templates" / "project-launchers"
 
 
+# Per-project files install-launchers must never overwrite (only seed when
+# absent): each workspace customizes these (dashboard URL, tier, secrets,
+# YOLO flags). A --force push that clobbered them would destroy per-project
+# config — the env-clobber gap closed by the durable-worker plan (§8).
+_PRESERVE_IF_PRESENT = ("orchestrator.env", "secrets.env")
+_PRESERVE_SUFFIXES = ("-yolo.env",)
+
+
+def _is_preserved(rel: "Path") -> bool:
+    return rel.name in _PRESERVE_IF_PRESENT or rel.name.endswith(_PRESERVE_SUFFIXES)
+
+
 def _launcher_copy_plan(
     src: Path,
     workspace: Path,
@@ -118,6 +130,8 @@ def _launcher_copy_plan(
         if "__pycache__" in rel.parts or rel.suffix == ".pyc":
             continue
         dest = workspace / rel
+        if dest.exists() and _is_preserved(rel):
+            continue  # per-project file: seed only when absent, never overwrite
         if dest.exists() and not force:
             raise FileExistsError(f"exists, not overwriting: {dest} (use --force)")
         planned.append((path, dest))
@@ -133,8 +147,12 @@ def _write_launcher_plan(
         text = path.read_text()
         for key, val in replacements.items():
             text = text.replace(key, val)
-        dest.write_text(text)
-        subprocess.run(["chmod", "+x", str(dest)], check=False)
+        # Atomic replace: running shells keep the old inode; readers never see
+        # a truncated file mid-write.
+        tmp = dest.parent / (dest.name + ".tmp-install")
+        tmp.write_text(text)
+        subprocess.run(["chmod", "+x", str(tmp)], check=False)
+        os.replace(tmp, dest)
         print("wrote", dest)
 
 

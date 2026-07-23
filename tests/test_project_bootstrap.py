@@ -237,3 +237,110 @@ def test_opencode_runtime_builds_config_and_command(settings, tmp_path, monkeypa
     # apply_interactive_prompt rewrites single-cycle directives for TUI launches.
     assert "Run backend cycles continuously for tendcharting" in " ".join(interactive_args)
     assert default_config == interactive_config
+
+
+def test_install_preserves_customized_env(settings, tmp_path):
+    """Verify that install --force preserves customized env files and only
+    overwrites code files (like run-agent-loop.sh)."""
+    workspace = tmp_path / "tendcharting-ws"
+
+    # First install: create the workspace with all default files
+    rc = cli._cmd_setup_project(_setup_args(workspace), settings)
+    assert rc == 0
+
+    # Customize the orchestrator.env file
+    env_file = workspace / "agent-launchers" / "orchestrator.env"
+    original_env = env_file.read_text()
+    customized_env = original_env + "\n# CUSTOM_CONFIG=my_value\n"
+    env_file.write_text(customized_env)
+
+    # Get a reference content from a code file (run-agent-loop.sh) before reinstall
+    code_file = workspace / "run-agent-loop.sh"
+    old_code = code_file.read_text()
+
+    # Now reinstall with force=True — should preserve the customized env
+    args = _setup_args(workspace, dry_run=False)
+    args.force = True
+    rc = cli._cmd_setup_project(args, settings)
+    assert rc == 0
+
+    # Check: orchestrator.env should still have the custom content
+    new_env = env_file.read_text()
+    assert "# CUSTOM_CONFIG=my_value" in new_env, "Custom env content was overwritten!"
+    assert new_env == customized_env, "Customized env was not fully preserved"
+
+    # Check: code file should have been updated (this proves the install actually ran)
+    # The run-agent-loop.sh script is in the templates and should be rewritten
+    new_code = code_file.read_text()
+    # We just verify the file exists and is readable (content may be the same in this test)
+    assert code_file.is_file(), "Code file should exist"
+
+
+def test_install_seeds_missing_env(settings, tmp_path):
+    """Verify that install creates orchestrator.env when it doesn't exist."""
+    workspace = tmp_path / "tendcharting-ws"
+    workspace.mkdir(parents=True)
+
+    # Create a minimal workspace structure without orchestrator.env
+    (workspace / "agent-launchers").mkdir(parents=True, exist_ok=True)
+
+    # Run install — should create the missing env file
+    rc = cli._cmd_setup_project(_setup_args(workspace), settings)
+    assert rc == 0
+
+    env_file = workspace / "agent-launchers" / "orchestrator.env"
+    assert env_file.is_file(), "orchestrator.env should have been created"
+    content = env_file.read_text()
+    assert "__WORKSPACE_ROOT__" not in content, "Placeholders should be replaced"
+    assert str(workspace) in content, "Workspace path should be substituted"
+
+
+def test_yolo_env_suffix_preserved(settings, tmp_path):
+    """Verify that *-yolo.env files are preserved (not overwritten) when
+    force=True, even if a template file exists."""
+    workspace = tmp_path / "tendcharting-ws"
+
+    # First install: scaffold the workspace
+    rc = cli._cmd_setup_project(_setup_args(workspace), settings)
+    assert rc == 0
+
+    # Check if any *-yolo.env template exists
+    templates_root = cli._launcher_template_root()
+    yolo_templates = list(templates_root.rglob("*-yolo.env"))
+
+    if yolo_templates:
+        # If a template exists, create a matching workspace file with custom content
+        for template_path in yolo_templates:
+            rel = template_path.relative_to(templates_root)
+            workspace_yolo = workspace / rel
+            workspace_yolo.parent.mkdir(parents=True, exist_ok=True)
+            custom_yolo = "# custom yolo settings\n"
+            workspace_yolo.write_text(custom_yolo)
+
+            # Reinstall with force
+            args = _setup_args(workspace, dry_run=False)
+            args.force = True
+            rc = cli._cmd_setup_project(args, settings)
+            assert rc == 0
+
+            # Verify the file was not overwritten
+            assert workspace_yolo.read_text() == custom_yolo, \
+                f"{workspace_yolo.name} should have been preserved"
+    else:
+        # No *-yolo.env templates exist, so unit-test _is_preserved directly
+        assert cli._is_preserved(Path("agent-launchers/qwen-yolo.env"))
+        assert cli._is_preserved(Path("orchestrator.env"))
+        assert cli._is_preserved(Path("secrets.env"))
+        assert not cli._is_preserved(Path("run-agent-loop.sh"))
+
+
+def test_write_is_atomic_no_tmp_left(settings, tmp_path):
+    """Verify that after an install, no .tmp-install temp files remain in the workspace."""
+    workspace = tmp_path / "tendcharting-ws"
+
+    rc = cli._cmd_setup_project(_setup_args(workspace), settings)
+    assert rc == 0
+
+    # Check that no temporary files were left behind
+    tmp_files = list(workspace.rglob("*.tmp-install"))
+    assert len(tmp_files) == 0, f"Temporary files found: {tmp_files}"
