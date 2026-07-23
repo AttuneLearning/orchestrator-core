@@ -980,6 +980,39 @@ def create_app(pool: Optional[ConnectionPool] = None,
         repo.bump_wake(pool, context.current_key())
         return RedirectResponse("/agents", status_code=303)
 
+    @app.post("/alerts")
+    def post_alert(agent_id: int = Form(...), subject: str = Form(...),
+                   body: str = Form("")):
+        """JSON POST target for durable-worker side-cars (plan §6/§C) — they
+        have no MCP access, so this is how e.g. an opencode balance/credit
+        exhaustion reaches a human. Mirrors the engine's own off-rails alert
+        pattern EXACTLY (repo.create_message(..., to_team="orch-monitor",
+        kind="request", status="pending") — see Engine._maybe_close_goal in
+        engine/loop.py): it lands in the same messages table row shape, shows
+        up on the /orch/monitor Correspondence pane and in comms_read, per
+        ADR-ORCH-006 (failures surface to Correspondence, never silently
+        paused). from_team identifies the reporting side-car so a human can
+        tell which agent/project without opening the body.
+
+        Never 500s: FastAPI's own Form(...) validation already turns a
+        missing agent_id/subject into a 422 (not a 500) before this body
+        runs; any unexpected failure in create_message itself is caught and
+        reported as a 400 rather than propagating."""
+        try:
+            repo.create_message(
+                pool,
+                from_team=f"sidecar-agent-{agent_id}",
+                to_team="orch-monitor",
+                subject=subject,
+                body=body,
+                priority="high",
+                kind="request",
+                status="pending",
+            )
+        except Exception as exc:  # noqa: BLE001 — report, never 500
+            return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True})
+
     @app.get("/tiers", response_class=HTMLResponse)
     def tiers() -> str:
         return templates.tiers_page(repo.worker_tier_stats(pool))

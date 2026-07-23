@@ -12,7 +12,9 @@ model calls.
 from __future__ import annotations
 
 import importlib.util
+import re
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -84,6 +86,16 @@ class FakeAdapter(sidecar.Adapter):
         self.marker_raise_count = 0   # MAJOR 2 (opus re-review): raise this
                                        # many times on completion_marker()
                                        # before succeeding again
+        self.marker_flip_remaining = 0   # QA fix (finding 7a tests): the next
+                                          # N completion_marker() calls return
+                                          # a distinct bogus/"unsettled" value
+                                          # instead of the real one, to model
+                                          # a mid-render/animated read.
+        self.force_not_idle = False      # QA fix (finding 7b tests): is_idle()
+                                          # always reads False regardless of
+                                          # `busy`, to model whole-tail hash
+                                          # instability at an otherwise-idle
+                                          # prompt.
 
         # -- Phase 3: scripted usage + session-id tracking ---------------
         # `usage_queue` is consumed one entry per get_usage() call (FIFO);
@@ -95,10 +107,16 @@ class FakeAdapter(sidecar.Adapter):
         self._session_counter = 0
         self.session_id = f"sess-{self._session_counter}"
 
+        # -- Phase 5: scripted last_error() for the balance-alert path -----
+        self._last_error: tuple[str, str] | None = None
+        self.raise_on_last_error = False
+
     def ensure_worker(self) -> None:
         pass
 
     def is_idle(self) -> bool:
+        if self.force_not_idle:
+            return False
         return not self.busy
 
     def inject(self, text: str) -> None:
@@ -119,7 +137,11 @@ class FakeAdapter(sidecar.Adapter):
         if self.marker_raise_count > 0:
             self.marker_raise_count -= 1
             raise RuntimeError("fake completion_marker failure")
-        return str(self._completion_counter) if self._completion_counter else None
+        value = str(self._completion_counter) if self._completion_counter else None
+        if self.marker_flip_remaining > 0 and value is not None:
+            self.marker_flip_remaining -= 1
+            return f"{value}-flip"
+        return value
 
     def clear(self) -> None:
         if self.raise_on_clear:
@@ -140,6 +162,14 @@ class FakeAdapter(sidecar.Adapter):
 
     def current_session_id(self) -> str | None:
         return self.session_id
+
+    def last_error(self) -> tuple[str, str] | None:
+        if self.raise_on_last_error:
+            raise RuntimeError("fake last_error failure")
+        return self._last_error
+
+    def set_last_error(self, name: str, message: str) -> None:
+        self._last_error = (name, message)
 
     def alive(self) -> bool:
         return self.alive_flag
@@ -178,6 +208,14 @@ class FakeDashboard:
             "poll_interval_seconds": poll_interval_seconds,
         }
         self.wake_at = None               # Phase 4: ISO string or None
+        self.agent_id = 1                 # Phase 5: DashboardClient shape
+        self.project = "proj"
+
+        # -- Phase 5: balance-alert (plan §6) — records of pause()/alert() --
+        self.pause_calls: list[dict] = []
+        self.alert_calls: list[dict] = []
+        self.pause_fail = False
+        self.alert_fail = False
 
     def heartbeat(self, status=None) -> bool:
         self.heartbeat_count += 1
@@ -193,6 +231,42 @@ class FakeDashboard:
         if self.wake_at is not None:
             payload["wake_at"] = self.wake_at
         return payload
+
+    def pause(self, minutes=120) -> bool:
+        self.pause_calls.append({"minutes": minutes})
+        return not self.pause_fail
+
+    def alert(self, subject: str, body: str = "") -> bool:
+        self.alert_calls.append({"subject": subject, "body": body})
+        return not self.alert_fail
+
+
+class FakeTmuxRunner:
+    """Stands in for TmuxAdapter's injectable `tmux_runner` seam (self._tmux)
+    -- records every call (the full argv, e.g. ["tmux", "capture-pane", "-p",
+    ...]) and returns a scripted `subprocess.CompletedProcess` keyed by the
+    tmux subcommand (args[1]). `script()` sets the STEADY response for a
+    subcommand -- every call to it returns that response until script() is
+    called again for the same subcommand (so a test can change what
+    `capture-pane` returns mid-test to simulate new pane output). Unscripted
+    subcommands default to a bare success with empty stdout."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self._responses: dict[str, tuple[int, str, str]] = {}
+
+    def script(self, subcommand: str, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self._responses[subcommand] = (returncode, stdout, stderr)
+
+    def __call__(self, args: list[str]) -> subprocess.CompletedProcess:
+        self.calls.append(list(args))
+        sub = args[1] if len(args) > 1 else ""
+        rc, out, err = self._responses.get(sub, (0, "", ""))
+        return subprocess.CompletedProcess(args=args, returncode=rc, stdout=out, stderr=err)
+
+    # -- test helpers -------------------------------------------------------
+    def calls_for(self, subcommand: str) -> list[list[str]]:
+        return [c for c in self.calls if len(c) > 1 and c[1] == subcommand]
 
 
 def make_sidecar(adapter=None, dashboard=None, clock=None, **overrides):
@@ -1509,3 +1583,862 @@ def test_policy_cadence_window_out_of_bounds_keeps_cli_value():
 
     assert sc.active_window == 1800
     assert sc.dormant_interval == 3600
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5: TmuxAdapter (plan §5 + §12) — driven entirely through
+# FakeTmuxRunner, never a real tmux binary.
+# --------------------------------------------------------------------------- #
+
+def make_tmux_adapter(runner=None, clock=None, **overrides):
+    runner = runner or FakeTmuxRunner()
+    clock = clock or FakeClock(0.0)
+    kwargs = dict(tmux_target="agents:1.0", spawn_cmd="claude --dangerously-skip-permissions",
+                  project="proj", agent_id=7, idle_quiet_seconds=10,
+                  tmux_runner=runner, clock=clock)
+    kwargs.update(overrides)
+    adapter = sidecar.TmuxAdapter(**kwargs)
+    return adapter, runner, clock
+
+
+def test_tmux_alive_true_when_pane_running_tui():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("display-message", stdout="claude\n")
+    assert adapter.alive() is True
+
+
+def test_tmux_alive_false_when_pane_is_bare_shell():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("display-message", stdout="bash\n")
+    assert adapter.alive() is False
+
+
+def test_tmux_alive_false_when_display_message_fails():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("display-message", returncode=1, stderr="can't find pane")
+    assert adapter.alive() is False
+
+
+# --------------------------------------------------------------------------- #
+# BUGFIX (coordinator live-tmux e2e report): a bash-driven fake-TUI/wrapper
+# reports pane_current_command == "bash" for its ENTIRE healthy lifetime --
+# the bare-shell-means-dead heuristic must not fire when that IS what we
+# expect to see (spawn_cmd itself launches a shell), only when we expect a
+# real TUI and see a shell instead (the unambiguous "it died" case).
+# --------------------------------------------------------------------------- #
+
+def test_tmux_alive_true_for_shell_driven_spawn_cmd_even_when_pane_shows_shell():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="bash /path/to/fake-tui.sh")
+    runner.script("display-message", stdout="bash\n")
+    assert adapter.alive() is True
+
+
+def test_tmux_alive_true_for_shell_driven_spawn_cmd_regardless_of_shell_flavor():
+    # expected="zsh" (itself a shell) -- observed "bash" differs from
+    # expected but is STILL a shell, so still counts as alive under the same
+    # "can't tell shell-running-script from shell-after-exit" reasoning.
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="zsh -c 'echo hi'")
+    runner.script("display-message", stdout="bash\n")
+    assert adapter.alive() is True
+
+
+def test_tmux_alive_true_when_observed_command_matches_expected_exactly():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="claude --dangerously-skip-permissions")
+    runner.script("display-message", stdout="claude\n")
+    assert adapter.alive() is True
+
+
+def test_tmux_alive_false_when_real_tui_expected_but_shell_observed():
+    # Unchanged: a genuine non-shell TUI (claude/codex) that dropped back to
+    # a bare shell is still correctly detected as dead.
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="claude --dangerously-skip-permissions")
+    runner.script("display-message", stdout="bash\n")
+    assert adapter.alive() is False
+
+
+def test_tmux_alive_false_without_spawn_cmd_bare_shell_unchanged():
+    # No spawn_cmd configured (nothing to compare against) -- falls back to
+    # the plain heuristic, unchanged from before this fix.
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd=None)
+    runner.script("display-message", stdout="bash\n")
+    assert adapter.alive() is False
+
+
+def test_tmux_ensure_worker_noop_for_shell_driven_spawn_cmd_already_running():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="bash fake-tui.sh")
+    runner.script("display-message", stdout="bash\n")
+    adapter.ensure_worker()
+    assert not runner.calls_for("respawn-pane")
+
+
+def test_tmux_ensure_worker_noop_when_alive():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("display-message", stdout="claude\n")
+    adapter.ensure_worker()
+    assert not runner.calls_for("respawn-pane")
+
+
+def test_tmux_ensure_worker_respawns_when_dead_with_spawn_cmd():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="claude --foo")
+    runner.script("display-message", stdout="bash\n")     # dead TUI, bare shell left behind
+    adapter.ensure_worker()
+    # finding 6: respawn ALWAYS goes through an explicit bash -lc, never the
+    # pane's own default shell, since spawn_cmd may itself be a composite
+    # shell command line (env K=V ... claude ...) only a real shell can parse.
+    assert runner.calls_for("respawn-pane") == [
+        ["tmux", "respawn-pane", "-k", "-t", "agents:1.0", "bash", "-lc", "claude --foo"]
+    ]
+
+
+def test_tmux_ensure_worker_raises_without_spawn_cmd_when_dead():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd=None)
+    runner.script("display-message", stdout="bash\n")
+    with pytest.raises(RuntimeError):
+        adapter.ensure_worker()
+    assert not runner.calls_for("respawn-pane")
+
+
+def test_tmux_is_idle_requires_stability_window():
+    adapter, runner, clock = make_tmux_adapter(idle_quiet_seconds=10)
+    runner.script("capture-pane", stdout="same output\n")
+
+    assert adapter.is_idle() is False   # first observation just establishes the baseline
+    clock.advance(5)
+    assert adapter.is_idle() is False   # stable, but not long enough yet
+    clock.advance(6)
+    assert adapter.is_idle() is True    # stable >= idle_quiet_seconds now
+
+
+def test_tmux_is_idle_resets_on_output_change():
+    adapter, runner, clock = make_tmux_adapter(idle_quiet_seconds=10)
+    runner.script("capture-pane", stdout="A\n")
+    adapter.is_idle()
+    clock.advance(11)
+    assert adapter.is_idle() is True
+
+    runner.script("capture-pane", stdout="B\n")   # new output -> stability resets
+    assert adapter.is_idle() is False
+    clock.advance(11)
+    assert adapter.is_idle() is True
+
+
+def test_tmux_is_idle_false_on_capture_failure():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", returncode=1, stderr="no server running on socket")
+    assert adapter.is_idle() is False
+
+
+# --------------------------------------------------------------------------- #
+# QA fix (finding 1): completion_marker() is now an adapter-LOCAL monotonic
+# counter (never None -- raises on capture failure only), immune to
+# capture-pane scrollback truncation regressing it.
+# --------------------------------------------------------------------------- #
+
+def test_tmux_completion_marker_returns_string_zero_not_none_when_no_markers_yet():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", stdout="just some ordinary chatter\n")
+    marker = adapter.completion_marker()
+    assert marker == "0"
+    assert isinstance(marker, str)
+
+
+def test_tmux_completion_marker_increments_once_when_markers_first_appear():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", stdout="waiting...\n")
+    baseline = adapter.completion_marker()
+    assert baseline == "0"
+
+    runner.script("capture-pane", stdout="waiting...\nTICK RESULT: NO WORK\n")
+    after = adapter.completion_marker()
+    assert after == "1"
+    assert after != baseline
+
+
+def test_tmux_completion_marker_monotonic_across_multiple_real_completions():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", stdout="TICK RESULT: NO WORK\n")
+    m1 = adapter.completion_marker()
+    runner.script("capture-pane", stdout="TICK RESULT: NO WORK\nTICK RESULT: WORKED #2\n")
+    m2 = adapter.completion_marker()
+    runner.script("capture-pane",
+                  stdout="TICK RESULT: NO WORK\nTICK RESULT: WORKED #2\nTICK RESULT: NO WORK\n")
+    m3 = adapter.completion_marker()
+    assert [m1, m2, m3] == ["1", "2", "3"]
+
+
+def test_tmux_completion_marker_truncation_count_drop_same_hash_is_no_op():
+    # Simulates capture-pane's `-S -N` scrollback window sliding: an OLDER
+    # marker (+ its context) falls off the front, but the NEWEST marker line
+    # + its trailing context is byte-identical to what was already seen --
+    # count regresses (2 -> 1) with an UNCHANGED hash. Must NOT register as
+    # a change (that would be a false completion/regression), and must NOT
+    # move the reference state either (so a later REAL increase is still
+    # measured against the true, pre-truncation peak).
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane",
+                  stdout="TICK RESULT: NO WORK\nsome context\nTICK RESULT: WORKED #1\n"
+                         "trailing1\ntrailing2\n")
+    first = adapter.completion_marker()
+    assert first == "1"     # first-ever observation: 0 -> 2 markers registers as ONE bump
+
+    runner.script("capture-pane",
+                  stdout="TICK RESULT: WORKED #1\ntrailing1\ntrailing2\n")
+    second = adapter.completion_marker()
+    assert second == first == "1"   # truncation -- no new completion, no change
+
+    # Prove the reference state truly wasn't touched: a genuine new marker
+    # bringing the count back up to 2 (this time for real) still registers
+    # as an increase relative to the ORIGINAL peak of 2, not the truncated 1.
+    runner.script("capture-pane",
+                  stdout="TICK RESULT: WORKED #1\ntrailing1\ntrailing2\nTICK RESULT: WORKED #3\n")
+    third = adapter.completion_marker()
+    assert third == "2"
+
+
+def test_tmux_completion_marker_count_increase_registers_change_for_identical_marker_text():
+    # The "identical-consecutive-NO-WORK" case: the marker line's own text
+    # is byte-for-byte the same both times, so a hash-of-the-marker-line-
+    # alone scheme would miss it -- but the raw COUNT still increases (a
+    # second, genuinely new "TICK RESULT: NO WORK" line appeared), which
+    # alone is sufficient to register a change.
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", stdout="TICK RESULT: NO WORK\n")
+    first = adapter.completion_marker()
+    assert first == "1"
+
+    runner.script("capture-pane", stdout="TICK RESULT: NO WORK\nTICK RESULT: NO WORK\n")
+    second = adapter.completion_marker()
+    assert second == "2"
+    assert second != first
+
+
+def test_tmux_completion_marker_raises_on_capture_failure():
+    # BLOCKER 1 contract (shared with OpencodeAdapter): raising here is what
+    # lets the Sidecar map this to _BASELINE_UNKNOWN and recover later.
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", returncode=1, stderr="tmux server gone")
+    with pytest.raises(RuntimeError):
+        adapter.completion_marker()
+
+
+def test_tmux_inject_uses_load_buffer_paste_buffer_then_enter_never_raw_text():
+    # buffer name namespaced by project+agent_id (finding 4) -- see the
+    # dedicated buffer-name tests below for the sanitization behavior.
+    adapter, runner, clock = make_tmux_adapter(project="proj", agent_id=42)
+    adapter.inject("do the thing " * 50)   # long text must never hit send-keys directly
+
+    load_calls = runner.calls_for("load-buffer")
+    paste_calls = runner.calls_for("paste-buffer")
+    enter_calls = runner.calls_for("send-keys")
+    assert len(load_calls) == 1
+    assert load_calls[0][2:4] == ["-b", "sidecar-proj-42"]
+    assert len(paste_calls) == 1
+    assert "-d" in paste_calls[0] and "-t" in paste_calls[0] and "agents:1.0" in paste_calls[0]
+    assert len(enter_calls) == 1
+    assert enter_calls[0][-1] == "Enter"
+    assert not any("do the thing" in " ".join(c) for c in enter_calls)
+
+
+def test_tmux_inject_raises_when_load_buffer_fails():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("load-buffer", returncode=1, stderr="no such buffer file")
+    with pytest.raises(RuntimeError):
+        adapter.inject("text")
+
+
+def test_tmux_clear_sends_slash_clear_via_send_keys_not_paste_buffer():
+    adapter, runner, clock = make_tmux_adapter()
+    adapter.clear()
+    enter_calls = runner.calls_for("send-keys")
+    assert enter_calls and enter_calls[-1][-2:] == ["/clear", "Enter"]
+    assert not runner.calls_for("paste-buffer")
+
+
+def test_tmux_clear_raises_on_send_keys_failure():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("send-keys", returncode=1, stderr="no pane")
+    with pytest.raises(RuntimeError):
+        adapter.clear()
+
+
+def test_tmux_clear_resets_usage_and_idle_tracking():
+    adapter, runner, clock = make_tmux_adapter()
+    adapter.inject("x" * 40)
+    assert adapter.get_usage()["context_tokens"] > 0
+    runner.script("capture-pane", stdout="steady\n")
+    adapter.is_idle()
+
+    adapter.clear()
+
+    assert adapter.get_usage()["context_tokens"] == 0
+    assert adapter.last_output_change() is None
+
+
+def test_tmux_restart_requires_spawn_cmd():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd=None)
+    with pytest.raises(RuntimeError):
+        adapter.restart()
+    assert not runner.calls_for("respawn-pane")
+
+
+def test_tmux_restart_respawns_and_resets_state():
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd="claude --resume")
+    adapter.inject("hello")
+    adapter.restart()
+    assert runner.calls_for("respawn-pane") == [
+        ["tmux", "respawn-pane", "-k", "-t", "agents:1.0", "bash", "-lc", "claude --resume"]
+    ]
+    assert adapter.get_usage()["context_tokens"] == 0
+
+
+def test_tmux_respawn_passes_bash_lc_as_separate_argv_no_extra_quoting():
+    # finding 6: bash/-lc/spawn_cmd must be THREE separate argv items handed
+    # straight to the tmux runner -- no additional shell-quoting applied to
+    # spawn_cmd here (that would double-escape whatever quoting spawn_cmd
+    # itself already carries, e.g. from --print-cmd's %q output).
+    spawn = 'env MCP_TOOL_TIMEOUT=3300000 claude --dangerously-skip-permissions "hello world"'
+    adapter, runner, clock = make_tmux_adapter(spawn_cmd=spawn)
+    runner.script("display-message", stdout="bash\n")
+    adapter.ensure_worker()
+    call = runner.calls_for("respawn-pane")[0]
+    assert call[-3:] == ["bash", "-lc", spawn]   # spawn_cmd passed through byte-for-byte
+
+
+def test_tmux_get_usage_monotonic_across_inject_and_read_result():
+    adapter, runner, clock = make_tmux_adapter()
+    adapter.inject("12345678")  # 8 chars
+    u1 = adapter.get_usage()
+    runner.script("capture-pane", stdout="A" * 40)
+    adapter.read_result()
+    u2 = adapter.get_usage()
+    assert u2["context_tokens"] >= u1["context_tokens"]
+    assert u2["session_cost"] == 0.0
+
+
+def test_tmux_read_result_returns_tail_lines_and_none_on_empty():
+    adapter, runner, clock = make_tmux_adapter(result_lines=2)
+    runner.script("capture-pane", stdout="l1\nl2\nl3\n")
+    assert adapter.read_result() == "l2\nl3"
+
+    runner.script("capture-pane", stdout="")
+    assert adapter.read_result() is None
+
+
+def test_tmux_read_result_returns_none_on_capture_failure():
+    adapter, runner, clock = make_tmux_adapter()
+    runner.script("capture-pane", returncode=1, stderr="gone")
+    assert adapter.read_result() is None
+
+
+def test_tmux_shutdown_kills_pane_only_when_requested():
+    adapter, runner, clock = make_tmux_adapter()
+    adapter.shutdown(kill_worker=False)
+    assert not runner.calls_for("kill-pane")
+    adapter.shutdown(kill_worker=True)
+    assert runner.calls_for("kill-pane")
+
+
+def test_cli_tmux_runtime_requires_tmux_target():
+    with pytest.raises(SystemExit):
+        sidecar.main(["--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+                      "--prompt-file", str(Path(__file__)), "--runtime", "tmux"])
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5: opencode balance/credit-exhaustion alert (plan §6)
+# --------------------------------------------------------------------------- #
+
+def test_balance_alert_fires_pauses_and_posts_alert(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)                                    # tick #1 injected
+    adapter.set_last_error("APIError", "insufficient balance for this request")
+    adapter.complete("TICK RESULT: NO WORK (balance)")
+    sc.step(clock.t)                                     # collect -> balance check runs
+
+    assert dashboard.pause_calls == [{"minutes": 120}]
+    assert len(dashboard.alert_calls) == 1
+    assert "insufficient balance" in dashboard.alert_calls[0]["body"].lower()
+    out = capsys.readouterr().out
+    assert "BALANCE_ALERT" in out
+
+
+def test_balance_alert_no_match_does_not_fire():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.set_last_error("SomeOtherError", "the model timed out")
+    adapter.complete("TICK RESULT: NO WORK (other)")
+    sc.step(clock.t)
+    assert dashboard.pause_calls == []
+    assert dashboard.alert_calls == []
+
+
+def test_balance_alert_rate_limited_to_once_per_hour():
+    # Exercises Sidecar._check_balance_alert directly (rather than round-
+    # tripping full ticks across an hour of fake clock, which would also
+    # cross the 30-min active-window and go DORMANT -- an orthogonal
+    # mechanism this test isn't about): the cooldown itself is what's
+    # under test.
+    sc, adapter, dashboard, clock = make_sidecar()
+    adapter.set_last_error("APIError", "insufficient credit")
+
+    sc._check_balance_alert(clock.t)
+    assert len(dashboard.pause_calls) == 1
+    assert len(dashboard.alert_calls) == 1
+
+    # Still erroring, well within the hour -- must NOT re-fire.
+    clock.advance(300)
+    sc._check_balance_alert(clock.t)
+    assert len(dashboard.pause_calls) == 1
+    assert len(dashboard.alert_calls) == 1
+
+    # An hour later, still erroring -- fires again.
+    clock.advance(3601)
+    sc._check_balance_alert(clock.t)
+    assert len(dashboard.pause_calls) == 2
+    assert len(dashboard.alert_calls) == 2
+
+
+def test_balance_alert_does_not_enter_dormant():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.set_last_error("APIError", "insufficient quota")
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.t)
+    assert sc.state == "ACTIVE"     # no dormant-until-reset: cost exhaustion has no rollover
+
+
+def test_balance_alert_checked_after_inject_error_too():
+    sc, adapter, dashboard, clock = make_sidecar()
+    adapter.raise_on_inject = True
+    adapter.set_last_error("APIError", "payment required (402)")
+    sc.step(clock.t)                # inject fails -> INJECT_ERROR -> balance check runs
+
+    assert dashboard.pause_calls == [{"minutes": 120}]
+    assert len(dashboard.alert_calls) == 1
+
+
+def test_balance_alert_last_error_raising_is_swallowed():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.raise_on_last_error = True
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.t)                 # must not raise; no pause/alert either
+    assert dashboard.pause_calls == []
+    assert dashboard.alert_calls == []
+
+
+def test_balance_alert_none_when_no_error():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.t)
+    assert dashboard.pause_calls == []
+    assert dashboard.alert_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# BUGFIX (coordinator live-tmux e2e report): restart cooldown. Nothing
+# bounded restart FREQUENCY -- a persistent alive()-false (or a crash-
+# looping TUI) restarted every ~3 probes, seconds apart. For a real
+# claude/codex session each respawn replays the initial prompt (token burn +
+# session churn). _restart() now enforces a minimum number of seconds
+# between actual restarts; a restart that would fire within the cooldown is
+# logged (RESTART_SUPPRESSED) and skipped WITHOUT resetting the counters
+# that triggered it, so it fires as soon as the cooldown lapses.
+# --------------------------------------------------------------------------- #
+
+def test_restart_cooldown_default_matches_documented_constant():
+    sc, adapter, dashboard, clock = make_sidecar()
+    assert sc.restart_cooldown == sidecar.DEFAULT_RESTART_COOLDOWN_S == 120
+
+
+def test_restart_cooldown_limits_persistent_alive_failure_storm(capsys):
+    sc, adapter, dashboard, clock = make_sidecar(restart_cooldown=10)
+    adapter.alive_flag = False   # persistently dead: every probe fails, forever
+
+    for _ in range(13):
+        clock.advance(1)
+        sc.step(clock.t)
+
+    # t=3: 3rd consecutive failure -- first restart, never suppressed (no
+    #   prior restart to be within cooldown of).
+    # t=6..12: threshold re-reached every step thereafter (the failure
+    #   counter is never reset by a SUPPRESSED restart), but each is still
+    #   within the 10s cooldown of the t=3 restart -> 7 suppressed events.
+    # t=13: 13-3=10 >= cooldown -> fires for real (2nd restart).
+    assert adapter.restart_count == 2
+    out = capsys.readouterr().out
+    assert out.count("RESTART_SUPPRESSED") == 7
+
+    for _ in range(10):
+        clock.advance(1)
+        sc.step(clock.t)
+    # The storm continues (still persistently dead) -- exactly one more
+    # restart lands per cooldown window, not one per 3-probe threshold.
+    assert adapter.restart_count == 3
+
+
+def test_restart_cooldown_zero_disables_suppression_immediate_behavior():
+    sc, adapter, dashboard, clock = make_sidecar(restart_cooldown=0)
+    adapter.alive_flag = False
+
+    for _ in range(9):     # 3 threshold-crossings, 3 probes apart each
+        clock.advance(1)
+        sc.step(clock.t)
+
+    # cooldown=0 restores the pre-fix behavior: every threshold-crossing
+    # restarts immediately, none suppressed.
+    assert adapter.restart_count == 3
+
+
+def test_restart_cooldown_zero_never_logs_suppressed(capsys):
+    sc, adapter, dashboard, clock = make_sidecar(restart_cooldown=0)
+    adapter.alive_flag = False
+    for _ in range(9):
+        clock.advance(1)
+        sc.step(clock.t)
+    out = capsys.readouterr().out
+    assert "RESTART_SUPPRESSED" not in out
+
+
+def test_restart_cooldown_applies_to_owned_process_dead_fast_path(capsys):
+    # The owned-process-dead path bypasses the alive()-flap DEBOUNCE (it's a
+    # confirmed-dead fast path, not a flaky probe), but it must still go
+    # through the same cooldown as every other restart trigger -- otherwise
+    # a persistently-dead owned subprocess would restart-storm every step.
+    sc, adapter, dashboard, clock = make_sidecar(restart_cooldown=50)
+    adapter.owns_process = True
+    adapter.proc_dead = True     # permanently "confirmed dead"
+
+    sc.step(clock.t)                       # t=0: first restart, no cooldown yet
+    assert adapter.restart_count == 1
+
+    clock.advance(10)
+    sc.step(clock.t)                       # t=10: elapsed 10 < 50 -> suppressed
+    assert adapter.restart_count == 1
+    out = capsys.readouterr().out
+    assert "RESTART_SUPPRESSED" in out
+
+    clock.advance(50)
+    sc.step(clock.t)                       # t=60: elapsed 60 >= 50 -> fires again
+    assert adapter.restart_count == 2
+
+
+def test_cli_rejects_negative_restart_cooldown(capsys):
+    with pytest.raises(SystemExit):
+        sidecar.main(["--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+                      "--prompt-file", str(Path(__file__)), "--runtime", "opencode",
+                      "--opencode-url", "http://127.0.0.1:4096", "--restart-cooldown", "-1"])
+    err = capsys.readouterr().err
+    assert "--restart-cooldown" in err
+
+
+def test_tmux_full_tick_cycle_with_healthy_shell_driven_worker_no_restarts(capsys):
+    """End-to-end sanity check (coordinator e2e follow-up): with the alive()
+    fix in place, a healthy bash-driven fake-TUI (pane_current_command ==
+    "bash" throughout -- exactly the coordinator's live e2e shape) completes
+    a full inject -> marker-change -> collect cycle with ZERO restarts. The
+    coordinator's e2e storm (66 ALIVE_PROBE_FAIL / 33 RESTART / 0
+    TICK_RESULT in 100s) was entirely a byproduct of alive() misreporting a
+    healthy shell-driven worker as dead -- this is the real Sidecar +
+    TmuxAdapter (not FakeAdapter) proving collection works end to end once
+    that's fixed."""
+    runner = FakeTmuxRunner()
+    clock = FakeClock(0.0)
+    runner.script("display-message", stdout="bash\n")   # healthy, shell-driven, throughout
+    runner.script("capture-pane", stdout="waiting for input\n")
+
+    adapter = sidecar.TmuxAdapter(
+        tmux_target="agents:9.0", spawn_cmd="bash /path/to/fake-tui.sh",
+        project="proj", agent_id=99, idle_quiet_seconds=5,
+        tmux_runner=runner, clock=clock,
+    )
+    dashboard = FakeDashboard()
+    sc = sidecar.Sidecar(
+        adapter=adapter, dashboard=dashboard, worker_prompt="WORKER PROMPT",
+        tick_contract="TICK CONTRACT", clock=clock, sleeper=noop_sleeper, t_max=3600,
+    )
+
+    # Let the first tick get injected and settle as "in flight, no result yet".
+    # (TmuxAdapter has no restart_count of its own -- restarts are observed
+    # through the fake tmux runner's respawn-pane call log instead.)
+    for _ in range(8):
+        clock.advance(1)
+        sc.step(clock.t)
+    assert not runner.calls_for("respawn-pane")
+    assert sc.tick_start_at is not None
+
+    # Worker finishes and prints its result -- a new TICK RESULT line
+    # (marker change), then holds stable long enough for is_idle() to trip.
+    runner.script("capture-pane",
+                  stdout="waiting for input\n$ \nTICK RESULT: WORKED #11; READY-TO-CLEAR\n")
+    for _ in range(15):
+        clock.advance(1)
+        sc.step(clock.t)
+
+    assert not runner.calls_for("respawn-pane")  # still zero -- no false "dead" detection
+    out = capsys.readouterr().out
+    assert "event=TICK_RESULT" in out and "worked=True" in out and "ids=[11]" in out
+    clear_calls = [c for c in runner.calls_for("send-keys") if c[-2:] == ["/clear", "Enter"]]
+    assert len(clear_calls) >= 1                # READY-TO-CLEAR handshake fired
+
+
+# --------------------------------------------------------------------------- #
+# QA fix (finding 4): paste/load-buffer names are namespaced by (project,
+# agent_id), sanitized to tmux/shell-safe characters.
+# --------------------------------------------------------------------------- #
+
+def test_tmux_buffer_name_sanitizes_project_and_includes_agent_id():
+    adapter, runner, clock = make_tmux_adapter(project="cadence/lms prod!", agent_id=3)
+    adapter.inject("x")
+    buf_name = runner.calls_for("load-buffer")[0][3]
+    assert buf_name == "sidecar-cadencelmsprod-3"
+    assert re.fullmatch(r"[a-zA-Z0-9-]+", buf_name)
+
+
+def test_tmux_buffer_name_falls_back_to_x_when_project_missing():
+    adapter, runner, clock = make_tmux_adapter(project=None, agent_id=5)
+    adapter.inject("x")
+    assert runner.calls_for("load-buffer")[0][3] == "sidecar-x-5"
+
+
+# --------------------------------------------------------------------------- #
+# QA fix (finding 3): OpencodeAdapter._ensure_session() verifies the
+# resolved/created session is actually scoped to self.directory, raising
+# loudly on a positive mismatch (never on a merely-inconclusive check).
+# --------------------------------------------------------------------------- #
+
+def _make_opencode_adapter_with_fake_request(directory="/work/projA", request_fn=None):
+    adapter = sidecar.OpencodeAdapter(base_url="http://127.0.0.1:4999", directory=directory,
+                                       project="projA", agent_id=1)
+    if request_fn is not None:
+        adapter._request = request_fn
+    return adapter
+
+
+def test_opencode_ensure_session_raises_on_directory_mismatch():
+    def fake_request(method, path, payload=None, timeout=None):
+        if method == "GET" and path.startswith("/session?directory="):
+            return []
+        if method == "POST" and path == "/session":
+            return {"id": "ses_new"}
+        if method == "GET" and path == "/session/ses_new":
+            return {"id": "ses_new", "directory": "/work/projB"}   # WRONG directory
+        raise AssertionError(f"unexpected request {method} {path}")
+    adapter = _make_opencode_adapter_with_fake_request(request_fn=fake_request)
+
+    with pytest.raises(RuntimeError, match="different directory"):
+        adapter._ensure_session()
+
+
+def test_opencode_ensure_session_passes_on_directory_match():
+    def fake_request(method, path, payload=None, timeout=None):
+        if method == "GET" and path.startswith("/session?directory="):
+            return []
+        if method == "POST" and path == "/session":
+            return {"id": "ses_new"}
+        if method == "GET" and path == "/session/ses_new":
+            return {"id": "ses_new", "directory": "/work/projA"}   # matches
+        raise AssertionError(f"unexpected request {method} {path}")
+    adapter = _make_opencode_adapter_with_fake_request(request_fn=fake_request)
+
+    adapter._ensure_session()   # must not raise
+    assert adapter.session_id == "ses_new"
+
+
+def test_opencode_ensure_session_ownership_falls_back_to_directory_listing_when_field_absent():
+    # Some server versions may not expose `directory` on the Session object
+    # -- fall back to confirming our id shows up in the SAME
+    # directory-scoped listing _ensure_session already uses for title
+    # re-discovery.
+    calls = {"listing": 0}
+
+    def fake_request(method, path, payload=None, timeout=None):
+        if method == "GET" and path.startswith("/session?directory="):
+            calls["listing"] += 1
+            if calls["listing"] == 1:
+                return []                        # title-discovery: nothing yet
+            return [{"id": "ses_new"}]             # ownership fallback: WE are listed
+        if method == "POST" and path == "/session":
+            return {"id": "ses_new"}
+        if method == "GET" and path == "/session/ses_new":
+            return {"id": "ses_new"}               # no `directory` field at all
+        raise AssertionError(f"unexpected request {method} {path}")
+    adapter = _make_opencode_adapter_with_fake_request(request_fn=fake_request)
+
+    adapter._ensure_session()   # must not raise
+    assert adapter.session_id == "ses_new"
+
+
+def test_opencode_ensure_session_ownership_fallback_raises_when_id_not_listed():
+    def fake_request(method, path, payload=None, timeout=None):
+        if method == "GET" and path.startswith("/session?directory="):
+            return []   # neither title-discovery nor the ownership fallback finds us
+        if method == "POST" and path == "/session":
+            return {"id": "ses_new"}
+        if method == "GET" and path == "/session/ses_new":
+            return {"id": "ses_new"}   # no `directory` field
+        raise AssertionError(f"unexpected request {method} {path}")
+    adapter = _make_opencode_adapter_with_fake_request(request_fn=fake_request)
+
+    with pytest.raises(RuntimeError, match="different directory"):
+        adapter._ensure_session()
+
+
+def test_opencode_ensure_session_ownership_check_degrades_gracefully_on_transient_failure():
+    # BOTH the primary (GET /session/{id}) and fallback (GET
+    # /session?directory=) verification calls fail (network blip) -- this
+    # must NOT crash a session that may be perfectly fine; only a POSITIVE
+    # mismatch raises.
+    def fake_request(method, path, payload=None, timeout=None):
+        if method == "GET" and path.startswith("/session?directory="):
+            raise RuntimeError("network blip")
+        if method == "POST" and path == "/session":
+            return {"id": "ses_new"}
+        if method == "GET" and path == "/session/ses_new":
+            raise RuntimeError("network blip")
+        raise AssertionError(f"unexpected request {method} {path}")
+    adapter = _make_opencode_adapter_with_fake_request(request_fn=fake_request)
+
+    adapter._ensure_session()   # must NOT raise
+    assert adapter.session_id == "ses_new"
+
+
+def test_opencode_ownership_check_skipped_when_no_directory_configured():
+    called = []
+
+    def fake_request(method, path, payload=None, timeout=None):
+        called.append((method, path))
+        if method == "POST" and path == "/session":
+            return {"id": "ses_new"}
+        raise AssertionError(f"unexpected request {method} {path}")
+    adapter = _make_opencode_adapter_with_fake_request(directory=None, request_fn=fake_request)
+
+    adapter._ensure_session()
+    assert adapter.session_id == "ses_new"
+    assert not any(p.startswith("/session/ses_new") for _, p in called)   # no ownership GET at all
+
+
+# --------------------------------------------------------------------------- #
+# QA fix (finding 5): the READY-TO-CLEAR drain re-inject is no longer
+# unconditional -- it flows through the SAME idle-gated path as every other
+# tick. Opencode-shaped adapters (idle immediately after clear()) still
+# drain same-step; a worker that stays busy right after clear() must wait.
+# --------------------------------------------------------------------------- #
+
+def test_ready_to_clear_drain_waits_for_idle_when_worker_not_idle_after_clear():
+    class SlowClearAdapter(FakeAdapter):
+        def clear(self):
+            super().clear()
+            self.busy = True   # simulate "still settling" right after clear() (e.g. tmux post-/clear)
+
+    adapter = SlowClearAdapter()
+    sc, adapter, dashboard, clock = make_sidecar(adapter=adapter)
+
+    sc.step(clock.t)                                          # tick #1 injected
+    adapter.complete("TICK RESULT: WORKED #1; READY-TO-CLEAR")
+    sc.step(clock.t)                                            # collect -> clear() -> now busy
+    assert adapter.clear_count == 1
+    assert len(adapter.injected) == 1        # NOT re-injected yet -- worker reads busy
+    assert sc.pending is True
+
+    adapter.busy = False                      # worker settles
+    sc.step(clock.advance(0.1))
+    assert len(adapter.injected) == 2          # NOW delivered, via the normal idle-gated path
+
+
+# --------------------------------------------------------------------------- #
+# QA fix (finding 7a): result collection now gates on completion-MARKER
+# stability (same value on two consecutive reads), not whole-tail is_idle().
+# --------------------------------------------------------------------------- #
+
+def test_collection_requires_marker_stable_across_two_consecutive_reads():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)                       # tick #1 injected
+    adapter.complete("TICK RESULT: WORKED #1")
+    adapter.marker_flip_remaining = 1       # this step's first read disagrees with its own confirm read
+    sc.step(clock.t)
+    assert sc.tick_start_at is not None       # NOT collected yet -- the two reads disagreed
+
+    sc.step(clock.t)                          # both reads now agree -> collects
+    assert sc.tick_start_at is None
+    assert sc.last_worked_at == clock.t
+
+
+def test_collection_unaffected_when_reads_agree_immediately():
+    # The overwhelmingly common case (and every pre-existing single-step
+    # collection test in this file) -- two consecutive reads that already
+    # agree collect on the very same step, no extra step needed.
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: WORKED #1")
+    sc.step(clock.t)
+    assert sc.tick_start_at is None
+    assert sc.last_worked_at == clock.t
+
+
+# --------------------------------------------------------------------------- #
+# QA fix (finding 7b): idle-wait fallback for INJECTION -- if a due tick has
+# been undeliverable purely because is_idle() won't settle (animated-TUI
+# hash instability) for > 3x idle_quiet_seconds, AND the completion marker
+# hasn't moved at all in that time, inject anyway.
+# --------------------------------------------------------------------------- #
+
+def test_idle_fallback_injects_after_prolonged_hash_instability_with_unchanged_marker(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    adapter.idle_quiet_seconds = 5     # only this test's adapter instance opts in
+    adapter.force_not_idle = True       # is_idle() never settles (simulated hash instability)
+
+    sc.step(clock.t)                    # t=0: tick due, but not idle -- wait starts
+    assert len(adapter.injected) == 0
+    assert sc.pending is True
+
+    for _ in range(14):                 # t=1..14: marker stays unchanged (nothing has completed)
+        clock.advance(1)
+        sc.step(clock.t)
+    assert len(adapter.injected) == 0     # elapsed 14s < 3*5=15s -- must NOT fall back yet
+
+    clock.advance(2)                    # t=16: elapsed 16s > 15s
+    sc.step(clock.t)
+    assert len(adapter.injected) == 1     # fallback fired
+    out = capsys.readouterr().out
+    assert "IDLE_FALLBACK" in out
+
+
+def test_idle_fallback_resets_when_marker_changes_during_the_wait():
+    sc, adapter, dashboard, clock = make_sidecar()
+    adapter.idle_quiet_seconds = 5
+    adapter.force_not_idle = True
+
+    sc.step(clock.t)                    # t=0: wait starts (marker unknown/None)
+    for _ in range(10):                 # t=1..10: marker still unchanged
+        clock.advance(1)
+        sc.step(clock.t)
+    assert len(adapter.injected) == 0
+
+    # Something genuinely changes (a completion happened) -- the wait must
+    # reset, even though is_idle() is still forced False the whole time.
+    adapter.complete("TICK RESULT: WORKED #1")
+    for _ in range(10):                 # t=11 (reset here) .. t=20
+        clock.advance(1)
+        sc.step(clock.t)
+    assert len(adapter.injected) == 0     # elapsed since the reset (9s) not yet > 15s
+
+    clock.advance(7)                    # t=27: elapsed since reset (16s) > 15s
+    sc.step(clock.t)
+    assert len(adapter.injected) == 1
+
+
+def test_idle_fallback_disabled_for_adapters_without_idle_quiet_seconds():
+    # opencode-shaped adapters (no idle_quiet_seconds attribute) never get
+    # the fallback -- is_idle() there is an instantaneous HTTP fact, not a
+    # hash-stability heuristic with anything to bound damage from.
+    sc, adapter, dashboard, clock = make_sidecar()
+    adapter.force_not_idle = True
+    assert not hasattr(adapter, "idle_quiet_seconds")
+
+    sc.step(clock.t)
+    for _ in range(100):
+        clock.advance(1)
+        sc.step(clock.t)
+    assert len(adapter.injected) == 0     # never falls back, waits forever

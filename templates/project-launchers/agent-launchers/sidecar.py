@@ -20,20 +20,23 @@ fires. This is a single-threaded, non-blocking state machine: one `step(now)`
 call per loop iteration. `now`, and every wait, comes from an injectable
 clock/sleeper so the whole thing is unit-testable without real sleeps.
 
-Runtime adapters implement `Adapter` (below). Phase 2 ships `OpencodeAdapter`
-only; a `FakeAdapter` used for tests lives in tests/test_sidecar.py. tmux
-adapters (claude/codex) are Phase 5 — the interface is adapter-shaped already
-but no tmux code is written here.
+Runtime adapters implement `Adapter` (below): `OpencodeAdapter` (HTTP against
+`opencode serve`, Phase 2) and `TmuxAdapter` (capture-pane/send-keys against a
+claude/codex TUI pane, Phase 5). A `FakeAdapter` used for tests lives in
+tests/test_sidecar.py.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -74,6 +77,21 @@ DEFAULT_T_MAX_S = MIN_T_MAX_S
 # -- see Adapter.owned_process_dead -- restarts immediately, no debounce.)
 ALIVE_FAILURE_THRESHOLD = 3
 
+# Live-tmux e2e finding (coordinator report): the watchdog's 3-strike debounce
+# bounds how OFTEN a restart can be TRIGGERED, but nothing bounded how often
+# one could actually FIRE -- a persistently-failing alive() probe (or a
+# crash-looping TUI) restarted every ~3 probes, seconds apart. For a real
+# claude/codex session each respawn replays the initial prompt from spawn_cmd
+# (token burn + session churn), so an unbounded restart rate is a real cost,
+# not just log noise. Sidecar._restart() enforces a minimum number of seconds
+# between actual restarts; a restart that would fire within the cooldown is
+# logged (RESTART_SUPPRESSED) and skipped WITHOUT resetting the failure
+# counters that triggered it, so it fires as soon as the cooldown lapses
+# rather than being lost. 0 disables the cooldown (immediate, pre-fix
+# behavior) -- validated >= 0 at the CLI layer, see resolve_t_max's sibling
+# check in main().
+DEFAULT_RESTART_COOLDOWN_S = 120
+
 # MAJOR 6: bounds enforced on dashboard-supplied cadence policy.
 MIN_POLL_INTERVAL_S = 60
 MAX_POLL_INTERVAL_S = 7200
@@ -86,6 +104,15 @@ MIN_ACTIVE_WINDOW_S = 300
 MAX_ACTIVE_WINDOW_S = 14400
 MIN_DORMANT_INTERVAL_S = 600
 MAX_DORMANT_INTERVAL_S = 86400
+
+# Phase 5 (plan §6): opencode balance/credit/quota exhaustion alert. Matched
+# case-insensitively against the (name, message) OpencodeAdapter.last_error()
+# returns. Deliberately broad (payment/402 included) since providers phrase
+# this differently -- a false positive just pauses+alerts a bit early, a
+# false negative leaves a worker silently stuck, which is worse.
+BALANCE_ALERT_RE = re.compile(r"insufficient|balance|credit|quota|payment|402", re.IGNORECASE)
+BALANCE_ALERT_COOLDOWN_S = 3600
+BALANCE_ALERT_PAUSE_MINUTES = 120
 
 
 def resolve_t_max(value: int | None) -> int:
@@ -369,6 +396,15 @@ class Adapter:
         then relies on t_max alone (see spec: skip t_stuck, don't guess)."""
         return None
 
+    def last_error(self) -> tuple[str, str] | None:
+        """Phase 5 (plan §6): (name, message) of the last runtime-reported
+        error, for the side-car's balance/credit-exhaustion alert
+        (Sidecar._check_balance_alert). None if the adapter doesn't track
+        errors, or there is none. Default: unsupported (tmux adapters have no
+        machine-readable error surface; only OpencodeAdapter implements
+        this)."""
+        return None
+
     def shutdown(self, kill_worker: bool) -> None:
         """Called once on clean side-car exit. Only tears the worker down if
         kill_worker is True; otherwise the durable session is left alive."""
@@ -470,9 +506,65 @@ class OpencodeAdapter(Adapter):
         if matches:
             matches.sort(key=lambda s: (s.get("time") or {}).get("updated", 0), reverse=True)
             self.session_id = matches[0]["id"]
+        else:
+            created = self._request("POST", "/session", {"title": title})
+            self.session_id = created["id"]
+        self._verify_session_ownership()
+
+    def _verify_session_ownership(self) -> None:
+        """QA fix (finding 3): the sidecar's port-selection formula spreads
+        projects across different port bands to avoid collision, but that's
+        a COLLISION-AVOIDANCE heuristic, not a guarantee -- two fleets on
+        one host, a stale process left listening on a recycled port, or a
+        simple misconfiguration could still put us in front of an
+        `opencode serve` bound to someone ELSE's checkout. Confirm the
+        session we just created/attached to is actually scoped to
+        self.directory; raise loudly rather than silently operating in the
+        wrong directory (which could mean claiming/editing/committing work
+        against the wrong project entirely).
+
+        Primary check: GET /session/{id} exposes `directory` directly (per
+        the opencode openapi spec) -- compare it to self.directory. Some
+        server versions may not expose that field; fall back to confirming
+        our session id appears in GET /session?directory=<ours> (the same
+        endpoint _ensure_session already uses for title re-discovery).
+
+        Deliberately best-effort on TRANSIENT failures (a network hiccup on
+        the verification call itself must not crash a session that may be
+        perfectly fine) -- only a POSITIVE mismatch (a real, differing
+        directory value, or a real listing that doesn't contain our id)
+        raises."""
+        if not self.directory:
             return
-        created = self._request("POST", "/session", {"title": title})
-        self.session_id = created["id"]
+        try:
+            session = self._request("GET", f"/session/{self.session_id}")
+        except Exception as exc:
+            self._logger("OWNERSHIP_CHECK_ERROR", error=str(exc))
+            session = None
+
+        if isinstance(session, dict) and "directory" in session:
+            directory = session.get("directory")
+            if directory != self.directory:
+                raise RuntimeError(
+                    "opencode server on this port serves a different directory "
+                    f"(expected {self.directory!r}, session {self.session_id} reports {directory!r})"
+                )
+            return
+
+        # `directory` not exposed on this server's Session object -- fall
+        # back to the directory-scoped listing containing our id.
+        try:
+            q = urllib.parse.quote(self.directory, safe="")
+            sessions = self._request("GET", f"/session?directory={q}") or []
+        except Exception as exc:
+            self._logger("OWNERSHIP_CHECK_ERROR", error=str(exc))
+            return
+        ids = {s.get("id") for s in sessions if isinstance(s, dict)}
+        if self.session_id not in ids:
+            raise RuntimeError(
+                "opencode server on this port serves a different directory "
+                f"(session {self.session_id} not found under directory {self.directory!r})"
+            )
 
     def is_idle(self) -> bool:
         try:
@@ -514,6 +606,30 @@ class OpencodeAdapter(Adapter):
             return None
         parts = msg.get("parts", [])
         return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+    def last_error(self) -> tuple[str, str] | None:
+        # Phase 5 (plan §6): the last completed assistant message's
+        # info.error -- opencode sets this when the provider call itself
+        # failed (rate limit, insufficient balance, invalid key, ...) rather
+        # than producing a normal reply. Tolerant of any missing/malformed
+        # shape -- this feeds an alert path, it must never raise.
+        try:
+            msg = self._last_completed_assistant_message()
+        except Exception:
+            return None
+        if msg is None:
+            return None
+        err = (msg.get("info") or {}).get("error")
+        if not isinstance(err, dict):
+            return None
+        name = str(err.get("name") or err.get("type") or "error")
+        data = err.get("data")
+        message = ""
+        if isinstance(data, dict):
+            message = str(data.get("message") or "")
+        if not message:
+            message = str(err.get("message") or "")
+        return (name, message)
 
     def clear(self) -> None:
         # Cheap and safe: create a NEW session (same owned title -- MAJOR 4),
@@ -622,6 +738,356 @@ class OpencodeAdapter(Adapter):
 
 
 # --------------------------------------------------------------------------- #
+# TmuxAdapter — claude/codex TUIs driven via tmux capture-pane/send-keys
+# (Phase 5, plan §5 + §12). ALL tmux interaction goes through the injectable
+# `tmux_runner` seam (self._tmux) so tests never shell out to a real tmux.
+# --------------------------------------------------------------------------- #
+
+_TICK_MARKER_LINE_RE = re.compile(r"tick result:", re.IGNORECASE)
+
+# QA fix (finding 4): paste-buffer/load-buffer names are sanitized to tmux/
+# shell-safe characters so a project key with e.g. slashes or spaces can't
+# produce an invalid (or, worse, a DIFFERENT project's) buffer name.
+_BUFFER_PROJECT_SANITIZE_RE = re.compile(r"[^a-zA-Z0-9-]")
+
+# A dead TUI drops the pane back to an interactive shell -- these are the
+# shells started/wrapped by every runtime we launch (bash/zsh directly, sh/dash
+# as a POSIX fallback). pane_current_command reporting one of these means the
+# TUI process exited, not that it is merely "idle at a prompt".
+_TMUX_SHELL_COMMANDS = frozenset({"bash", "zsh", "sh", "dash"})
+
+
+def _default_tmux_runner(args: list[str]) -> subprocess.CompletedProcess:
+    """The real subprocess seam: `args` is the full argv including the `tmux`
+    binary name itself (e.g. ["tmux", "capture-pane", "-p", "-t", target]).
+    10s timeout: every tmux call here is a local IPC round-trip to the tmux
+    server, never something that legitimately blocks for a worker-scale
+    duration."""
+    return subprocess.run(args, capture_output=True, text=True, timeout=10)
+
+
+class TmuxAdapter(Adapter):
+    """Drives a claude/codex TUI living in one tmux pane. Fragility
+    mitigations (plan §12, accepted risk): inject() NEVER send-keys the raw
+    prompt text (load-buffer/paste-buffer only -- send-keys is reserved for
+    short, literal control input: Enter and the `/clear` slash command,
+    which the TUI must receive as typed keystrokes to recognize it as a
+    command rather than pasted text). Idle detection is capture-pane hash
+    stability, the primary signal the plan accepts as "good enough, bounded
+    by completion_marker + coalescing" rather than parsing TUI chrome.
+
+    completion_marker()/get_usage() intentionally return simple, monotonic,
+    heuristic values (a marker-line count+hash tuple; a chars/4 token
+    estimate) -- see each method's docstring. Both are conservative by
+    design: the goal is "never worse than the t_max watchdog backstop",
+    not TUI introspection precision.
+    """
+
+    def __init__(self, *, tmux_target: str, spawn_cmd: str | None = None,
+                 project: str | None = None, agent_id: int | None = None,
+                 idle_quiet_seconds: int = 10, capture_lines: int = 2000,
+                 tail_lines: int = 40, result_lines: int = 60,
+                 tmux_runner=None, clock=time.monotonic, logger=None):
+        self.tmux_target = tmux_target
+        self.spawn_cmd = spawn_cmd
+        self.project = project
+        self.agent_id = agent_id
+        self.idle_quiet_seconds = idle_quiet_seconds
+        self.capture_lines = capture_lines
+        self.tail_lines = tail_lines
+        self.result_lines = result_lines
+        self._tmux = tmux_runner or _default_tmux_runner
+        self.clock = clock
+        self._logger = logger or (lambda event, **kv: None)
+
+        # -- is_idle()/last_output_change() stability tracking ------------
+        self._last_hash: str | None = None
+        self._stable_since: float | None = None
+
+        # -- get_usage() heuristic (spec: chars injected + chars read, /4,
+        # monotonic within a session, reset on clear()/restart()) ---------
+        self._chars_total = 0
+
+        # -- completion_marker() adapter-LOCAL monotonic state (QA fix,
+        # finding 1): capture-pane's `-S -N` scrollback window can TRUNCATE
+        # older lines as the pane fills up, which would make a naive
+        # (count, hash-of-last-line) marker regress (count drops) even
+        # though nothing about the actual latest completion changed. See
+        # completion_marker()'s docstring for the full reasoning.
+        self._marker_last_count = 0
+        self._marker_last_hash: str | None = None
+        self._marker_counter = 0
+
+    # -- low-level tmux seam --------------------------------------------------
+    def _tmux_run(self, *args: str) -> subprocess.CompletedProcess:
+        return self._tmux(["tmux", *args])
+
+    def _buffer_name(self) -> str:
+        # QA fix (finding 4): a bare "sidecar-<agent_id>" buffer name
+        # collides across PROJECTS sharing this host whenever two sidecars
+        # for the SAME agent_id number (common -- e.g. every project's
+        # backend-dev-worker is agent 1) inject at literally the same tmux
+        # instant, one paste-buffer clobbering the other's in-flight
+        # load/paste. Namespacing by project (sanitized to tmux/shell-safe
+        # chars) makes the name unique per (project, agent) pair.
+        project = _BUFFER_PROJECT_SANITIZE_RE.sub("", self.project) if self.project else ""
+        project = project or "x"
+        agent = self.agent_id if self.agent_id is not None else "x"
+        return f"sidecar-{project}-{agent}"
+
+    def _capture(self, lines: int) -> str:
+        res = self._tmux_run("capture-pane", "-p", "-t", self.tmux_target, "-S", f"-{lines}")
+        if res.returncode != 0:
+            raise RuntimeError(f"tmux capture-pane failed: {(res.stderr or '').strip()}")
+        return res.stdout or ""
+
+    def _reset_tracking_state(self) -> None:
+        """Called on clear()/restart(): a fresh session/pane means the
+        idle-stability window, the usage estimate, AND the completion-marker
+        monotonic state (finding 1) all start over."""
+        self._last_hash = None
+        self._stable_since = None
+        self._chars_total = 0
+        self._marker_last_count = 0
+        self._marker_last_hash = None
+        self._marker_counter = 0
+
+    def _respawn(self) -> subprocess.CompletedProcess:
+        # QA fix (finding 6): respawn-pane's target pane runs whatever its
+        # DEFAULT shell is (the login shell tmux started it with, e.g. zsh
+        # on macOS) -- NOT necessarily bash. spawn_cmd itself may be a
+        # composite shell command line (e.g. finding 2's `env K=V ... claude
+        # ...`, or a chain with &&/pipes), which only a REAL shell can parse
+        # correctly; handing it to the pane's default shell risked subtly
+        # wrong parsing (or outright failure) depending on what that shell
+        # happens to be. Explicit `bash -lc <spawn_cmd>` as THREE separate
+        # argv items (not one pre-quoted string) makes tmux exec bash
+        # directly with spawn_cmd as its single -c argument -- no additional
+        # shell-quoting/escaping needed here, tmux passes each argv item
+        # through untouched.
+        return self._tmux_run("respawn-pane", "-k", "-t", self.tmux_target,
+                               "bash", "-lc", self.spawn_cmd)
+
+    # -- Adapter interface ------------------------------------------------
+    def ensure_worker(self) -> None:
+        if self.alive():
+            return
+        if not self.spawn_cmd:
+            raise RuntimeError(
+                f"tmux pane {self.tmux_target} has no live TUI and no spawn_cmd "
+                "was given to (re)spawn it"
+            )
+        # respawn-pane -k force-kills whatever's currently in the pane (a bare
+        # shell, harmlessly, or nothing at all) and execs spawn_cmd -- this
+        # covers both "dead TUI, shell left behind" and "pane exists but never
+        # had a TUI started in it" with one call.
+        res = self._respawn()
+        if res.returncode != 0:
+            raise RuntimeError(f"tmux respawn-pane failed: {(res.stderr or '').strip()}")
+        self._reset_tracking_state()
+
+    def is_idle(self) -> bool:
+        now = self.clock()
+        try:
+            text = self._capture(self.tail_lines)
+        except Exception:
+            return False
+        digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+        if digest != self._last_hash:
+            self._last_hash = digest
+            self._stable_since = now
+            return False
+        if self._stable_since is None:
+            self._stable_since = now
+            return False
+        return (now - self._stable_since) >= self.idle_quiet_seconds
+
+    def inject(self, text: str) -> None:
+        # Never send-keys the raw prompt (plan §12): write it to a temp file,
+        # load it into a named tmux paste buffer, paste (and delete) that
+        # buffer into the pane, then send a bare Enter to submit it. Claude
+        # and codex TUIs both accept this as bracketed-paste input.
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        tmp_path = tmp.name
+        try:
+            tmp.write(text)
+            tmp.close()
+            buf = self._buffer_name()
+            res = self._tmux_run("load-buffer", "-b", buf, tmp_path)
+            if res.returncode != 0:
+                raise RuntimeError(f"tmux load-buffer failed: {(res.stderr or '').strip()}")
+            res = self._tmux_run("paste-buffer", "-d", "-b", buf, "-t", self.tmux_target)
+            if res.returncode != 0:
+                raise RuntimeError(f"tmux paste-buffer failed: {(res.stderr or '').strip()}")
+            res = self._tmux_run("send-keys", "-t", self.tmux_target, "Enter")
+            if res.returncode != 0:
+                raise RuntimeError(f"tmux send-keys (Enter) failed: {(res.stderr or '').strip()}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        self._chars_total += len(text)
+
+    def completion_marker(self) -> str:
+        """QA fix (finding 1): adapter-LOCAL monotonic counter, not a raw
+        (count, hash) snapshot. `capture-pane -S -N` is a SCROLLBACK WINDOW,
+        not the whole session history -- as the pane fills up, older marker
+        lines fall off the front of that window, which would make a naive
+        "count of TICK RESULT lines currently visible" REGRESS even though
+        nothing about the actual latest completion changed. The Sidecar's
+        baseline-equality check (`marker == self.tick_baseline`) has no
+        notion of "this went backwards, ignore it" -- a regressed marker
+        risks either a stuck "already seen this" false match or, worse,
+        corrupting the comparison. Fix: keep (last_seen_count,
+        last_seen_hash, monotonic_counter) on the adapter itself; the
+        returned value only ever counts up.
+
+        Per call: capture, compute the current count of "TICK RESULT:"
+        lines and a hash of the LAST such line plus up to 4 lines
+        FOLLOWING it (not just the marker line alone -- two ticks that
+        both emit byte-identical marker text, e.g. consecutive "TICK
+        RESULT: NO WORK", are disambiguated by whatever differs in the
+        trailing context; and even if that window hash also happens to
+        collide, a genuine new occurrence still raises the raw COUNT, which
+        alone is sufficient to register a change). Then:
+          - hash CHANGED or count INCREASED -> bump the counter, adopt the
+            new (count, hash) as the reference.
+          - count DECREASED with the hash UNCHANGED -> scrollback
+            truncation (the newest marker + its trailing window are
+            identical to what we already saw; some OLDER marker just
+            scrolled out of the captured window) -- a complete no-op,
+            counter/reference left exactly as they were so a later real
+            increase is still measured against the true (higher) peak.
+          - anything else unchanged -> no-op (nothing new).
+
+        Always returns a string (never None) -- raises on capture failure
+        only, same contract as before (BLOCKER 1: the Sidecar maps that to
+        _BASELINE_UNKNOWN and recovers on the next successful read, exactly
+        like an opencode HTTP hiccup)."""
+        text = self._capture(self.capture_lines)
+        lines = text.splitlines()
+        marker_idxs = [i for i, ln in enumerate(lines) if _TICK_MARKER_LINE_RE.search(ln)]
+        count = len(marker_idxs)
+        if count:
+            last_idx = marker_idxs[-1]
+            window = lines[last_idx:last_idx + 5]   # marker line + up to 4 following
+            current_hash = hashlib.sha1(
+                "\n".join(window).encode("utf-8", errors="replace")
+            ).hexdigest()
+        else:
+            current_hash = None
+
+        count_increased = count > self._marker_last_count
+        count_decreased = count < self._marker_last_count
+        hash_changed = current_hash != self._marker_last_hash
+        truncated = count_decreased and not hash_changed
+
+        if not truncated:
+            if hash_changed or count_increased:
+                self._marker_counter += 1
+            self._marker_last_count = count
+            self._marker_last_hash = current_hash
+        # else: truncation -- leave counter/last_count/last_hash untouched.
+
+        return str(self._marker_counter)
+
+    def read_result(self) -> str | None:
+        try:
+            text = self._capture(self.capture_lines)
+        except Exception:
+            return None
+        lines = text.splitlines()
+        tail = "\n".join(lines[-self.result_lines:]) if lines else ""
+        if not tail:
+            return None
+        # Spec (get_usage heuristic): count chars of each read_result() return
+        # once per tick -- this is that one call per completed tick.
+        self._chars_total += len(tail)
+        return tail
+
+    def clear(self) -> None:
+        # Slash commands must be TYPED, not pasted (plan implementation
+        # notes): send-keys "/clear" + Enter as two literal keystroke groups,
+        # never via load-buffer/paste-buffer.
+        res = self._tmux_run("send-keys", "-t", self.tmux_target, "/clear", "Enter")
+        if res.returncode != 0:
+            raise RuntimeError(f"tmux send-keys (/clear) failed: {(res.stderr or '').strip()}")
+        self._reset_tracking_state()
+
+    def restart(self) -> None:
+        if not self.spawn_cmd:
+            raise RuntimeError("TmuxAdapter.restart() requires spawn_cmd (none configured)")
+        res = self._respawn()
+        if res.returncode != 0:
+            raise RuntimeError(f"tmux respawn-pane failed: {(res.stderr or '').strip()}")
+        self._reset_tracking_state()
+
+    def get_usage(self) -> dict | None:
+        # Heuristic only (spec): no TUI introspection, so this is a rough,
+        # conservative, MONOTONIC-within-a-session estimate -- (chars
+        # injected + chars read via read_result()) / 4 as a token count.
+        # session_cost is always 0.0 (claude/codex billing isn't observable
+        # here; get_usage() docs already allow session_cost to be a stub).
+        return {"context_tokens": self._chars_total // 4, "session_cost": 0.0}
+
+    def _expected_command(self) -> str | None:
+        """basename of the first whitespace-separated token of spawn_cmd
+        (e.g. "claude --foo" -> "claude", "/usr/bin/bash script.sh" ->
+        "bash"). None if spawn_cmd isn't configured -- alive() then falls
+        back to the plain shell-means-dead heuristic, unchanged."""
+        if not self.spawn_cmd:
+            return None
+        first = self.spawn_cmd.strip().split(None, 1)
+        if not first:
+            return None
+        return os.path.basename(first[0])
+
+    def alive(self) -> bool:
+        res = self._tmux_run("display-message", "-p", "-t", self.tmux_target,
+                              "#{pane_current_command}")
+        if res.returncode != 0:
+            return False
+        cmd = (res.stdout or "").strip()
+        if not cmd:
+            return False
+        # BUGFIX (live tmux e2e, coordinator report): the bare-shell-means-
+        # dead heuristic below only makes sense when we EXPECT the pane to
+        # be running a non-shell TUI (claude/codex/node/...). When spawn_cmd
+        # itself IS (or is launched via) a shell -- e.g. a bash-driven
+        # fake-TUI/wrapper script used for e2e/testing -- tmux reports
+        # pane_current_command == "bash" for the ENTIRE lifetime of a
+        # perfectly healthy pane. Treating that as "dead" made alive()
+        # permanently False for such a worker, which drove an endless
+        # 3-strike restart loop (observed live: 66 ALIVE_PROBE_FAIL / 33
+        # RESTART / 0 TICK_RESULT in 100s, despite the pane visibly having
+        # completed and printed its result). Fix: if the command we EXPECT
+        # to see is itself a shell, or the observed command matches the
+        # expected one exactly, any non-empty pane_current_command counts
+        # as alive -- we cannot distinguish "shell running our script" from
+        # "shell after the script exited" via this field alone, so we don't
+        # try. The shell-means-dead heuristic still applies (unchanged) when
+        # we expect a real TUI (spawn_cmd starts with a non-shell binary,
+        # e.g. claude/codex) and don't see it -- that case is unambiguous:
+        # the TUI dropped back to a shell, so it's dead.
+        expected = self._expected_command()
+        if expected is not None and (expected in _TMUX_SHELL_COMMANDS or cmd == expected):
+            return True
+        return cmd not in _TMUX_SHELL_COMMANDS
+
+    def last_output_change(self) -> float | None:
+        return self._stable_since
+
+    def shutdown(self, kill_worker: bool) -> None:
+        if not kill_worker:
+            return
+        try:
+            self._tmux_run("kill-pane", "-t", self.tmux_target)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Dashboard client (heartbeat + pause/loop policy poll)
 # --------------------------------------------------------------------------- #
 
@@ -664,6 +1130,44 @@ class DashboardClient:
         except Exception as exc:
             self._logger("STATE_POLL", ok=False, error=str(exc))
             return None
+
+    def pause(self, minutes: int = BALANCE_ALERT_PAUSE_MINUTES) -> bool:
+        """Phase 5 (plan §6): POST the EXISTING human/engine pause endpoint
+        (POST /agents/pause, form-encoded) so the engine stops assigning this
+        agent new work -- used by the balance-alert path. Best-effort: the
+        caller (Sidecar._check_balance_alert) treats a failure as non-fatal."""
+        q = urllib.parse.quote(self.project, safe="")
+        url = f"{self.base_url}/agents/pause?project={q}"
+        data = urllib.parse.urlencode(
+            {"agent_id": self.agent_id, "minutes": minutes}
+        ).encode("utf-8")
+        try:
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout):
+                pass
+            return True
+        except Exception as exc:
+            self._logger("PAUSE_POST_FAIL", error=str(exc))
+            return False
+
+    def alert(self, subject: str, body: str = "") -> bool:
+        """Phase 5 (plan §6/§C): POST the NEW /alerts endpoint so a human sees
+        the balance/credit exhaustion in Correspondence (ADR-ORCH-006:
+        failures surface to Correspondence, never silently). Best-effort,
+        same as pause() above."""
+        q = urllib.parse.quote(self.project, safe="")
+        url = f"{self.base_url}/alerts?project={q}"
+        data = urllib.parse.urlencode(
+            {"agent_id": self.agent_id, "subject": subject, "body": body}
+        ).encode("utf-8")
+        try:
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout):
+                pass
+            return True
+        except Exception as exc:
+            self._logger("ALERT_POST_FAIL", error=str(exc))
+            return False
 
 
 # --------------------------------------------------------------------------- #
@@ -766,6 +1270,7 @@ class Sidecar:
                  active_window: int = 1800, dormant_interval: int = 3600,
                  heartbeat_interval: int = 20, state_poll_interval: int = 45,
                  t_stuck: int | None = 900, t_max: int = DEFAULT_T_MAX_S,
+                 restart_cooldown: int = DEFAULT_RESTART_COOLDOWN_S,
                  kill_worker_on_exit: bool = False,
                  context_limit_tokens: int = 180_000, context_clear_pct: int = 70,
                  context_low_pct: int = 90, budget_margin_pct: int = 15,
@@ -782,6 +1287,7 @@ class Sidecar:
         self.state_poll_interval = state_poll_interval
         self.t_stuck = t_stuck
         self.t_max = t_max
+        self.restart_cooldown = restart_cooldown
         self.kill_worker_on_exit = kill_worker_on_exit
         # Phase 3: accepts a pre-built accountant (tests that want to inspect
         # it directly) or builds one from the individual CLI-shaped kwargs.
@@ -810,6 +1316,13 @@ class Sidecar:
         self.protocol_violations = 0
         self.restart_times: list[float] = []
         self._consecutive_alive_failures = 0    # BLOCKER 3
+        # Coordinator e2e report (live tmux): nothing bounded restart
+        # frequency, so a persistent alive()-false (or a crash-looping TUI)
+        # restarted every ~3 probes -- seconds apart for a real claude/codex
+        # session, each respawn replaying the initial prompt (token burn +
+        # session churn). None means "never restarted yet" -- the very first
+        # restart is never suppressed. See _restart().
+        self._last_restart_at: float | None = None
         self.policy = dict(DEFAULT_POLICY)
         # Force both the heartbeat and the state-poll to fire on the very
         # first step() rather than waiting a full interval.
@@ -821,6 +1334,17 @@ class Sidecar:
         self._last_wake_at: datetime | None = None
         self._stop = False
         self._log_fh = open(log_file, "a") if log_file else None
+        # Phase 5 (plan §6): last time (self.clock() units) a BALANCE_ALERT
+        # fired -- None means "never fired yet". Rate-limits the
+        # pause+alert POSTs to at most once per BALANCE_ALERT_COOLDOWN_S.
+        self._last_balance_alert_at: float | None = None
+        # QA fix (finding 7b): idle-wait fallback bookkeeping -- how long a
+        # DUE tick has been undeliverable purely because is_idle() won't
+        # settle, and the completion_marker() value observed when that wait
+        # began (to confirm nothing has actually changed in the meantime).
+        # None means "not currently waiting". See _maybe_deliver_tick.
+        self._coalesce_wait_since: float | None = None
+        self._coalesce_wait_marker = None
 
     # -- logging --------------------------------------------------------------
     def _log(self, event: str, **kv) -> None:
@@ -1074,6 +1598,23 @@ class Sidecar:
                 return
 
     def _restart(self, now: float, reason: str) -> None:
+        # Single choke point (mirrors MAJOR 5's _inject_tick pattern): EVERY
+        # restart call site -- the 3-strike alive()-failure path, t_max,
+        # t_stuck, AND the owned-process-dead fast path -- goes through this
+        # method, so the cooldown applies uniformly (the fast path is a
+        # debounce bypass for CONFIRMING death quickly, not an exemption from
+        # rate-limiting the resulting restart). Counters that led here
+        # (_consecutive_alive_failures, tick_start_at/tick_baseline) are
+        # deliberately left untouched on suppression -- the watchdog will
+        # keep calling _restart() every subsequent step while the underlying
+        # condition persists, and it fires for real the moment the cooldown
+        # lapses, rather than the failure being silently dropped.
+        if (self.restart_cooldown > 0 and self._last_restart_at is not None
+                and (now - self._last_restart_at) < self.restart_cooldown):
+            self._log("RESTART_SUPPRESSED", reason=reason,
+                      cooldown_remaining=round(self.restart_cooldown - (now - self._last_restart_at), 1))
+            return
+        self._last_restart_at = now
         self.adapter.restart()
         # BLOCKER (opus re-review): the in-flight tick (if any) is abandoned
         # by definition once we restart -- clear both fields BEFORE the
@@ -1175,6 +1716,7 @@ class Sidecar:
         except Exception as exc:
             self.pending = True
             self._log("INJECT_ERROR", reason=reason, error=str(exc))
+            self._check_balance_alert(now)
             return
         self.tick_start_at = now
         # BLOCKER 1: snapshot the completion-marker baseline at the moment
@@ -1212,35 +1754,83 @@ class Sidecar:
             became_due = True
 
         if not self.pending:
+            self._coalesce_wait_since = None
             return
 
         # BLOCKER 1: never start a new tick while one is already in flight,
         # even if the adapter's is_idle() looks true (that can be a stale
         # read of the *previous* turn right after an async inject).
         if self.tick_start_at is not None:
+            self._coalesce_wait_since = None
             return
 
         if not self.adapter.is_idle():
+            # QA fix (finding 7b, animated-TUI hash instability): bound the
+            # damage from a tail hash that never settles (spinner, blinking
+            # cursor, live status line) even though the worker is genuinely
+            # at rest -- there is NO tick in flight here (guarded above), so
+            # the only thing keeping this tick from being delivered is
+            # is_idle() itself. If it's been stuck for a while AND the
+            # completion marker hasn't moved AT ALL in that time (nothing
+            # new is actually happening -- a genuinely busy worker would
+            # have a stale/unchanging marker too, but so would a merely
+            # flickering idle prompt, which is exactly the ambiguous case
+            # this is meant to catch), inject anyway rather than coalescing
+            # forever. Adapters with no idle_quiet_seconds (opencode:
+            # is_idle() is an instantaneous HTTP fact, not a hash-stability
+            # heuristic) never get this fallback -- there's no hash flakiness
+            # to bound damage from. Heuristic thresholds (3x) -- tune against
+            # the real-TUI soak.
+            idle_quiet = getattr(self.adapter, "idle_quiet_seconds", None)
+            if idle_quiet:
+                try:
+                    current_marker = self.adapter.completion_marker()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    current_marker = _BASELINE_UNKNOWN
+                if (self._coalesce_wait_since is None
+                        or current_marker != self._coalesce_wait_marker):
+                    self._coalesce_wait_since = now
+                    self._coalesce_wait_marker = current_marker
+                elif (now - self._coalesce_wait_since) > 3 * idle_quiet:
+                    self._log("IDLE_FALLBACK", waited=round(now - self._coalesce_wait_since, 1))
+                    self._coalesce_wait_since = None
+                    self._inject_tick(now, reason="idle_fallback")
+                    return
             if became_due:
                 self._log("COALESCE")
             return
 
+        self._coalesce_wait_since = None
         self._inject_tick(now, reason="scheduled" if became_due else "coalesced")
 
     # -- result collection --------------------------------------------------
     def _maybe_collect_result(self, now: float) -> None:
         if self.tick_start_at is None:
             return
-        if not self.adapter.is_idle():
-            return
-        # BLOCKER 1: is_idle() alone is NOT sufficient -- right after an
-        # async inject, the worker may not have started the turn yet, so
-        # is_idle() can read as true against the *previous* completed
-        # message (a stale read). Only treat the tick as complete once the
+        # QA fix (finding 7a, animated-TUI hash instability): the collection
+        # gate is now completion-MARKER stability, not whole-tail is_idle().
+        # is_idle() remains the gate for INJECTION only (_maybe_deliver_tick)
+        # -- an animated/streaming TUI (spinner, live-updating status line)
+        # can keep the whole-tail hash from EVER settling even after the
+        # model has actually finished and printed its TICK RESULT marker;
+        # gating collection on is_idle() starved collection entirely in
+        # that case (the coordinator's live e2e: "0 TICK_RESULT despite the
+        # pane visibly having completed"). The ORIGINAL protection this
+        # is_idle() check provided (the "false-idle window right after an
+        # async inject" BLOCKER 1 concern below) was never actually is_idle()
+        # itself -- it's the marker-vs-baseline comparison that follows,
+        # which is unaffected by removing this gate.
+        #
+        # BLOCKER 1: is_idle() alone was never sufficient on its own -- right
+        # after an async inject, the worker may not have started the turn
+        # yet, so a raw idle reading can be stale (against the *previous*
+        # completed message). Only treat the tick as complete once the
         # completion marker has actually moved past the injection baseline.
-        # A bare idle observation (marker unchanged, or unreadable) must
-        # NEVER clear tick_start_at -- the t_max watchdog remains the
-        # backstop for a worker that never reports a fresh completion.
+        # A bare marker-unchanged observation must NEVER clear tick_start_at
+        # -- the t_max watchdog remains the backstop for a worker that never
+        # reports a fresh completion.
 
         if self.tick_baseline is _BASELINE_UNKNOWN:
             # MAJOR 2 (opus re-review): the snapshot at inject time raised,
@@ -1277,11 +1867,36 @@ class Sidecar:
             return
         if marker is None or marker == self.tick_baseline:
             return
+
+        # QA fix (finding 7a): the marker differs from baseline -- a change
+        # is visible -- but require it to be STABLE across two consecutive
+        # reads before trusting it, in place of the whole-tail is_idle()
+        # gate removed above. A mid-render/animated read could otherwise
+        # catch a not-yet-fully-written marker line. A second read that
+        # disagrees means it's still changing -- treat that exactly like
+        # "not yet observed a stable completion" (return; tick_baseline is
+        # untouched, so the ORIGINAL baseline is still what the next step
+        # compares against, and the next step gets its own fresh 2-read
+        # confirmation).
+        try:
+            marker_confirm = self.adapter.completion_marker()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self._log("MARKER_ERROR", error=str(exc))
+            return
+        if marker_confirm != marker:
+            return
+
         self._collect_result(now)
 
     def _collect_result(self, now: float) -> None:
         text = self.adapter.read_result()
         self._update_usage()
+        # Phase 5 (plan §6): checked on EVERY result collection, independent
+        # of whether the tick parsed as WORKED/NO WORK/garbled -- a balance
+        # exhaustion can arrive instead of a normal reply at all.
+        self._check_balance_alert(now)
         result = parse_tick_result(text)
         self.tick_start_at = None
         self.tick_baseline = None
@@ -1335,7 +1950,20 @@ class Sidecar:
                 return
             self.accountant.reset_session()
             self._log("CLEAR", session_id=self._current_session_id_safe())
-            self._inject_tick(now, reason="drain")  # immediate, no cadence wait
+            # QA fix (finding 5): don't call _inject_tick directly here --
+            # that bypassed the is_idle() gate entirely, which is fine for
+            # opencode (clear() creates a brand-new session that reads idle
+            # immediately) but WRONG for tmux: right after send-keys("/clear",
+            # "Enter") the pane is BUSY processing that command, so pasting
+            # the next tick's prompt into it immediately risked interleaving
+            # with /clear's own output or landing before the TUI is ready
+            # for input. Mark the tick pending + due NOW and let it flow
+            # through the SAME idle-gated path every other tick uses
+            # (_maybe_deliver_tick, called later in this same step()) --
+            # opencode still drains same-step (idle immediately after
+            # clear()), tmux waits for the TUI to actually settle.
+            self.pending = True
+            self.next_tick_at = now
 
     # -- Phase 3: usage accounting --------------------------------------------
     def _update_usage(self) -> None:
@@ -1357,6 +1985,57 @@ class Sidecar:
                   pct=("unknown" if pct is None else round(pct, 1)),
                   cost=round(self.accountant.total_cost, 4))
 
+    # -- Phase 5: opencode balance/credit-exhaustion alert (plan §6) ----------
+    def _check_balance_alert(self, now: float) -> None:
+        """Checked after every result collection AND after a failed inject
+        (INJECT_ERROR). adapter.last_error() is opt-in (default None on the
+        base Adapter -- tmux adapters have no error surface and this is
+        simply a no-op for them). On a balance/credit/quota/payment match:
+        log BALANCE_ALERT, pause the agent (engine stops assigning work --
+        the SAME /agents/pause the human "cooldown" control uses) and post a
+        human-visible Correspondence alert (POST /alerts) so someone reloads
+        the account. Deliberately does NOT go dormant-until-reset: unlike
+        claude/codex's time-window exhaustion, a cost/balance exhaustion has
+        no rollover -- pause + alert-a-human is the only recovery. Both
+        POSTs are best-effort (DashboardClient.pause/alert already swallow
+        their own failures) and this whole method must never raise -- it
+        runs on the hot path of every tick collection."""
+        try:
+            err = self.adapter.last_error()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self._log("LAST_ERROR_ERROR", error=str(exc))
+            return
+        if not err:
+            return
+        name, message = err
+        if not BALANCE_ALERT_RE.search(f"{name or ''} {message or ''}"):
+            return
+        if (self._last_balance_alert_at is not None
+                and (now - self._last_balance_alert_at) < BALANCE_ALERT_COOLDOWN_S):
+            return
+        self._last_balance_alert_at = now
+        self._log("BALANCE_ALERT", name=name, message=message[:200])
+        try:
+            self.dashboard.pause(minutes=BALANCE_ALERT_PAUSE_MINUTES)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self._log("BALANCE_ALERT_PAUSE_ERROR", error=str(exc))
+        try:
+            self.dashboard.alert(
+                subject=(f"Agent {getattr(self.dashboard, 'agent_id', '?')} "
+                         f"({getattr(self.dashboard, 'project', '?')}) out of balance/credit"),
+                body=(f"Runtime reported: {name}: {message}\n\n"
+                      "Reload the DigitalOcean / open-model API account, then clear "
+                      "the pause on the Agents page (or wait for it to expire)."),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self._log("BALANCE_ALERT_POST_ERROR", error=str(exc))
+
 
 # --------------------------------------------------------------------------- #
 # CLI
@@ -1368,12 +2047,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", required=True)
     p.add_argument("--dashboard", required=True, help="dashboard base URL")
 
-    p.add_argument("--runtime", default="opencode", choices=["opencode"],
-                    help="tmux runtimes (claude/codex) are Phase 5, not yet implemented")
+    p.add_argument("--runtime", default="opencode", choices=["opencode", "tmux"],
+                    help="opencode: HTTP against `opencode serve`. tmux (Phase 5): drives a "
+                         "claude/codex TUI living in a tmux pane via capture-pane/send-keys.")
     p.add_argument("--opencode-url", help="base URL of the opencode serve instance")
     p.add_argument("--opencode-dir", help="project directory to spawn `opencode serve` in if unreachable")
     p.add_argument("--opencode-provider-id", help="model.providerID for injected prompts (optional)")
     p.add_argument("--opencode-model-id", help="model.modelID for injected prompts (optional)")
+
+    # Phase 5: tmux runtime (claude/codex TUIs).
+    p.add_argument("--tmux-target", help="tmux pane target, e.g. 'session:window.pane', for --runtime tmux")
+    p.add_argument("--tmux-spawn-cmd",
+                    help="shell command `tmux respawn-pane` uses to (re)launch the TUI if the pane "
+                         "is dead/bare-shell -- required for ensure_worker()/restart() to recover")
+    p.add_argument("--idle-quiet-seconds", type=int, default=10,
+                    help="tmux runtime: seconds capture-pane output must be unchanged to count as idle")
 
     p.add_argument("--prompt-file", required=True, help="path to the already-rendered worker prompt")
     p.add_argument("--tick-contract", help="path to tick-contract.md (default: prompts/tick-contract.md "
@@ -1386,6 +2074,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--t-stuck", type=int, default=900)
     p.add_argument("--t-max", type=int, default=None,
                     help=f"default: max(3600, verify ceiling {VERIFY_CEILING_S} + margin {T_MAX_MARGIN_S})")
+    p.add_argument("--restart-cooldown", type=int, default=DEFAULT_RESTART_COOLDOWN_S,
+                    help="minimum seconds between watchdog restarts (0 disables the cooldown, "
+                         f"restoring immediate/pre-cooldown behavior; default {DEFAULT_RESTART_COOLDOWN_S})")
 
     p.add_argument("--kill-worker-on-exit", action="store_true")
     p.add_argument("--log-file", help="also append log lines to this file")
@@ -1412,8 +2103,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
         return 2  # unreachable; parser.error exits, keeps type-checkers happy
 
-    if args.runtime != "opencode" or not args.opencode_url:
-        parser.error("--opencode-url is required for --runtime opencode (the only Phase-2 runtime)")
+    if args.runtime == "opencode" and not args.opencode_url:
+        parser.error("--opencode-url is required for --runtime opencode")
+    if args.runtime == "tmux" and not args.tmux_target:
+        parser.error("--tmux-target is required for --runtime tmux")
+
+    if args.restart_cooldown < 0:
+        parser.error(f"--restart-cooldown must be >= 0 (got {args.restart_cooldown})")
 
     if not (0 < args.context_clear_pct < args.context_low_pct <= 100):
         parser.error(
@@ -1437,14 +2133,23 @@ def main(argv: list[str] | None = None) -> int:
                       else Path(__file__).resolve().parent / "prompts" / "tick-contract.md")
     tick_contract = contract_path.read_text()
 
-    adapter = OpencodeAdapter(
-        base_url=args.opencode_url,
-        directory=args.opencode_dir,
-        provider_id=args.opencode_provider_id,
-        model_id=args.opencode_model_id,
-        project=args.project,
-        agent_id=args.agent_id,
-    )
+    if args.runtime == "opencode":
+        adapter = OpencodeAdapter(
+            base_url=args.opencode_url,
+            directory=args.opencode_dir,
+            provider_id=args.opencode_provider_id,
+            model_id=args.opencode_model_id,
+            project=args.project,
+            agent_id=args.agent_id,
+        )
+    else:
+        adapter = TmuxAdapter(
+            tmux_target=args.tmux_target,
+            spawn_cmd=args.tmux_spawn_cmd,
+            project=args.project,
+            agent_id=args.agent_id,
+            idle_quiet_seconds=args.idle_quiet_seconds,
+        )
     dashboard = DashboardClient(args.dashboard, args.agent_id, args.project)
 
     sidecar = Sidecar(
@@ -1458,6 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
         state_poll_interval=args.state_poll,
         t_stuck=args.t_stuck,
         t_max=t_max,
+        restart_cooldown=args.restart_cooldown,
         kill_worker_on_exit=args.kill_worker_on_exit,
         context_limit_tokens=args.context_limit_tokens,
         context_clear_pct=args.context_clear_pct,

@@ -159,4 +159,106 @@ if [ "$RUNTIME" = "claude" ] && [ "${DOC_FN:-}" = "dev" ] \
 fi
 
 enable_agent_loop
+
+# ---------------------------------------------------------------------------
+# AGENT_SIDECAR=1 (durable-worker-sidecar plan, Phase 5): route through the
+# side-car (agent-launchers/sidecar.py) instead of the per-cycle relaunch
+# loop (run-agent-loop.sh). The worker session becomes durable -- the
+# side-car injects "tick" prompts into the SAME session/pane forever instead
+# of re-execing the agent every poll. Opt-in per launch; AGENT_SIDECAR
+# unset/0 (the default) skips this whole block and behavior stays
+# byte-identical to today.
+# ---------------------------------------------------------------------------
+if [ "${AGENT_SIDECAR:-0}" = "1" ]; then
+  if [ -z "${AGENT_ID:-}" ]; then
+    echo "AGENT_SIDECAR=1 requires a role with an AGENT_ID ('$ROLE' has none)" >&2
+    exit 1
+  fi
+
+  # Render the worker prompt EXACTLY as an interactive/TUI launch would today
+  # (render_prompt + apply_interactive_prompt interactive mode strips the
+  # "one cycle then STOP" directive so it can't fight the tick contract) --
+  # written to its own temp file since sidecar.py takes --prompt-file, not
+  # the rendered text directly. Left in place for the sidecar's whole
+  # lifetime (it re-reads --prompt-file only at its own startup, but the
+  # path must stay valid for that one read).
+  SIDECAR_PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/sidecar-prompt-${PROJECT:-workspace}-${AGENT_ID}.XXXXXX")"
+  RENDERED_PROMPT="$(render_prompt "$PROMPT_FILE")"
+  RENDERED_PROMPT="$(apply_interactive_prompt "$RENDERED_PROMPT" interactive)"
+  printf '%s' "$RENDERED_PROMPT" > "$SIDECAR_PROMPT_FILE"
+
+  SIDECAR_ARGS=(--agent-id "$AGENT_ID" --project "$PROJECT" --dashboard "$DASHBOARD"
+                --prompt-file "$SIDECAR_PROMPT_FILE")
+
+  case "$RUNTIME" in
+    opencode)
+      # Per-agent port so multiple sidecar'd opencode workers never collide --
+      # QA fix: 4900+AGENT_ID alone collides ACROSS PROJECTS (both fleets
+      # share this host, and agent-id numbering is small/reused per project,
+      # e.g. agent 1 in cadencelms and agent 1 in tendcharting would both
+      # claim 4901). Fold a hash of PROJECT into the base so different
+      # projects land in different 20-wide port bands; cksum's mod 50 keeps
+      # the whole range within ~4900-5920 (50 bands x 20 ports/band).
+      SIDECAR_PORT=$((4900 + ($(printf '%s' "$PROJECT" | cksum | cut -d' ' -f1) % 50) * 20 + AGENT_ID))
+      # Same model resolution opencode.sh uses: ORCH_OPENCODE_MODEL (set by
+      # -m/--model above) or the glm-5.2 default; split provider/model on
+      # the slash the same way opencode.sh's config does.
+      SIDECAR_OPENCODE_MODEL="${ORCH_OPENCODE_MODEL:-orch_model/glm-5.2}"
+      SIDECAR_PROVIDER_ID="${SIDECAR_OPENCODE_MODEL%%/*}"
+      SIDECAR_MODEL_ID="${SIDECAR_OPENCODE_MODEL#*/}"
+
+      command -v opencode >/dev/null 2>&1 || { echo "missing opencode CLI on PATH" >&2; exit 1; }
+      ensure_opensource_keys
+      # opencode_write_config needs its own XDG_CONFIG_HOME (provider menu +
+      # orchestrator MCP), same as opencode.sh's normal launch -- but unlike
+      # that per-launch temp dir (cleaned up on exit), this one must persist
+      # for the whole life of the durable `opencode serve` process sidecar.py
+      # spawns (and any restart of it), so it is never rm -rf'd here.
+      SIDECAR_OC_CONFIG_HOME="$(mktemp -d "${TMPDIR:-/tmp}/opencode-sidecar-${PROJECT:-workspace}-${AGENT_ID}.XXXXXX")"
+      mkdir -p "$SIDECAR_OC_CONFIG_HOME/opencode"
+      export XDG_CONFIG_HOME="$SIDECAR_OC_CONFIG_HOME"
+      opencode_write_config "$SIDECAR_OC_CONFIG_HOME/opencode/opencode.jsonc" "$SIDECAR_OPENCODE_MODEL"
+
+      SIDECAR_ARGS+=(--runtime opencode
+                     --opencode-url "http://127.0.0.1:$SIDECAR_PORT"
+                     --opencode-dir "$WORKTREE"
+                     --opencode-provider-id "$SIDECAR_PROVIDER_ID"
+                     --opencode-model-id "$SIDECAR_MODEL_ID")
+      ;;
+    claude|codex)
+      # tmux runtimes: the operator owns a tmux pane running (or ready to run)
+      # the TUI; the side-car injects ticks into it via capture-pane/
+      # send-keys rather than owning a subprocess itself.
+      if [ -z "${SIDECAR_TMUX_TARGET:-}" ]; then
+        echo "AGENT_SIDECAR=1 with runtime '$RUNTIME' requires SIDECAR_TMUX_TARGET" \
+             "(the operator's tmux pane, e.g. 'agents:1.0')" >&2
+        exit 1
+      fi
+      # spawn_cmd = exactly what this runtime adapter would exec today for an
+      # interactive launch -- obtained by asking the adapter itself (not
+      # reconstructed here) via its --print-cmd mode, so it can never drift
+      # from the real interactive exec line (MCP wiring, model flags, etc).
+      # QA fix: force COMMAND_TIMEOUT=0 for this call -- a durable side-car
+      # session must NEVER be wrapped in `timeout N` (the side-car's own
+      # watchdog, not a per-cycle shell timeout, owns stuck detection; some
+      # roles default COMMAND_TIMEOUT>0, e.g. dev-manager's 1200s, which
+      # exists only for the per-cycle relaunch loop this bypasses).
+      if ! SIDECAR_SPAWN_CMD="$(AGENT_MODE=interactive COMMAND_TIMEOUT=0 "$ADAPTER" --print-cmd "${PASSTHRU[@]}")"; then
+        echo "failed to construct the tmux spawn command via '$ADAPTER --print-cmd'" >&2
+        exit 1
+      fi
+      SIDECAR_ARGS+=(--runtime tmux --tmux-target "$SIDECAR_TMUX_TARGET"
+                     --tmux-spawn-cmd "$SIDECAR_SPAWN_CMD")
+      ;;
+    *)
+      echo "AGENT_SIDECAR=1 is not supported for runtime '$RUNTIME' (expected claude, codex, or opencode)" >&2
+      exit 1
+      ;;
+  esac
+
+  # Foreground; Ctrl-C exits the side-car cleanly (phase-2), leaving the
+  # durable worker session/pane alive by default.
+  exec python3 "$LAUNCHER_DIR/sidecar.py" "${SIDECAR_ARGS[@]}"
+fi
+
 exec "$ADAPTER" "${PASSTHRU[@]}"

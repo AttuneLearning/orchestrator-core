@@ -4,6 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib.sh"
 
+# --print-cmd (durable-worker-sidecar plan §5/§D): guarded, zero-impact on
+# normal runs -- ONLY consumed when it is literally the first argument, before
+# anything else looks at "$@". Prints the exact exec command line instead of
+# running it, so start-agent.sh's AGENT_SIDECAR branch can capture it as the
+# tmux `spawn_cmd` the side-car uses for ensure_worker()/restart().
+PRINT_CMD_ONLY=0
+if [ "${1:-}" = "--print-cmd" ]; then
+  PRINT_CMD_ONLY=1
+  shift
+fi
+
 PROMPT="$(render_prompt "$PROMPT_FILE")"
 cd "$WORKTREE"
 
@@ -29,7 +40,13 @@ CLAUDE_MCP_FILE=""
 cleanup_claude_mcp() {
   [ -n "$CLAUDE_MCP_FILE" ] && [ -f "$CLAUDE_MCP_FILE" ] && rm -f "$CLAUDE_MCP_FILE"
 }
-trap cleanup_claude_mcp EXIT INT TERM
+# In --print-cmd mode the printed command line REFERENCES this file by path,
+# and it is meant to be run later/elsewhere (tmux respawn-pane) -- an EXIT
+# trap here would delete it out from under that future exec the moment this
+# script's own `exit 0` below fires (a normal `exec` never runs EXIT traps,
+# but the print-cmd path's early exit does). So the file is deliberately left
+# behind for the lifetime of the side-car's tmux session in that mode.
+[ "$PRINT_CMD_ONLY" = "1" ] || trap cleanup_claude_mcp EXIT INT TERM
 CLAUDE_MCP_FILE="$(mktemp "${TMPDIR:-/tmp}/claude-mcp-${PROJECT:-workspace}.XXXXXX.json")"
 if write_mcp_json "$CLAUDE_MCP_FILE"; then
   CLAUDE_MCP_ARGS=(--mcp-config "$CLAUDE_MCP_FILE" --strict-mcp-config)
@@ -55,6 +72,19 @@ fi
 
 if [ "${COMMAND_TIMEOUT:-0}" -gt 0 ]; then
   cmd=(timeout --signal=TERM "$COMMAND_TIMEOUT" "${cmd[@]}")
+fi
+
+if [ "$PRINT_CMD_ONLY" = "1" ]; then
+  # QA fix: the printed line is meant to run LATER, elsewhere (tmux
+  # respawn-pane) -- a bare "claude ..." command relies on MCP_TOOL_TIMEOUT/
+  # MCP_TIMEOUT being present in whatever environment eventually execs it,
+  # which is NOT guaranteed (a fresh tmux pane's shell doesn't inherit this
+  # script's `export`s). Prefix with `env K=V ...` so the printed command is
+  # fully self-contained -- every env var this script exports for the exec.
+  PRINT_ENV_ARGS=(env "MCP_TOOL_TIMEOUT=${MCP_TOOL_TIMEOUT}" "MCP_TIMEOUT=${MCP_TIMEOUT}")
+  printf '%q ' "${PRINT_ENV_ARGS[@]}" "${cmd[@]}"
+  printf '\n'
+  exit 0
 fi
 
 if [ "${ORCH_LAUNCH_DRY_RUN:-0}" = "1" ]; then

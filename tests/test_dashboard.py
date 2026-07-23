@@ -553,3 +553,66 @@ def test_actions_expired_row_not_actionable(settings, pool):
     r = client.post(f"/actions/{row['id']}/deny", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/actions"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5 (durable-worker-sidecar plan §6/§C): POST /alerts — the side-car's
+# no-MCP path to surface a human-visible Correspondence alert (e.g. opencode
+# balance/credit exhaustion). Mirrors the engine's own off-rails alert
+# pattern (repo.create_message(..., to_team="orch-monitor")) exactly.
+# --------------------------------------------------------------------------- #
+
+def test_post_alert_lands_as_pending_message_to_orch_monitor(settings, pool):
+    client = TestClient(create_app(pool, settings))
+
+    resp = client.post("/alerts", data={
+        "agent_id": 7,
+        "subject": "Agent 7 out of balance/credit",
+        "body": "Runtime reported: APIError: insufficient balance. Reload the account.",
+    })
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+    pending = repo.pending_messages(pool, to_team="orch-monitor")
+    assert len(pending) == 1
+    msg = pending[0]
+    assert msg["from_team"] == "sidecar-agent-7"
+    assert msg["to_team"] == "orch-monitor"
+    assert msg["subject"] == "Agent 7 out of balance/credit"
+    assert "insufficient balance" in msg["body"]
+    assert msg["priority"] == "high"
+    assert msg["kind"] == "request"
+    assert msg["status"] == "pending"
+
+
+def test_post_alert_shows_in_orch_monitor_comms_pane(settings, pool):
+    client = TestClient(create_app(pool, settings))
+
+    client.post("/alerts", data={
+        "agent_id": 3,
+        "subject": "Agent 3 out of balance/credit",
+        "body": "reload the DigitalOcean account",
+    })
+
+    body = client.get("/orch/monitor").text
+    assert "Agent 3 out of balance/credit" in body
+
+
+def test_post_alert_missing_required_field_is_client_error_not_500(settings, pool):
+    client = TestClient(create_app(pool, settings))
+
+    resp = client.post("/alerts", data={"subject": "no agent id"})
+
+    assert resp.status_code < 500
+    assert repo.pending_messages(pool, to_team="orch-monitor") == []
+
+
+def test_post_alert_defaults_empty_body(settings, pool):
+    client = TestClient(create_app(pool, settings))
+
+    resp = client.post("/alerts", data={"agent_id": 9, "subject": "no body given"})
+
+    assert resp.status_code == 200
+    pending = repo.pending_messages(pool, to_team="orch-monitor")
+    assert len(pending) == 1 and pending[0]["body"] == ""

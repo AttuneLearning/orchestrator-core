@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
 
+# ---------------------------------------------------------------------------
+# AGENT_SIDECAR (durable-worker-sidecar plan, Phase 5): set AGENT_SIDECAR=1
+# in the environment before invoking start-agent.sh to route a role through
+# the durable-worker side-car (agent-launchers/sidecar.py) instead of the
+# per-cycle relaunch loop (run-agent-loop.sh). The side-car injects "tick"
+# prompts into ONE long-lived worker session/pane forever, instead of
+# re-execing the agent every poll interval. See start-agent.sh for the
+# branch that reads this flag and plans/durable-worker-sidecar-plan.md for
+# the full design.
+#
+#   - opencode roles: the side-car spawns/owns `opencode serve` itself
+#     (HTTP adapter) on a per-agent port (4900+AGENT_ID).
+#   - claude/codex roles: require SIDECAR_TMUX_TARGET (the operator's tmux
+#     pane, e.g. "agents:1.0") in the environment -- the side-car drives that
+#     pane via tmux capture-pane/send-keys instead of owning a subprocess.
+#
+# This file (roles.sh) makes NO default-flip: no role sets AGENT_SIDECAR
+# here, and none should until the operator explicitly opts a role in via the
+# environment at launch time. AGENT_SIDECAR unset/0 (the default for every
+# role below) is byte-identical to pre-Phase-5 behavior.
+# ---------------------------------------------------------------------------
+
 resolve_role() {
   ROLE_INPUT="${1:?role required}"
   ROLE="$ROLE_INPUT"

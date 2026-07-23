@@ -4,6 +4,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib.sh"
 
+# --print-cmd (durable-worker-sidecar plan §5/§D): guarded, zero-impact on
+# normal runs -- ONLY consumed when it is literally the first argument, before
+# the runtime-args loop below (--inference etc.) ever sees "$@". Prints the
+# exact exec command line instead of running it, so start-agent.sh's
+# AGENT_SIDECAR branch can capture it as the tmux `spawn_cmd` the side-car
+# uses for ensure_worker()/restart().
+PRINT_CMD_ONLY=0
+if [ "${1:-}" = "--print-cmd" ]; then
+  PRINT_CMD_ONLY=1
+  shift
+fi
+
 # Per-fleet codex home. codex-cli keeps its session/telemetry store in an
 # embedded SQLite DB ($CODEX_HOME/logs_2.sqlite + WAL). With multiple fleets on
 # one box (e.g. two fleets sharing one host) all defaulting to ~/.codex,
@@ -197,6 +209,22 @@ else
     cmd=(codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox
       -C "$WORKTREE" "${MCP_CONFIG[@]}" "${CODEX_PROVIDER_CONFIG[@]}" "${RUNTIME_ARGS[@]}" "$PROMPT")
   fi
+fi
+
+if [ "$PRINT_CMD_ONLY" = "1" ]; then
+  # QA fix: the printed line is meant to run LATER, elsewhere (tmux
+  # respawn-pane) -- a bare "codex ..." command relies on CODEX_HOME (and,
+  # when the inference profile set one, MODEL_ACCESS_KEY) being present in
+  # whatever environment eventually execs it, which is NOT guaranteed (a
+  # fresh tmux pane's shell doesn't inherit this script's `export`s).
+  # Prefix with `env K=V ...` so the printed command is fully self-contained.
+  PRINT_ENV_ARGS=(env "CODEX_HOME=${CODEX_HOME}")
+  if [ -n "${MODEL_ACCESS_KEY:-}" ]; then
+    PRINT_ENV_ARGS+=("MODEL_ACCESS_KEY=${MODEL_ACCESS_KEY}")
+  fi
+  printf '%q ' "${PRINT_ENV_ARGS[@]}" "${cmd[@]}"
+  printf '\n'
+  exit 0
 fi
 
 if [ "${ORCH_LAUNCH_DRY_RUN:-0}" = "1" ]; then
