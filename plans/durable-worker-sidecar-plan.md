@@ -1,0 +1,258 @@
+# Plan: Durable Token-Aware Workers + Side-Car Watcher
+
+> **Status:** APPROVED (rev 3, 2026-07-22) — operator gave go-ahead; implementation
+> follows the delivery methodology in §11 (model-tiered agent team, phase gates,
+> commit per phase, e2e after development).
+> Rev 2 folded in review findings: Phase-1 heartbeat/stale sequencing fix, dormant
+> status, watchdog-vs-verify ceiling, tick protocol (markers, coalescing, clear
+> handshake), side-car poll cadence, role scope, wake dedup, acceptance criteria.
+> Rev 3 added Phase 0 (baseline hygiene) and §11 delivery methodology.
+> **Scope:** orchestrator repo only (`python-orchestrator-v1`). All launcher/prompt
+> changes are made in `templates/project-launchers/**` (canonical source of truth)
+> and pushed to project workspaces via `install-launchers`. Engine/dashboard
+> changes live in `orchestrator/**`.
+> **Supersedes/extends:** `loop-cadence-spec.md` (shipped) — this adds a *push*
+> path (side-car injection) the pull-only cadence model explicitly lacked.
+
+---
+
+## 1. Goal & principles
+
+Replace the per-cycle **relaunch** loop (`run-agent-loop.sh` re-execs the agent
+every poll) with a **durable agent session** that is driven by a thin, local
+**side-car**. Optimize for **least tokens/context per tick**. No process is
+relaunched to do normal work; relaunch is reserved for crash/context recovery.
+
+Two kinds of "relaunch", kept distinct:
+- **Work loop** — the side-car injects a "tick" prompt into the *same* long-lived
+  session. Never relaunches the process.
+- **Reasoner relaunch** — a rare janitor: kill+restart the session only on crash
+  or when context has grown too large. Time/size triggered, not per-cycle.
+
+## 2. Architecture
+
+```
+orchestrator (engine + dashboard)
+   │  publishes cadence (loop_enabled, poll_interval_*), wake_at
+   ▼
+side-car (one per worker, local)            durable worker session (TUI/serve)
+   │  - owns cadence (5-min active / dormant)   ▲   - token-gated work
+   │  - injects "tick" prompts  ───────────────►│   - drains queue while tokens last
+   │  - heartbeat ~20s ALWAYS (HTTP, token-free)│   - memory_write between issues,
+   │  - watchdog: kill+restart if stuck         │     then signals READY-TO-CLEAR
+   │  - relays orch wake_at as an injected tick │   - yields (turn ends; session persists)
+   │  - injects /clear on worker's signal       │
+   └─ Ctrl-C exitable
+```
+
+**Why the side-car owns cadence (not the worker self-sleeping):** a self-sleeping
+worker (blocked in `sleep`) cannot be woken early by injection — only by
+kill+restart, which violates "durable, never relaunched." So the worker does a
+tick and **yields**; the side-car decides when the next tick fires. This is the
+only shape that satisfies *durable session* **and** *on-demand wake*.
+
+**Role scope:** pull workers first — dev workers, QA workers, senior dev/QA
+(Phase 2 proves one opencode worker; Phase 5 extends to the rest). Dev-managers
+(also `LOOP_AGENT=1`) migrate in Phase 5 with the claude/codex adapters.
+**orch-manager is excluded** — it is an interactive supervisory console, not a
+pull worker.
+
+## 3. Worker contract (per injected tick)
+
+The worker NEVER sleeps, loops itself, or invokes runtime slash commands
+(`/clear`, `/usage` are user-level; the agent cannot run them — the side-car
+injects them). Per tick:
+
+1. Read the token budget **from the tick prompt** (the side-car computes and
+   embeds it — see §6). Apply a **safety margin**.
+2. Not enough to *finish* the next issue → emit `TICK RESULT: NO WORK (insufficient
+   tokens)` and yield.
+3. Enough → claim + complete the issue. Then **drain**: keep taking issues it can
+   finish while budget allows.
+4. **Between issues:** `memory_write` a summary of the completed work, then emit
+   `TICK RESULT: WORKED #<ids>; READY-TO-CLEAR` and yield. The **side-car** injects
+   `/clear`, then injects the next tick immediately (fresh, small context).
+5. Otherwise end every tick with a machine-readable marker (see §5 protocol):
+   `TICK RESULT: WORKED #<ids>` or `TICK RESULT: NO WORK`.
+
+## 4. Side-car spec
+
+- **Cadence:** tick every **`poll_interval_enabled_seconds`** (dashboard, default
+  5 min) while inside a **30-minute active window**; after 30 min with no work,
+  drop to **dormant** (1 hr, or until the usage window resets). **Reset the 30-min
+  timer whenever a tick did work.** ("Did work" = `TICK RESULT: WORKED …` — not a
+  bare heartbeat or a NO-WORK tick.)
+- **Own poll cadence (decoupled from worker cadence):** the side-car polls the
+  dashboard agent-state every **30–60s ALWAYS** — including while the worker is
+  dormant. This is a free HTTP GET and is what makes `wake_at` low-latency; a
+  side-car that slept the dormant hour would defeat the wake signal.
+- **Heartbeat:** HTTP `POST /agents/$AID/heartbeat` every **~20s ALWAYS** while
+  the side-car runs (not just while the worker is progressing — a dormant worker
+  must not read as dead). Includes a status field once §7's endpoint extension
+  lands: `working | idle | dormant`. Token-free (not a model call).
+- **Watchdog:** kill+restart the session (the only relaunch) on:
+  - crash (process gone);
+  - stuck: no session-output change AND no in-flight MCP call for > T_stuck;
+  - tick over **T_max**, where **T_max ≥ 3600s** — MUST exceed the verify ceiling
+    (engine `verify_timeout_s` 3000s / client 3300s). A pending `verify_run` MCP
+    call is NOT stuck; killing below the verify ceiling re-introduces the
+    false-negative bug fixed 2026-07-21 (#2/#3/#43).
+  - context too large (context-reclaim; time/size triggered).
+  After restart: re-attach/re-discover the session (opencode session id changes
+  on restart), then inject a tick immediately so the fresh session resumes work.
+- **Wake relay:** store last-seen `wake_at`; trigger **only when it increases**
+  (dedup — never re-fire on every poll). On trigger: inject a tick immediately
+  and enter the active window.
+- **Ctrl-C exitable:** `trap … INT TERM`; clean exit, leaves the durable session
+  alive by default (`--kill-worker` to tear down).
+
+## 5. Tick protocol (side-car ⇄ worker)
+
+- **Injection only when idle + coalescing:** a tick can legitimately run 35–55
+  min (full-suite verify) while the active cadence is 5 min — collisions are
+  guaranteed, not edge cases. The side-car MUST:
+  - detect busy before injecting (worker mid-turn → do not inject);
+  - keep **at most one pending tick**: if a tick is due while the worker is busy,
+    coalesce — deliver a single tick when the worker goes idle, never a backlog.
+- **Busy/idle + result detection, per runtime:**
+  - *opencode:* `opencode serve` HTTP API — session state and messages are
+    readable; post messages via the API (first-class, no keystroke risk).
+  - *claude / codex (tmux):* `tmux capture-pane` diff to detect idle-at-prompt
+    and to read the `TICK RESULT:` marker; `send-keys` only when idle.
+- **End-of-tick marker (worker obligation):** every tick ends with exactly one:
+  `TICK RESULT: WORKED #<ids>[; READY-TO-CLEAR]` | `TICK RESULT: NO WORK[ (reason)]`.
+  This is the side-car's only signal for the 30-min reset, the clear handshake,
+  and stuck detection — the prompt templates must enforce it.
+- **Clear handshake:** worker emits `READY-TO-CLEAR` → side-car injects `/clear`
+  → side-car injects next tick. The worker never clears itself.
+
+## 6. Token accounting & exhaustion (differs by runtime)
+
+The **side-car owns token accounting** and embeds the budget into each tick
+prompt ("you have ≈N% of the window / $ budget remaining"); the worker only
+applies the margin. Sources:
+
+- **claude, codex** — time-based usage window. No exact reset timestamp is
+  exposed (5h rolling windows), so the side-car tracks usage **heuristically**
+  (session accounting + observed limit errors) — do not treat reset time as
+  deterministic. On exhaustion: dormant until the estimated window reset, then
+  probe with a tick.
+- **opencode** — cost/balance (DigitalOcean / open-model API account), **not** a
+  timed reset. The serve API exposes real per-session token counts; on
+  balance/API errors **alert the human to reload the account** (dashboard alert +
+  Correspondence message); do not wait for a rollover that won't come.
+
+## 7. Orchestrator (engine + dashboard) changes
+
+- **Cadence-window fields** (migration): add active-window seconds (default 1800)
+  and dormant cadence; the existing `poll_interval_enabled_seconds` (5 min) is the
+  active cadence. Operator-editable on `/agents`.
+- **Heartbeat status extension:** extend `POST /agents/{id}/heartbeat` (and agent
+  state) with an optional status: `working | idle | dormant`. `dormant` is a
+  first-class state — **excluded from stale alerting** — so an hour-dormant worker
+  doesn't read as dead. (Today the endpoint only bumps `last_seen`.)
+- **Wake signal:** per-project `wake_at` timestamp surfaced in the agent-state
+  payload the side-car already fetches, plus a trigger (orch-manager after
+  promoting work, and a dashboard "Wake all" button).
+- **Stale window (sequencing matters — see Phase 1):** target ~**90s**, but ONLY
+  after heartbeats are continuous. Note: the config default is
+  `agent_stale_seconds: 300` (`config.py`); the 1800 value is a cadencelms-only
+  daemon env override. Set the new value in **config/per-instance settings** so
+  both projects get it consistently — not just in `start-orch-daemon.sh`. Stale
+  agents get their issues **reclaimed** (not merely flagged), so a stale window
+  below the worst silent gap causes reclaim churn.
+- **Dashboard bind:** set **`DASHBOARD_HOST=0.0.0.0`** (all interfaces + loopback).
+  The dashboard currently has **no auth** — accepted deliberately: the operator is
+  the sole owner of both the server and the network. Auth to be added later;
+  until then this is a known, owner-accepted exposure.
+
+## 8. Distribution (canonical → projects)
+
+- **Canonical source:** `templates/project-launchers/**`. Edit there only.
+- **Publish:** `python -m orchestrator.cli install-launchers --workspace <PATH>
+  --force` per project (cadencelms, tendcharting).
+- **⚠ Gap found during reconciliation:** `install-launchers --force` overwrites
+  **every** template file, including per-project-customized env
+  (`orchestrator.env` has each project's `DASHBOARD`, `DECOMPOSITION_TIER`,
+  qwen-YOLO). A blind `--force` would clobber those. **Fix as part of this work:**
+  teach `install-launchers` to skip/merge a declared set of per-project files
+  (`orchestrator.env`, `secrets.env`, `*-yolo.env`) instead of overwriting. Until
+  then, launcher code is synced surgically (code files only).
+
+## 9. Reconciliation baseline (done 2026-07-22)
+
+Before this plan, real fixes were scattered. Now folded into the canonical
+template and synced to both projects (code files only; env preserved):
+- verify-timeout MCP client fix (`claude.sh` `MCP_TOOL_TIMEOUT`; `codex.sh`
+  `tool_timeout_sec=3300`) — was cadencelms-only, now canonical.
+- `CODEX_HOME` per-fleet isolation (`codex.sh`) — was tendcharting-only, now
+  canonical (prevents cross-fleet sqlite WAL contention wedging QA).
+- `apply_interactive_prompt` + opencode `permission.external_directory` for senior
+  roles (`lib.sh` + runtime adapters) — was cadencelms-only, now canonical.
+
+## 10. Phasing (each independently shippable; publish after each)
+
+**Gate rule:** every phase is completed AND functionally tested before the next
+begins. Long soaks (24h phase-1, 12h phase-2) run in parallel with the next
+phase's development and gate the **fleet-wide publish** step, not phase
+progression. Full e2e testing runs after all development completes. **Commit
+(and tag `phase-N`) between each phase.**
+
+| Phase | Change (orchestrator repo) | Acceptance | Publish |
+|---|---|---|---|
+| 0 | Baseline hygiene: commit the ~15 dirty files on `feat/contract-lifecycle-mcp` (verify-timeout engine fix, template reconciliation, this plan) in logical commits; branch `feat/durable-worker-sidecar` | clean `git status`; existing pytest suite green | none |
+| 1 | Heartbeat 60→20s AND move it to **loop-lifetime** in `run-agent-loop.sh` (runs through inter-cycle sleeps — today it stops between cycles, so cutting stale first would flag every idle worker and trigger issue reclaim). **Only then** stale → 90s (in config/per-instance for BOTH projects). `DASHBOARD_HOST=0.0.0.0`. | 24h with zero false-stale flags and zero reclaim events on idle-but-alive workers; dashboard reachable on LAN + loopback | push + dashboard restart |
+| 2 | Side-car script (cadence, always-on heartbeat, watchdog with T_max ≥ 3600s, tick coalescing, Ctrl-C) + worker-prompt tick contract (markers, clear handshake); prove on ONE opencode worker via `opencode serve` | ≥ 12h run: work completed across ≥ 3 ticks, zero session relaunches for work, one coalesced tick under a long verify, `TICK RESULT` parsed every tick, clean Ctrl-C | push cadencelms, validate |
+| 3 | Token accounting in side-car (budget embedded in tick prompt) + memory→READY-TO-CLEAR→`/clear` handshake | worker drains ≥ 2 issues in one active window with a `/clear` between them; context after clear ≪ before; bails cleanly on low budget | push |
+| 4 | Engine migration: cadence-window fields + heartbeat `status` (`dormant` excluded from stale alerts) + `wake_at` signal; side-car wake relay (dedup on increase) | dormant worker shows `dormant` not stale; "Wake all" reaches a dormant worker in < 90s | migration + push |
+| 5 | claude/codex tmux adapters (capture-pane idle detection); dev-managers migrated; retire per-cycle relaunch for migrated roles; opencode balance-alert; `install-launchers` env-preserve fix | all migrated roles run ≥ 24h on side-car; `install-launchers --force` leaves env files intact (dry-run diff proof) | push both projects |
+
+## 11. Delivery methodology (operator-approved 2026-07-22)
+
+**Agent team (model-tiered):**
+- **haiku** — almost all initial coding, driven by tight, fully-specified
+  file-level specs with exact anchors and expected diffs (haiku executes narrow
+  specs reliably; under-specification is what burns it): Phase-1 heartbeat/config
+  edits, migration boilerplate, prompt-template rewrites, `install-launchers`
+  env-preserve, balance-alert.
+- **sonnet** — complicated coding: side-car state machine (cadence/coalescing/
+  watchdog), tmux capture-pane idle detection, engine stale/reclaim integration,
+  token heuristics.
+- **opus** — sparingly, for the hardest correctness spots (coalescing races,
+  reclaim-path change) when sonnet struggles.
+- **QA:** sonnet reviews every phase diff; opus gate-reviews the risky phases
+  (2 = side-car, 4 = migration/reclaim) and the final e2e.
+- The orch-manager session is the integrator: writes specs, reviews, commits.
+
+**Reliability practices:**
+1. **Fake-worker stub** (script that emits `TICK RESULT:` markers on cue) so the
+   entire side-car state machine — coalescing, 30-min reset, watchdog, wake
+   dedup — is tested deterministically and token-free before any live agent runs.
+2. **Scratch orchestrator instance** (`--instance sandbox`) for stale/reclaim
+   experiments — never the live cadencelms fleet; a mis-tuned stale window would
+   reclaim real in-progress issues.
+3. **Existing pytest suite runs before AND after every phase** (regression net
+   for engine changes).
+4. **DB backup before the Phase-4 migration** (`sync-backups.sh` →
+   orchestrator-backups repo); tag each phase commit (`phase-N`) for
+   one-command rollback.
+5. **Publish choreography:** pause worker loops → `install-launchers` push →
+   relaunch. Never hot-swap launcher scripts under running loops.
+
+## 12. Open items / risks
+
+- **Token estimation is a heuristic** (accepted): side-car accounting + margin;
+  may bail before an issue it could have done, but never mid-commit. Claude/codex
+  window-reset time is estimated, not exact.
+- **tmux inject fragility** for claude/codex: capture-pane idle-detection is the
+  mitigation; inject only at an idle prompt, coalesce to one pending tick.
+  opencode's API path is cleaner — prefer `opencode serve` where possible.
+- **Context persistence across ticks** relies on the clear handshake; the
+  side-car context-age restart is the backstop if a worker stops signalling
+  READY-TO-CLEAR.
+- **Watchdog tuning:** T_max must track the verify ceiling if `verify_timeout_s`
+  is ever raised — derive it from settings (ceiling + margin), don't hardcode.
+- **`install-launchers` env-clobber** must be fixed before any `--force` push
+  (Phase 5), or per-project env is destroyed.
+- **Dashboard auth** deliberately deferred (owner-accepted, single-owner
+  server/network); revisit when adding any additional operator or exposure.
