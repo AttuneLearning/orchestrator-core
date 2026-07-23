@@ -191,8 +191,9 @@ def parse_tick_result(text: str | None) -> TickResult:
     # appending it to the TICK RESULT line as the contract asks. Tolerant on
     # purpose; the contract (tick-contract.md) still asks for same-line.
     # Case-SENSITIVE uppercase-token match only -- see _READY_TO_CLEAR_RE.
-    # TODO(phase-3): hook the token-budget FORCED_CLEAR trigger here too, same
-    # whole-text scan, once the Phase-3 token-budget spec lands.
+    # (FORCED_CLEAR is deliberately NOT text-driven: it fires from
+    # TokenAccountant.exhausted() in Sidecar._maybe_forced_clear, the backstop
+    # for a worker that never emits this token at all.)
     ready_to_clear = bool(_READY_TO_CLEAR_RE.search(text))
 
     if re.search(r"\bno work\b", lowered):
