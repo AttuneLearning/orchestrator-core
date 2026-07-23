@@ -1320,41 +1320,78 @@ def test_token_accountant_reset_session_folds_cost_and_clears_context():
 # prefer the server's own `tokens.total` when it's a sane positive int.
 # --------------------------------------------------------------------------- #
 
+def _oc_usage_stub(turn_tokens, cost):
+    """Stub OpencodeAdapter._request for get_usage: the LAST completed
+    assistant message carries `turn_tokens`; GET /session carries cumulative
+    cost. Mirrors the two calls get_usage makes since DEFECT-SIDECAR-2 (per-turn
+    tokens from /message, cumulative cost from /session)."""
+    messages = [{"info": {"role": "assistant", "time": {"completed": 1},
+                          "tokens": turn_tokens}}]
+
+    def _request(method, path, payload=None, timeout=None):
+        if path.endswith("/message"):
+            return messages
+        return {"cost": cost}
+    return _request
+
+
 def test_opencode_adapter_get_usage_prefers_total_when_present():
     adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
     adapter.session_id = "ses_1"
-    adapter._request = lambda method, path, payload=None, timeout=None: {
-        "tokens": {"input": 100, "output": 50, "reasoning": 20,
-                   "cache": {"read": 10, "write": 5}, "total": 999},
-        "cost": 1.23,
-    }
+    adapter._request = _oc_usage_stub(
+        {"input": 100, "output": 50, "reasoning": 20,
+         "cache": {"read": 10, "write": 5}, "total": 999}, cost=1.23)
     assert adapter.get_usage() == {"context_tokens": 999, "session_cost": 1.23}
 
 
 def test_opencode_adapter_get_usage_sums_all_fields_including_cache_write_and_reasoning():
     adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
     adapter.session_id = "ses_1"
-    # No `total` field -> must fall back to summing ALL parts, including
-    # cache.write (15) and reasoning (20) -- the two fields the pre-QA-fix
-    # code silently dropped.
-    adapter._request = lambda method, path, payload=None, timeout=None: {
-        "tokens": {"input": 100, "output": 50, "reasoning": 20,
-                   "cache": {"read": 10, "write": 15}},
-        "cost": 0.5,
-    }
-    usage = adapter.get_usage()
-    assert usage == {"context_tokens": 195, "session_cost": 0.5}   # 100+50+20+10+15
+    # No per-turn `total` -> sum ALL parts, including cache.write (15) and
+    # reasoning (20) -- the two fields the pre-QA-fix code silently dropped.
+    adapter._request = _oc_usage_stub(
+        {"input": 100, "output": 50, "reasoning": 20,
+         "cache": {"read": 10, "write": 15}}, cost=0.5)
+    assert adapter.get_usage() == {"context_tokens": 195, "session_cost": 0.5}   # 100+50+20+10+15
 
 
 def test_opencode_adapter_get_usage_falls_back_to_sum_when_total_missing_or_zero():
     adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
     adapter.session_id = "ses_1"
-    adapter._request = lambda method, path, payload=None, timeout=None: {
-        "tokens": {"input": 10, "output": 5, "reasoning": 0,
-                   "cache": {"read": 0, "write": 0}, "total": 0},
-        "cost": 0.0,
-    }
+    adapter._request = _oc_usage_stub(
+        {"input": 10, "output": 5, "reasoning": 0,
+         "cache": {"read": 0, "write": 0}, "total": 0}, cost=0.0)
     assert adapter.get_usage() == {"context_tokens": 15, "session_cost": 0.0}
+
+
+def test_opencode_adapter_get_usage_tracks_last_turn_not_session_cumulative():
+    """DEFECT-SIDECAR-2 regression (plan §14): context occupancy must come from
+    the LAST completed assistant turn, NOT the session's cumulative token total.
+    In the first soak (2026-07-23) reading the session sum reported
+    context_tokens=2,860,186 (1589% of a 180k window) after one work cycle and
+    forced a spurious clear. Here the session object still carries that
+    cumulative trap, but the reported context must equal only the final turn."""
+    adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
+    adapter.session_id = "ses_1"
+    messages = [
+        {"info": {"role": "assistant", "time": {"completed": 1},
+                  "tokens": {"input": 50000, "output": 40000, "reasoning": 0,
+                             "cache": {"read": 0, "write": 0}}}},
+        {"info": {"role": "user", "time": {"completed": 2}}},
+        {"info": {"role": "assistant", "time": {"completed": 3},
+                  "tokens": {"input": 18000, "output": 1000, "reasoning": 0,
+                             "cache": {"read": 24, "write": 27}}}},
+    ]
+
+    def _request(method, path, payload=None, timeout=None):
+        if path.endswith("/message"):
+            return messages
+        return {"tokens": {"total": 2_860_186}, "cost": 3.5}   # cumulative session trap
+
+    adapter._request = _request
+    usage = adapter.get_usage()
+    assert usage["context_tokens"] == 19051   # last turn only: 18000+1000+0+24+27
+    assert usage["session_cost"] == 3.5
 
 
 def test_opencode_adapter_get_usage_returns_none_on_request_failure():
@@ -1364,6 +1401,17 @@ def test_opencode_adapter_get_usage_returns_none_on_request_failure():
     def _raise(*a, **kw):
         raise RuntimeError("boom")
     adapter._request = _raise
+    assert adapter.get_usage() is None
+
+
+def test_opencode_adapter_get_usage_none_when_no_completed_turn_yet():
+    """Right after clear() the fresh session has no completed assistant turn --
+    get_usage must degrade to unknown (None), not report 0 (which would read as
+    an empty context and defeat the budget layer)."""
+    adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
+    adapter.session_id = "ses_1"
+    adapter._request = lambda method, path, payload=None, timeout=None: (
+        [] if path.endswith("/message") else {"cost": 0.0})
     assert adapter.get_usage() is None
 
 

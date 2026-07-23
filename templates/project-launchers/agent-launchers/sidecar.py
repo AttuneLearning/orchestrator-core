@@ -641,57 +641,71 @@ class OpencodeAdapter(Adapter):
     def current_session_id(self) -> str | None:
         return self.session_id
 
-    def get_usage(self) -> dict | None:
-        # Phase 3: GET /session/{id} exposes cumulative per-session
-        # Session.tokens / Session.cost (oc-api-cheatsheet.md). Tolerant of
-        # any missing/malformed field -- this must NEVER raise, it is polled
-        # every tick and a hiccup here must degrade to "usage unknown", not
-        # crash the side-car.
-        if not self.session_id:
-            return None
+    @staticmethod
+    def _nonneg_int(value) -> int:
         try:
-            data = self._request("GET", f"/session/{self.session_id}")
-        except Exception:
-            return None
-        if not isinstance(data, dict):
-            return None
+            n = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return n if n >= 0 else 0
 
-        def _nonneg_int(value) -> int:
-            try:
-                n = int(value)
-            except (TypeError, ValueError):
-                return 0
-            return n if n >= 0 else 0
-
-        tokens = data.get("tokens")
-        tokens = tokens if isinstance(tokens, dict) else {}
+    @classmethod
+    def _context_tokens_from(cls, tokens) -> int | None:
+        """Current-context occupancy from ONE assistant turn's info.tokens.
+        Prefer the server's own per-message `total` when it's a sane positive
+        int (it already accounts for every sub-field); otherwise sum ALL parts
+        ourselves -- input + output + reasoning + cache.read + cache.write
+        (dropping none, the Phase-3 QA fix). Returns None when tokens is
+        absent/garbled so get_usage can degrade to the unknown-budget line
+        rather than report a bogus 0."""
+        if not isinstance(tokens, dict):
+            return None
         cache = tokens.get("cache")
         cache = cache if isinstance(cache, dict) else {}
-
-        # QA fix (MAJOR): the previous version summed only input + cache.read
-        # + output, silently dropping cache.write and reasoning tokens -- both
-        # of which count against the real context window. Prefer the
-        # server's own `total` when it's a sane positive int (it already
-        # accounts for every sub-field); only fall back to summing the parts
-        # ourselves -- ALL of them -- when `total` is missing/invalid.
         raw_total = tokens.get("total")
-        total_int = None
         if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool) and raw_total > 0:
-            total_int = int(raw_total)
+            return int(raw_total)
+        return (cls._nonneg_int(tokens.get("input"))
+                + cls._nonneg_int(tokens.get("output"))
+                + cls._nonneg_int(tokens.get("reasoning"))
+                + cls._nonneg_int(cache.get("read"))
+                + cls._nonneg_int(cache.get("write")))
 
-        if total_int is not None:
-            context_tokens = total_int
-        else:
-            context_tokens = (_nonneg_int(tokens.get("input"))
-                               + _nonneg_int(tokens.get("output"))
-                               + _nonneg_int(tokens.get("reasoning"))
-                               + _nonneg_int(cache.get("read"))
-                               + _nonneg_int(cache.get("write")))
+    def get_usage(self) -> dict | None:
+        # DEFECT-SIDECAR-2 (plan §14): context occupancy is a CURRENT-turn
+        # quantity, NOT a session sum. GET /session exposes Session.tokens as a
+        # per-session CUMULATIVE running total that only ever grows; feeding it
+        # to TokenAccountant (which divides by the ~180k window) reported 1589%
+        # after a single work cycle and tripped a spurious FORCED_CLEAR (first
+        # soak, 2026-07-23). The live context window is the LAST completed
+        # assistant message's OWN per-turn tokens, so read those. session_cost
+        # is genuinely cumulative, so it still comes from GET /session.
+        # Tolerant of any missing/malformed field -- polled every tick, a hiccup
+        # must degrade to "usage unknown", never crash the side-car.
+        if not self.session_id:
+            return None
+        msg = self._last_completed_assistant_message()
+        if msg is None:
+            return None
+        info = msg.get("info")
+        info = info if isinstance(info, dict) else {}
+        context_tokens = self._context_tokens_from(info.get("tokens"))
+        if context_tokens is None:
+            return None
 
-        try:
-            session_cost = float(data.get("cost"))
-        except (TypeError, ValueError):
-            session_cost = 0.0
+        # Cumulative session cost, best-effort: a failure here degrades cost to
+        # 0.0 but must never suppress the (already-obtained) token reading.
+        session_cost = 0.0
+        if self.session_id:
+            try:
+                data = self._request("GET", f"/session/{self.session_id}")
+                if isinstance(data, dict):
+                    try:
+                        session_cost = float(data.get("cost"))
+                    except (TypeError, ValueError):
+                        session_cost = 0.0
+            except Exception:
+                session_cost = 0.0
         if session_cost < 0:
             session_cost = 0.0
 
