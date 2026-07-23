@@ -25,7 +25,7 @@ from ..workflow.runner import run_step
 from .npm_deps import ensure_deps_current
 
 WORKTREES_DIR = Path("/tmp/orchestrator-worktrees")
-VERIFY_TIMEOUT_S = 300
+VERIFY_TIMEOUT_S = 3000  # fallback default only; the live ceiling is settings.verify_timeout_s (dashboard-managed)
 _GIT_ID = ["-c", "user.email=orchestrator@local", "-c", "user.name=orchestrator",
            "-c", "commit.gpgsign=false"]
 _BLOCKED_NOTE = "approval pending on /actions; re-run after approval"
@@ -377,10 +377,11 @@ def _apply_in_worktree(
         return {"passed": False, "error": f"dependency install failed: {deps['reason']}",
                 "branch": branch, "commit": sha, "deps": deps}
 
+    verify_timeout_s = getattr(settings, "verify_timeout_s", VERIFY_TIMEOUT_S)
     try:
         proc = subprocess.run(
             settings.verify_cmd, shell=True, cwd=wt,
-            capture_output=True, text=True, timeout=VERIFY_TIMEOUT_S,
+            capture_output=True, text=True, timeout=verify_timeout_s,
         )
         return {
             "passed": proc.returncode == 0,
@@ -393,7 +394,7 @@ def _apply_in_worktree(
             "deps": deps,
         }
     except subprocess.TimeoutExpired:
-        return {"passed": False, "error": f"verify timed out after {VERIFY_TIMEOUT_S}s",
+        return {"passed": False, "error": f"verify timed out after {verify_timeout_s}s",
                 "branch": branch, "commit": sha}
 
 

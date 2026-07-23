@@ -435,6 +435,82 @@ def update_state(
     return _issue_from_row(row)
 
 
+def hold_decomposed_parent(
+    pool: ConnectionPool,
+    issue_id: int,
+    *,
+    event_type: str = "coordination_hold",
+    payload: Optional[dict[str, Any]] = None,
+) -> Issue:
+    """Keep a decomposed issue in the coordination-parent hold state.
+
+    A parent with children is not a worker deliverable.  This is an explicit
+    lifecycle repair path for stale/admin-recovered states (including
+    ``in_review``), so it intentionally does not use the ordinary transition
+    validator: ``in_review -> blocked`` is not an autonomous gate transition.
+    The child check is performed inside the same transaction as the update so
+    callers cannot accidentally use this for a normal issue.
+    """
+    with pool.connection() as conn, conn.transaction():
+        child_rows = conn.execute(
+            "SELECT id FROM issues WHERE parent_id = %s ORDER BY id", (issue_id,)
+        ).fetchall()
+        if not child_rows:
+            raise ValueError(f"issue {issue_id} is not a decomposed parent")
+        child_ids = [row[0] for row in child_rows]
+        cur = conn.execute("SELECT state FROM issues WHERE id = %s", (issue_id,)).fetchone()
+        if cur is None:
+            raise ValueError(f"no issue {issue_id}")
+        detail = dict(payload or {})
+        detail.update({"reason": "decomposed parent is coordination-only",
+                       "children": child_ids})
+        row = conn.execute(
+            "UPDATE issues SET state = %s, gate_type = NULL, assigned_agent = NULL, "
+            "updated_at = now() WHERE id = %s RETURNING "
+            "id, goal_id, title, description, parent_id, depth, team, pipeline, "
+            "state, gate_type, retry_count, step_count, assigned_agent, "
+            "triggered_by_message, origin_message_id, work_type, created_at, updated_at",
+            (IssueState.BLOCKED.value, issue_id),
+        ).fetchone()
+        _append_event(conn, issue_id, event_type, cur[0], IssueState.BLOCKED.value, detail)
+    return _issue_from_row(row)
+
+
+def complete_decomposed_parent(
+    pool: ConnectionPool,
+    issue_id: int,
+    *,
+    payload: Optional[dict[str, Any]] = None,
+) -> Issue:
+    """Close a coordination parent after every child is complete."""
+    with pool.connection() as conn, conn.transaction():
+        child_rows = conn.execute(
+            "SELECT id, state FROM issues WHERE parent_id = %s ORDER BY id",
+            (issue_id,),
+        ).fetchall()
+        if not child_rows:
+            raise ValueError(f"issue {issue_id} is not a decomposed parent")
+        if any(state != IssueState.DONE.value for _, state in child_rows):
+            raise ValueError(f"decomposed parent {issue_id} has unfinished children")
+        cur = conn.execute("SELECT state FROM issues WHERE id = %s", (issue_id,)).fetchone()
+        if cur is None:
+            raise ValueError(f"no issue {issue_id}")
+        detail = dict(payload or {})
+        detail.update({"reason": "all decomposed children complete",
+                       "children": [row[0] for row in child_rows]})
+        row = conn.execute(
+            "UPDATE issues SET state = %s, gate_type = NULL, assigned_agent = NULL, "
+            "updated_at = now() WHERE id = %s RETURNING "
+            "id, goal_id, title, description, parent_id, depth, team, pipeline, "
+            "state, gate_type, retry_count, step_count, assigned_agent, "
+            "triggered_by_message, origin_message_id, work_type, created_at, updated_at",
+            (IssueState.DONE.value, issue_id),
+        ).fetchone()
+        _append_event(conn, issue_id, "coordination_complete", cur[0],
+                      IssueState.DONE.value, detail)
+    return _issue_from_row(row)
+
+
 def apply_directive(
     pool: ConnectionPool,
     issue_id: int,
@@ -454,21 +530,31 @@ def apply_directive(
     issue = get_issue(pool, issue_id)
     if issue is None:
         raise ValueError(f"no issue {issue_id}")
-    to_state = IssueState.IN_PROGRESS.value
     _recoverable = (IssueState.OFF_RAILS.value, IssueState.FAILED.value)
     if issue.state not in _recoverable or not validate_transition(
-        issue.state, to_state, directive=True
+        issue.state, IssueState.IN_PROGRESS.value, directive=True
     ):
         raise ValueError(
             f"directive '{directive}' not applicable: issue {issue_id} is "
             f"'{issue.state}', expected 'off_rails' or 'failed'"
         )
-    recovered = update_state(
-        pool, issue_id, to_state, gate_type=issue.gate_type,
-        event_type="directive",
-        payload={"directive": directive, "note": note, "actor": actor},
-        retry_count=0, step_count=0,
-    )
+    children = list_issues(pool, parent_id=issue.id)
+    # Directives recover worker deliverables, not coordination parents.  Keep
+    # decomposed parents held while their children run; otherwise the engine
+    # will re-enter them into a worker gate and recreate the review crash-loop.
+    if children:
+        recovered = hold_decomposed_parent(
+            pool, issue_id, event_type="directive",
+            payload={"directive": directive, "note": note, "actor": actor,
+                     "held_state": IssueState.BLOCKED.value},
+        )
+    else:
+        recovered = update_state(
+            pool, issue_id, IssueState.IN_PROGRESS.value, gate_type=issue.gate_type,
+            event_type="directive",
+            payload={"directive": directive, "note": note, "actor": actor},
+            retry_count=0, step_count=0,
+        )
     # Re-activate a parent goal that reconcile closed/paused on this failure,
     # otherwise the recovered issue would sit in a non-open goal and never run.
     if issue.goal_id is not None:

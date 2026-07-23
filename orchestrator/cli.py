@@ -473,9 +473,11 @@ def _cmd_serve_dashboard(args, settings) -> int:
 
     # No explicit pool: let create_app build the multi-coordinator registry from
     # config/instances.yaml (passing a pool forces the single-'default' test path).
+    host = args.host if args.host is not None else settings.dashboard_host
+    port = args.port if args.port is not None else settings.dashboard_port
     app = create_app(settings=settings)
-    print(f"dashboard: http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    print(f"dashboard: http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
     return 0
 
 
@@ -1340,8 +1342,9 @@ def build_parser() -> argparse.ArgumentParser:
     sv.set_defaults(func=_cmd_serve)
 
     sd = sub.add_parser("serve-dashboard", help="start the FastAPI ops dashboard")
-    sd.add_argument("--host", default="127.0.0.1")
-    sd.add_argument("--port", type=int, default=8000)
+    # Defaults None → fall back to settings (DASHBOARD_HOST/DASHBOARD_PORT in .env).
+    sd.add_argument("--host", default=None)
+    sd.add_argument("--port", type=int, default=None)
     sd.set_defaults(func=_cmd_serve_dashboard)
 
     ic = sub.add_parser("import-contracts",

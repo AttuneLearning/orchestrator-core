@@ -950,6 +950,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None,
         if report_path and not os.path.isabs(report_path):
             report_path = os.path.join(wt, report_path)
         report_fmt = settings.verify_report_format or "junit"
+        verify_timeout_s = int(getattr(settings, "verify_timeout_s", 3000) or 3000)
 
         def _run_once() -> tuple[int, str, str, float]:
             # Remove any stale report so a parse can never read a prior run's result.
@@ -961,12 +962,12 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None,
             started = time.monotonic()
             try:
                 proc = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True,
-                                      text=True, timeout=900)
+                                      text=True, timeout=verify_timeout_s)
                 rc, o, e = proc.returncode, proc.stdout, proc.stderr
             except subprocess.TimeoutExpired as exc:
                 rc = 124
                 o = (exc.stdout or b"").decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-                e = "verify timed out after 900s"
+                e = f"verify timed out after {verify_timeout_s}s"
             return rc, o, e, round(time.monotonic() - started, 1)
 
         def _stamp(rc, o, e, dur, report, classification, attempt):

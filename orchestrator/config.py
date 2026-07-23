@@ -121,6 +121,10 @@ class Settings:
     verify_report_format: str = "junit"     # junit | (phase 2: vitest-json/pytest-json/gotest-json)
     verify_flake_retries: int = 1           # clean re-runs of a flaky_exit before flagging a human
     verify_ignore_unhandled: list[str] = field(default_factory=list)  # extra regexes, merged with defaults
+    # Max wall-clock seconds a verify command (verify_run subprocess + apply-path
+    # verify) may run before it is killed and reported as timed out. Full monorepo
+    # suites can take 30+ min, so the ceiling must exceed the slowest real run.
+    verify_timeout_s: int = 3000
 
     # Coordinator DB backups. The engine runs this best-effort after e2e gate
     # success and goal completion. The CLI/script can run it manually too.
@@ -142,6 +146,12 @@ class Settings:
     # the integrator; fast-forwards (or merges) — never rebases/rewrites history — and
     # aborts on conflict, leaving the worktree pristine. OFF by default.
     auto_rebase_downstream: bool = False
+
+    # FastAPI ops dashboard bind address. `serve-dashboard` falls back to these
+    # when --host/--port are not passed, so the deployment's address persists in
+    # .env (DASHBOARD_HOST/DASHBOARD_PORT) instead of living only in a launcher flag.
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8000
 
     # Shared development docs browser (dashboard "Docs" tab). Read-only: the dashboard
     # lists and renders files under this dir (and subdirs) so agents/humans share dev
@@ -424,12 +434,15 @@ def load_settings(instance: str | None = None) -> Settings:
         verify_report_format=pick("VERIFY_REPORT_FORMAT", "verify_report_format", "junit"),
         verify_flake_retries=int(pick("VERIFY_FLAKE_RETRIES", "verify_flake_retries", "1")),
         verify_ignore_unhandled=pick_list("verify_ignore_unhandled", []),
+        verify_timeout_s=int(pick("VERIFY_TIMEOUT_S", "verify_timeout_s", "3000")),
         database_backup_enabled=pick_bool("ORCH_DB_BACKUP_ENABLED", "database_backup_enabled", True),
         database_backup_dir=pick("ORCH_DB_BACKUP_DIR", "database_backup_dir", "backups/orchestrator-db"),
         auto_promote_enabled=pick_bool("AUTO_PROMOTE_ENABLED", "auto_promote_enabled", False),
         promote_repo_path=pick("PROMOTE_REPO_PATH", "promote_repo_path", ""),
         promote_branch=pick("PROMOTE_BRANCH", "promote_branch", "main"),
         auto_rebase_downstream=pick_bool("AUTO_REBASE_DOWNSTREAM", "auto_rebase_downstream", False),
+        dashboard_host=pick("DASHBOARD_HOST", "dashboard_host", "127.0.0.1"),
+        dashboard_port=int(pick("DASHBOARD_PORT", "dashboard_port", "8000")),
         docs_path=pick("DOCS_PATH", "docs_path", ""),
         contract_gate_enabled=pick_bool("CONTRACT_GATE_ENABLED", "contract_gate_enabled", False),
         default_pipeline=pick("DEFAULT_PIPELINE", "default_pipeline", "pipeline-1"),

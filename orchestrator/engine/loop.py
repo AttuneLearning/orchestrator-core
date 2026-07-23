@@ -629,6 +629,16 @@ class Engine:
         maint_ids = repo.maintenance_goal_ids(self.pool)
         for issue in focus.select_assignable(ready, in_progress, maint_ids):
             try:
+                children = repo.list_issues(self.pool, parent_id=issue.id)
+                if children and all(c.state == IssueState.DONE.value for c in children):
+                    # Once all children finish, close the coordination parent
+                    # directly. It has no worker deliverable or review gate.
+                    repo.complete_decomposed_parent(
+                        self.pool, issue.id,
+                        payload={"phase": "assign"},
+                    )
+                    summary.completed += 1
+                    continue
                 gate = first_gate(self._pipeline(issue),
                                   triggered_by_message=issue.triggered_by_message)
                 if gate is None:
@@ -653,6 +663,17 @@ class Engine:
         # working them out-of-band).
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
             try:
+                children = repo.list_issues(self.pool, parent_id=issue.id)
+                if children:
+                    # A decomposed parent coordinates its children; it is never
+                    # executable work and must not be sent to a worker/review gate.
+                    if issue.assigned_agent is not None:
+                        self._release_agent(issue)
+                    repo.hold_decomposed_parent(
+                        self.pool, issue.id,
+                        payload={"phase": "work", "previous_gate": issue.gate_type},
+                    )
+                    continue
                 gate = self._pipeline(issue).gate(issue.gate_type or "")
                 if gate is None or gate.mode != "pull":
                     continue
@@ -694,6 +715,17 @@ class Engine:
         # Work step: IN_PROGRESS issues do their gate's work, then enter review.
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_PROGRESS.value]):
             try:
+                children = repo.list_issues(self.pool, parent_id=issue.id)
+                if children:
+                    # A decomposed parent coordinates its children; it is never
+                    # executable work and must not be sent to a worker/review gate.
+                    if issue.assigned_agent is not None:
+                        self._release_agent(issue)
+                    repo.hold_decomposed_parent(
+                        self.pool, issue.id,
+                        payload={"phase": "work", "previous_gate": issue.gate_type},
+                    )
+                    continue
                 gate = self._pipeline(issue).gate(issue.gate_type or "")
                 if issue.gate_type == "completion" and self._awaiting_manual_merge(issue):
                     continue  # held: promote conflicted; awaiting manual merge (no churn)
@@ -731,6 +763,17 @@ class Engine:
         # Review step: IN_REVIEW issues get a gate_review and transition.
         for issue in repo.list_issues(self.pool, states=[IssueState.IN_REVIEW.value]):
             try:
+                children = repo.list_issues(self.pool, parent_id=issue.id)
+                if children:
+                    # Repair legacy/admin-created stale state without attempting
+                    # the ordinary (and deliberately illegal) review->blocked edge.
+                    if issue.assigned_agent is not None:
+                        self._release_agent(issue)
+                    repo.hold_decomposed_parent(
+                        self.pool, issue.id,
+                        payload={"phase": "review", "previous_gate": issue.gate_type},
+                    )
+                    continue
                 pipeline = self._pipeline(issue)
                 gate = pipeline.gate(issue.gate_type)
                 if gate is None:

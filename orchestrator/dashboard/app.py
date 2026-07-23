@@ -134,6 +134,15 @@ _SETTINGS_FIELDS = [
         ],
     },
     {
+        "group": "Dashboard",
+        "fields": [
+            ("dashboard_host", "Dashboard bind host", "text", None,
+             "Host serve-dashboard binds to when --host is omitted. 0.0.0.0 = all interfaces."),
+            ("dashboard_port", "Dashboard bind port", "int", None,
+             "Port serve-dashboard binds to when --port is omitted (default 8000)."),
+        ],
+    },
+    {
         "group": "Dev/QA Workers",
         "fields": [
             ("devqa_worker.profile", "Worker model profile", "text", None,
@@ -185,6 +194,10 @@ _SETTINGS_FIELDS = [
              "When enabled, QA gates may apply worker artifacts in an isolated worktree."),
             ("apply_repo_path", "Apply repo path", "text", None, ""),
             ("verify_cmd", "Verify command", "text", None, ""),
+            ("verify_timeout_s", "Verify timeout (seconds)", "int", None,
+             "Max wall-clock seconds a verify command (verify_run + apply-path verify) may "
+             "run before it is killed and reported timed out. Full monorepo suites can take "
+             "30+ min — keep this above the slowest real run (default 3000)."),
             ("auto_promote_enabled", "Auto-promote completed issues", "bool", None,
              "Locally merges completed issue branches into promote_branch. Never pushes."),
             ("promote_repo_path", "Promote repo path", "text", None, ""),
@@ -238,6 +251,7 @@ _SETTINGS_ENV = {
     "apply_enabled": "APPLY_ENABLED",
     "apply_repo_path": "APPLY_REPO_PATH",
     "verify_cmd": "VERIFY_CMD",
+    "verify_timeout_s": "VERIFY_TIMEOUT_S",
     "auto_promote_enabled": "AUTO_PROMOTE_ENABLED",
     "promote_repo_path": "PROMOTE_REPO_PATH",
     "promote_branch": "PROMOTE_BRANCH",
