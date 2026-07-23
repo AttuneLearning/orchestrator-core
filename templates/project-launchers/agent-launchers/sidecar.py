@@ -124,6 +124,14 @@ _REASON_RE = re.compile(r"\(([^)]*)\)")
 # written with hyphens, spaces, or run together.
 _READY_TO_CLEAR_RE = re.compile(r"READY[-\s]?TO[-\s]?CLEAR")
 
+# Phase 3 note (was a TODO here): the token-budget FORCED_CLEAR backstop does
+# NOT hook into this text-scanning parser -- it is driven entirely by the
+# side-car's own usage accounting (TokenAccountant.exhausted(), fed by
+# Adapter.get_usage()), independent of anything the worker's reply says. A
+# worker that ignores the CONTEXT BUDGET line and never emits READY-TO-CLEAR
+# is exactly the case this backstop exists for, so tying it to reply-text
+# scanning would defeat the purpose. See Sidecar._maybe_forced_clear.
+
 
 def parse_tick_result(text: str | None) -> TickResult:
     """Tolerant parser: finds the LAST case-insensitive `TICK RESULT:` in
@@ -174,11 +182,107 @@ def parse_tick_result(text: str | None) -> TickResult:
 
 def build_tick_prompt(worker_prompt: str, tick_contract: str, extra_context: str = "") -> str:
     """Assemble the text injected for one tick: worker prompt + tick contract
-    + an optional extra block (Phase 3 token-budget hook; empty for now)."""
+    + an optional extra block (Phase 3: the token-budget line, see
+    Sidecar._extra_context)."""
     parts = [worker_prompt.rstrip(), tick_contract.rstrip()]
     if extra_context:
         parts.append(extra_context.rstrip())
     return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3: token accounting (plan §6). The side-car -- not the worker -- owns
+# usage accounting and embeds a budget line into each tick prompt.
+# --------------------------------------------------------------------------- #
+
+class TokenAccountant:
+    """Tracks context-window usage and cumulative cost for one worker across
+    its lifetime of opencode sessions.
+
+    Context usage is inherently PER-SESSION (a fresh session starts at 0
+    tokens), so it resets on `reset_session()` -- called by the side-car
+    after any clear, drain or forced. Cost is cumulative across the whole
+    worker's lifetime, so it is NOT reset: `reset_session()` folds the
+    just-ended session's cost into a running baseline before zeroing the
+    per-session counter, so `total_cost` never goes backwards across a
+    clear.
+    """
+
+    def __init__(self, context_limit_tokens: int = 180_000, clear_threshold_pct: int = 70,
+                 low_budget_pct: int = 90, margin_pct: int = 15):
+        self.context_limit_tokens = context_limit_tokens
+        self.clear_threshold_pct = clear_threshold_pct
+        self.low_budget_pct = low_budget_pct
+        self.margin_pct = margin_pct
+
+        self.context_tokens: int | None = None   # last known, CURRENT session
+        self._session_cost: float = 0.0           # last-seen cumulative cost, CURRENT session
+        self._cost_baseline: float = 0.0          # summed final cost of PRIOR sessions
+
+    @property
+    def total_cost(self) -> float:
+        return self._cost_baseline + self._session_cost
+
+    def update(self, usage: dict | None) -> None:
+        """Ingest one get_usage() reading. Tolerant of None/malformed input
+        -- never raises, and a bad reading simply leaves prior state alone
+        rather than resetting it to zero/unknown."""
+        if not isinstance(usage, dict):
+            return
+        tokens = usage.get("context_tokens")
+        if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and tokens >= 0:
+            self.context_tokens = int(tokens)
+        cost = usage.get("session_cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+            # QA fix (MAJOR): a raw assignment let a stale/smaller cost
+            # reading regress `_session_cost` downward; reset_session() would
+            # then permanently fold that too-low value into the baseline,
+            # silently undercounting cumulative cost forever after. Cost is
+            # cumulative-within-a-session by construction (the opencode API
+            # never reports it decreasing), so take the max of what we've
+            # seen -- a genuine decrease is by definition a bad/stale read,
+            # never a real one.
+            self._session_cost = max(self._session_cost, float(cost))
+
+    def context_pct(self) -> float | None:
+        if self.context_tokens is None or not self.context_limit_tokens:
+            return None
+        return (self.context_tokens / self.context_limit_tokens) * 100.0
+
+    def should_request_clear(self) -> bool:
+        pct = self.context_pct()
+        return pct is not None and pct >= self.clear_threshold_pct
+
+    def exhausted(self) -> bool:
+        pct = self.context_pct()
+        return pct is not None and pct >= self.low_budget_pct
+
+    def budget_line(self) -> str:
+        """The CONTEXT BUDGET line embedded in every tick prompt (does NOT
+        include the "nearly full" appendix -- Sidecar._extra_context adds
+        that separately, gated on should_request_clear())."""
+        pct = self.context_pct()
+        if pct is None:
+            return (
+                "CONTEXT BUDGET: unknown (usage unavailable this tick). Be conservative: "
+                "prefer small issues you can finish within one tick, memory_write a handoff "
+                "summary after each issue, and end with READY-TO-CLEAR once you have."
+            )
+        return (
+            f"CONTEXT BUDGET: ~{self.context_tokens} of {self.context_limit_tokens} tokens "
+            f"used ({pct:.0f}%). Apply a {self.margin_pct}% safety margin -- do not start an "
+            "issue you cannot finish within the remainder; if too little remains, reply "
+            "TICK RESULT: NO WORK (insufficient tokens)."
+        )
+
+    def reset_session(self) -> None:
+        """Called by the side-car after ANY clear (drain or forced): context
+        resets to unknown (the new session starts fresh and hasn't reported
+        usage yet), but cost is cumulative across the worker's lifetime --
+        fold the just-ended session's cost into the baseline first."""
+        self._cost_baseline += self._session_cost
+        self._session_cost = 0.0
+        self.context_tokens = None
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +325,22 @@ class Adapter:
 
     def restart(self) -> None:
         raise NotImplementedError
+
+    def get_usage(self) -> dict | None:
+        """Phase 3: best-effort token/cost usage for the CURRENT session, or
+        None if unavailable/unsupported. Shape: {"context_tokens": int,
+        "session_cost": float}. Must NEVER raise -- an adapter that can't
+        determine usage (transient error, runtime doesn't expose it) returns
+        None and the side-car falls back to the conservative unknown-budget
+        line. Default: unsupported."""
+        return None
+
+    def current_session_id(self) -> str | None:
+        """Optional: an identifier for the current underlying session/
+        context, purely for log correlation across a clear() (so operators
+        can confirm from the log that a clear actually rotated the session).
+        None if the adapter doesn't track one."""
+        return None
 
     def alive(self) -> bool:
         raise NotImplementedError
@@ -391,6 +511,65 @@ class OpencodeAdapter(Adapter):
         # leave the old one in place.
         created = self._request("POST", "/session", {"title": self._session_title()})
         self.session_id = created["id"]
+
+    def current_session_id(self) -> str | None:
+        return self.session_id
+
+    def get_usage(self) -> dict | None:
+        # Phase 3: GET /session/{id} exposes cumulative per-session
+        # Session.tokens / Session.cost (oc-api-cheatsheet.md). Tolerant of
+        # any missing/malformed field -- this must NEVER raise, it is polled
+        # every tick and a hiccup here must degrade to "usage unknown", not
+        # crash the side-car.
+        if not self.session_id:
+            return None
+        try:
+            data = self._request("GET", f"/session/{self.session_id}")
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        def _nonneg_int(value) -> int:
+            try:
+                n = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return n if n >= 0 else 0
+
+        tokens = data.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        cache = tokens.get("cache")
+        cache = cache if isinstance(cache, dict) else {}
+
+        # QA fix (MAJOR): the previous version summed only input + cache.read
+        # + output, silently dropping cache.write and reasoning tokens -- both
+        # of which count against the real context window. Prefer the
+        # server's own `total` when it's a sane positive int (it already
+        # accounts for every sub-field); only fall back to summing the parts
+        # ourselves -- ALL of them -- when `total` is missing/invalid.
+        raw_total = tokens.get("total")
+        total_int = None
+        if isinstance(raw_total, (int, float)) and not isinstance(raw_total, bool) and raw_total > 0:
+            total_int = int(raw_total)
+
+        if total_int is not None:
+            context_tokens = total_int
+        else:
+            context_tokens = (_nonneg_int(tokens.get("input"))
+                               + _nonneg_int(tokens.get("output"))
+                               + _nonneg_int(tokens.get("reasoning"))
+                               + _nonneg_int(cache.get("read"))
+                               + _nonneg_int(cache.get("write")))
+
+        try:
+            session_cost = float(data.get("cost"))
+        except (TypeError, ValueError):
+            session_cost = 0.0
+        if session_cost < 0:
+            session_cost = 0.0
+
+        return {"context_tokens": context_tokens, "session_cost": session_cost}
 
     def restart(self) -> None:
         if self._proc is not None:
@@ -571,6 +750,9 @@ class Sidecar:
                  heartbeat_interval: int = 20, state_poll_interval: int = 45,
                  t_stuck: int | None = 900, t_max: int = DEFAULT_T_MAX_S,
                  kill_worker_on_exit: bool = False,
+                 context_limit_tokens: int = 180_000, context_clear_pct: int = 70,
+                 context_low_pct: int = 90, budget_margin_pct: int = 15,
+                 token_accountant: "TokenAccountant | None" = None,
                  clock=time.monotonic, sleeper=time.sleep, tick_resolution: float = 1.0,
                  log_file: str | None = None):
         self.adapter = adapter
@@ -584,6 +766,14 @@ class Sidecar:
         self.t_stuck = t_stuck
         self.t_max = t_max
         self.kill_worker_on_exit = kill_worker_on_exit
+        # Phase 3: accepts a pre-built accountant (tests that want to inspect
+        # it directly) or builds one from the individual CLI-shaped kwargs.
+        self.accountant = token_accountant or TokenAccountant(
+            context_limit_tokens=context_limit_tokens,
+            clear_threshold_pct=context_clear_pct,
+            low_budget_pct=context_low_pct,
+            margin_pct=budget_margin_pct,
+        )
         self.clock = clock
         self.sleeper = sleeper
         self.tick_resolution = tick_resolution
@@ -622,6 +812,15 @@ class Sidecar:
         if self._log_fh:
             self._log_fh.write(line + "\n")
             self._log_fh.flush()
+
+    def _current_session_id_safe(self) -> str | None:
+        # Phase 3: best-effort, for log correlation across a clear() -- an
+        # adapter's current_session_id() must never be allowed to break
+        # logging if it misbehaves.
+        try:
+            return self.adapter.current_session_id()
+        except Exception:
+            return None
 
     # -- Phase-4 wake-relay hook (no-op placeholder) ---------------------------
     def check_wake(self, state_json: dict) -> None:
@@ -683,6 +882,10 @@ class Sidecar:
             self._maybe_collect_result(now)
             self._check_watchdog(now)
             self._check_window(now)
+            # Phase 3: the exhaustion backstop runs BEFORE tick delivery so a
+            # forced clear always lands before the next tick is injected,
+            # never mid-tick (it is itself gated on no tick being in flight).
+            self._maybe_forced_clear(now)
             self._maybe_deliver_tick(now)
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -805,10 +1008,46 @@ class Sidecar:
             # cadence stale.
             self.next_tick_at = now + self.dormant_interval
 
+    # -- Phase 3: proactive exhaustion backstop --------------------------------
+    def _maybe_forced_clear(self, now: float) -> None:
+        """Backstop for a worker that ignores the CONTEXT NEARLY FULL
+        instruction and never emits READY-TO-CLEAR: once the side-car's own
+        usage accounting says the context is exhausted, clear proactively --
+        but only when it is safe to (worker idle, no tick in flight, not
+        paused/loop-disabled) and NEVER mid-tick. This runs every step, but
+        is self-limiting: reset_session() sets context_tokens back to
+        unknown, so exhausted() reads False again until the next tick's
+        get_usage() reports fresh (low) usage -- no repeated clearing."""
+        if self.tick_start_at is not None:
+            return
+        if self._suppressed():
+            return
+        if not self.accountant.exhausted():
+            return
+        if not self.adapter.is_idle():
+            return
+        try:
+            self.adapter.clear()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self._log("CLEAR_ERROR", error=str(exc), forced=True)
+            return
+        self.accountant.reset_session()
+        self._log("FORCED_CLEAR", reason="context", session_id=self._current_session_id_safe())
+
     # -- tick injection ---------------------------------------------------------
     def _extra_context(self) -> str:
-        # TODO(phase-3): prepend the token-budget line here.
-        return ""
+        # Phase 3: the side-car-measured CONTEXT BUDGET line, plus a
+        # "nearly full" appendix instructing the worker to checkpoint and
+        # emit READY-TO-CLEAR once should_request_clear() trips.
+        line = self.accountant.budget_line()
+        if self.accountant.should_request_clear():
+            line += (
+                "\n\nCONTEXT NEARLY FULL: finish/checkpoint the current issue, memory_write "
+                "a handoff summary, and end this tick with READY-TO-CLEAR."
+            )
+        return line
 
     def _build_prompt(self) -> str:
         return build_tick_prompt(self.worker_prompt, self.tick_contract, self._extra_context())
@@ -852,7 +1091,7 @@ class Sidecar:
         except Exception:
             self.tick_baseline = _BASELINE_UNKNOWN
         self.pending = False
-        self._log("TICK_INJECT", reason=reason)
+        self._log("TICK_INJECT", reason=reason, session_id=self._current_session_id_safe())
 
     def _maybe_deliver_tick(self, now: float) -> None:
         """Note this is NOT gated on tick_start_at for BECOMING due: a tick
@@ -942,6 +1181,7 @@ class Sidecar:
 
     def _collect_result(self, now: float) -> None:
         text = self.adapter.read_result()
+        self._update_usage()
         result = parse_tick_result(text)
         self.tick_start_at = None
         self.tick_baseline = None
@@ -993,8 +1233,29 @@ class Sidecar:
             except Exception as exc:
                 self._log("CLEAR_ERROR", error=str(exc))
                 return
-            self._log("CLEAR")
+            self.accountant.reset_session()
+            self._log("CLEAR", session_id=self._current_session_id_safe())
             self._inject_tick(now, reason="drain")  # immediate, no cadence wait
+
+    # -- Phase 3: usage accounting --------------------------------------------
+    def _update_usage(self) -> None:
+        """Read adapter.get_usage() and feed the accountant. Adapter.get_usage()
+        is contractually never-raising, but this is wrapped defensively
+        anyway (BLOCKER-2 style): a usage hiccup must never break result
+        collection."""
+        try:
+            usage = self.adapter.get_usage()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self._log("USAGE_ERROR", error=str(exc))
+            return
+        self.accountant.update(usage)
+        pct = self.accountant.context_pct()
+        self._log("USAGE",
+                  context_tokens=self.accountant.context_tokens,
+                  pct=("unknown" if pct is None else round(pct, 1)),
+                  cost=round(self.accountant.total_cost, 4))
 
 
 # --------------------------------------------------------------------------- #
@@ -1028,6 +1289,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--kill-worker-on-exit", action="store_true")
     p.add_argument("--log-file", help="also append log lines to this file")
+
+    # Phase 3: token accounting / budget-embedded ticks (plan §6).
+    p.add_argument("--context-limit-tokens", type=int, default=180_000,
+                    help="context-window size the budget line is computed against")
+    p.add_argument("--context-clear-pct", type=int, default=70,
+                    help="context %% at/above which the tick prompt asks for READY-TO-CLEAR")
+    p.add_argument("--context-low-pct", type=int, default=90,
+                    help="context %% at/above which the side-car proactively force-clears")
+    p.add_argument("--budget-margin-pct", type=int, default=15,
+                    help="safety margin the worker is told to reserve before starting new work")
     return p
 
 
@@ -1043,6 +1314,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.runtime != "opencode" or not args.opencode_url:
         parser.error("--opencode-url is required for --runtime opencode (the only Phase-2 runtime)")
+
+    if not (0 < args.context_clear_pct < args.context_low_pct <= 100):
+        parser.error(
+            "--context-clear-pct/--context-low-pct must satisfy "
+            f"0 < clear < low <= 100 (got clear={args.context_clear_pct}, "
+            f"low={args.context_low_pct})"
+        )
+
+    # QA fix (MEDIUM): a zero/negative context-limit-tokens makes
+    # context_pct() return None (or a nonsense negative number) forever,
+    # which silently disables the entire safety layer (should_request_clear
+    # / exhausted() never trip, no budget line ever computed) -- refuse it
+    # at parse time instead of letting it degrade quietly at runtime.
+    if args.context_limit_tokens <= 0:
+        parser.error(
+            f"--context-limit-tokens must be a positive integer (got {args.context_limit_tokens})"
+        )
 
     worker_prompt = Path(args.prompt_file).read_text()
     contract_path = (Path(args.tick_contract) if args.tick_contract
@@ -1071,6 +1359,10 @@ def main(argv: list[str] | None = None) -> int:
         t_stuck=args.t_stuck,
         t_max=t_max,
         kill_worker_on_exit=args.kill_worker_on_exit,
+        context_limit_tokens=args.context_limit_tokens,
+        context_clear_pct=args.context_clear_pct,
+        context_low_pct=args.context_low_pct,
+        budget_margin_pct=args.budget_margin_pct,
         log_file=args.log_file,
     )
     sidecar.run()

@@ -85,6 +85,16 @@ class FakeAdapter(sidecar.Adapter):
                                        # many times on completion_marker()
                                        # before succeeding again
 
+        # -- Phase 3: scripted usage + session-id tracking ---------------
+        # `usage_queue` is consumed one entry per get_usage() call (FIFO);
+        # once exhausted, the last value keeps being returned (mirrors a
+        # real adapter reporting a steady reading), starting from None
+        # (unknown) if the queue was never populated.
+        self.usage_queue: list[dict | None] = []
+        self._last_usage: dict | None = None
+        self._session_counter = 0
+        self.session_id = f"sess-{self._session_counter}"
+
     def ensure_worker(self) -> None:
         pass
 
@@ -115,11 +125,21 @@ class FakeAdapter(sidecar.Adapter):
         if self.raise_on_clear:
             raise RuntimeError("fake clear failure")
         self.clear_count += 1
+        self._session_counter += 1
+        self.session_id = f"sess-{self._session_counter}"
 
     def restart(self) -> None:
         self.restart_count += 1
         self.busy = False
         self._result = None
+
+    def get_usage(self) -> dict | None:
+        if self.usage_queue:
+            self._last_usage = self.usage_queue.pop(0)
+        return self._last_usage
+
+    def current_session_id(self) -> str | None:
+        return self.session_id
 
     def alive(self) -> bool:
         return self.alive_flag
@@ -930,3 +950,380 @@ def test_uppercase_ready_to_clear_token_variants_still_trigger():
     assert sidecar.parse_tick_result(
         "notes\nREADY-TO-CLEAR\nTICK RESULT: WORKED #1"
     ).ready_to_clear is True
+
+
+# =========================================================================== #
+# Phase 3: token accounting + budget-embedded ticks (plan §6, phase3-token
+# spec). FakeAdapter gained get_usage() (scripted via `usage_queue`) and
+# current_session_id() (bumped by clear()) for these tests.
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# P3-1. budget_line appears in every injected tick prompt.
+# --------------------------------------------------------------------------- #
+
+def test_budget_line_present_in_every_tick_prompt():
+    sc, adapter, dashboard, clock = make_sidecar()
+
+    sc.step(clock.t)                                   # tick #1: no usage known yet
+    assert "CONTEXT BUDGET" in adapter.injected[0]
+    assert "CONTEXT BUDGET: unknown" in adapter.injected[0]
+
+    adapter.complete("TICK RESULT: WORKED #1")
+    sc.step(clock.advance(0.1))
+    clock.advance(300)
+    sc.step(clock.t)                                    # tick #2
+    assert "CONTEXT BUDGET" in adapter.injected[-1]
+
+
+# --------------------------------------------------------------------------- #
+# P3-2. Usage below clear threshold -> no "nearly full" appendix; usage at/
+# above threshold -> appendix present.
+# --------------------------------------------------------------------------- #
+
+def test_budget_appendix_appears_only_above_clear_threshold():
+    adapter = FakeAdapter()
+    sc, adapter, dashboard, clock = make_sidecar(
+        adapter=adapter, context_limit_tokens=1000, context_clear_pct=70, context_low_pct=90)
+
+    sc.step(clock.t)                                    # tick #1: unknown budget
+    adapter.usage_queue = [{"context_tokens": 500, "session_cost": 0.1}]   # 50% < clear_pct
+    adapter.complete("TICK RESULT: WORKED #1")
+    sc.step(clock.advance(0.1))                          # collect -> accountant now at 50%
+
+    clock.advance(300)
+    sc.step(clock.t)                                      # tick #2 reflects 50%
+    assert "CONTEXT BUDGET" in adapter.injected[-1]
+    assert "CONTEXT NEARLY FULL" not in adapter.injected[-1]
+
+    adapter.usage_queue = [{"context_tokens": 750, "session_cost": 0.2}]    # 75% >= clear_pct
+    adapter.complete("TICK RESULT: WORKED #2")
+    sc.step(clock.advance(0.1))                            # collect -> accountant now at 75%
+
+    clock.advance(300)
+    sc.step(clock.t)                                        # tick #3 reflects 75% -> appendix
+    assert "CONTEXT NEARLY FULL" in adapter.injected[-1]
+
+
+# --------------------------------------------------------------------------- #
+# P3-3. exhausted() + idle + no tick in flight -> FORCED_CLEAR fires (backstop
+# for a worker that never says READY-TO-CLEAR); context resets to unknown,
+# cumulative cost survives the clear, and the session id visibly rotates.
+# --------------------------------------------------------------------------- #
+
+def test_forced_clear_when_exhausted_idle_no_tick_in_flight(capsys):
+    adapter = FakeAdapter()
+    sc, adapter, dashboard, clock = make_sidecar(
+        adapter=adapter, context_limit_tokens=1000, context_clear_pct=70, context_low_pct=90)
+
+    sc.step(clock.t)                                       # tick #1 injected
+    old_session = adapter.session_id
+    adapter.usage_queue = [{"context_tokens": 950, "session_cost": 1.5}]   # 95% >= low_pct
+    adapter.complete("TICK RESULT: WORKED #1")               # NOTE: no READY-TO-CLEAR
+    sc.step(clock.advance(0.1))                               # collect -> exhausted -> forced clear same step
+
+    assert adapter.clear_count == 1
+    assert adapter.session_id != old_session
+    assert sc.accountant.context_tokens is None                # per-session context reset
+    assert sc.accountant.total_cost == pytest.approx(1.5)       # cumulative cost preserved
+
+    captured = capsys.readouterr()
+    assert "event=FORCED_CLEAR" in captured.out
+    assert "reason=context" in captured.out
+    assert f"session_id={adapter.session_id}" in captured.out
+
+
+def test_forced_clear_never_fires_mid_tick():
+    adapter = FakeAdapter()
+    sc, adapter, dashboard, clock = make_sidecar(
+        adapter=adapter, context_limit_tokens=1000, context_clear_pct=70, context_low_pct=90)
+
+    sc.step(clock.t)                                        # tick #1 in flight, never completes
+    adapter.usage_queue = [{"context_tokens": 950, "session_cost": 0.5}]
+    # Feed usage without ever collecting a result (worker stays busy) --
+    # exhaustion alone, mid-tick, must never trigger a clear.
+    sc.accountant.update(adapter.get_usage())
+    assert sc.accountant.exhausted() is True
+
+    clock.advance(1)
+    sc.step(clock.t)
+    assert adapter.clear_count == 0                          # tick_start_at is not None -> no forced clear
+
+
+# --------------------------------------------------------------------------- #
+# P3-4. get_usage() returning None (adapter has nothing to report) never
+# crashes the side-car and keeps the conservative unknown-budget line.
+# --------------------------------------------------------------------------- #
+
+def test_get_usage_none_never_crashes_and_uses_unknown_line():
+    adapter = FakeAdapter()                                  # usage_queue empty -> get_usage() -> None
+    sc, adapter, dashboard, clock = make_sidecar(adapter=adapter)
+
+    sc.step(clock.t)
+    assert "CONTEXT BUDGET: unknown" in adapter.injected[0]
+
+    adapter.complete("TICK RESULT: WORKED #1")
+    sc.step(clock.advance(0.1))                               # collect with usage still None
+    assert sc.accountant.context_tokens is None
+    assert sc.accountant.exhausted() is False
+    assert sc.accountant.should_request_clear() is False
+
+    clock.advance(300)
+    sc.step(clock.t)                                           # loop continues normally
+    assert len(adapter.injected) == 2
+
+
+# --------------------------------------------------------------------------- #
+# P3-5. READY-TO-CLEAR drain still works with the budget layer wired in: the
+# clear resets context, and the IMMEDIATE re-inject reflects the fresh
+# (unknown, not stale-high) session usage.
+# --------------------------------------------------------------------------- #
+
+def test_ready_to_clear_drain_with_budget_layer_reflects_fresh_usage():
+    adapter = FakeAdapter()
+    sc, adapter, dashboard, clock = make_sidecar(
+        adapter=adapter, context_limit_tokens=1000, context_clear_pct=70, context_low_pct=90)
+
+    sc.step(clock.t)                                           # tick #1
+    old_session = adapter.session_id
+    adapter.usage_queue = [{"context_tokens": 800, "session_cost": 0.5}]    # 80% -> request-clear
+    adapter.complete("TICK RESULT: WORKED #1; READY-TO-CLEAR")
+    sc.step(clock.t)                                             # collect -> drain clear -> immediate re-inject
+
+    assert adapter.clear_count == 1
+    assert adapter.session_id != old_session
+    assert len(adapter.injected) == 2
+    assert "CONTEXT BUDGET: unknown" in adapter.injected[-1]      # fresh session, not stale 80%
+    assert "CONTEXT NEARLY FULL" not in adapter.injected[-1]
+
+
+# --------------------------------------------------------------------------- #
+# P3-6. Cost accumulates correctly across two sessions (pre/post clear): the
+# running total is the sum, never reset to the new session's figure alone.
+# --------------------------------------------------------------------------- #
+
+def test_cost_accumulates_across_two_sessions_through_clear():
+    adapter = FakeAdapter()
+    sc, adapter, dashboard, clock = make_sidecar(adapter=adapter, context_limit_tokens=1000)
+
+    sc.step(clock.t)                                            # tick #1
+    adapter.usage_queue = [{"context_tokens": 200, "session_cost": 1.25}]
+    adapter.complete("TICK RESULT: WORKED #1; READY-TO-CLEAR")
+    sc.step(clock.t)                                              # collect -> drain clear -> folds 1.25 into baseline
+    assert sc.accountant.total_cost == pytest.approx(1.25)
+    assert len(adapter.injected) == 2                              # drain's immediate re-inject (tick #2)
+
+    adapter.usage_queue = [{"context_tokens": 300, "session_cost": 0.75}]
+    adapter.complete("TICK RESULT: WORKED #2")
+    sc.step(clock.advance(0.1))                                    # collect tick #2's usage
+
+    assert sc.accountant.total_cost == pytest.approx(2.0)           # 1.25 baseline + 0.75 current session
+
+
+# --------------------------------------------------------------------------- #
+# P3-7. TICK_INJECT/CLEAR log lines carry session_id for operator log
+# correlation across a clear.
+# --------------------------------------------------------------------------- #
+
+def test_tick_inject_log_includes_session_id(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    captured = capsys.readouterr()
+    assert f"session_id={adapter.session_id}" in captured.out
+
+
+def test_clear_log_includes_session_id_after_drain(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: WORKED #1; READY-TO-CLEAR")
+    capsys.readouterr()                                          # drop tick #1's noise
+    sc.step(clock.t)
+    captured = capsys.readouterr()
+    assert "event=CLEAR " in captured.out or captured.out.rstrip().endswith("event=CLEAR")
+    assert f"session_id={adapter.session_id}" in captured.out
+
+
+# --------------------------------------------------------------------------- #
+# P3-8. CLI: --context-limit-tokens/--context-clear-pct/--context-low-pct/
+# --budget-margin-pct defaults, and validation of 0 < clear < low <= 100.
+# --------------------------------------------------------------------------- #
+
+def test_cli_context_flag_defaults():
+    parser = sidecar.build_arg_parser()
+    args = parser.parse_args([
+        "--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+        "--opencode-url", "http://y", "--prompt-file", "/nonexistent",
+    ])
+    assert args.context_limit_tokens == 180_000
+    assert args.context_clear_pct == 70
+    assert args.context_low_pct == 90
+    assert args.budget_margin_pct == 15
+
+
+def test_cli_rejects_clear_pct_not_below_low_pct(capsys):
+    with pytest.raises(SystemExit):
+        sidecar.main([
+            "--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+            "--runtime", "opencode", "--opencode-url", "http://y",
+            "--prompt-file", "/nonexistent",
+            "--context-clear-pct", "90", "--context-low-pct", "70",
+        ])
+    assert "context-clear-pct" in capsys.readouterr().err
+
+
+def test_cli_rejects_low_pct_over_100():
+    with pytest.raises(SystemExit):
+        sidecar.main([
+            "--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+            "--runtime", "opencode", "--opencode-url", "http://y",
+            "--prompt-file", "/nonexistent",
+            "--context-clear-pct", "70", "--context-low-pct", "150",
+        ])
+
+
+# --------------------------------------------------------------------------- #
+# P3-9. TokenAccountant unit-level checks (no Sidecar involved).
+# --------------------------------------------------------------------------- #
+
+def test_token_accountant_update_tolerates_malformed_usage():
+    acc = sidecar.TokenAccountant(context_limit_tokens=1000)
+    acc.update(None)
+    assert acc.context_tokens is None
+    acc.update({"context_tokens": "garbage", "session_cost": "also-garbage"})
+    assert acc.context_tokens is None
+    assert acc.total_cost == 0.0
+    acc.update({"context_tokens": 100, "session_cost": 0.5})
+    assert acc.context_tokens == 100
+    assert acc.total_cost == pytest.approx(0.5)
+    # A subsequent malformed reading must not wipe out the last-good state.
+    acc.update({"context_tokens": None, "session_cost": None})
+    assert acc.context_tokens == 100
+    assert acc.total_cost == pytest.approx(0.5)
+
+
+def test_token_accountant_pct_thresholds():
+    acc = sidecar.TokenAccountant(context_limit_tokens=1000, clear_threshold_pct=70, low_budget_pct=90)
+    assert acc.should_request_clear() is False
+    assert acc.exhausted() is False
+
+    acc.update({"context_tokens": 699, "session_cost": 0.0})
+    assert acc.should_request_clear() is False
+    acc.update({"context_tokens": 700, "session_cost": 0.0})
+    assert acc.should_request_clear() is True
+    assert acc.exhausted() is False
+
+    acc.update({"context_tokens": 900, "session_cost": 0.0})
+    assert acc.exhausted() is True
+
+
+def test_token_accountant_reset_session_folds_cost_and_clears_context():
+    acc = sidecar.TokenAccountant(context_limit_tokens=1000)
+    acc.update({"context_tokens": 400, "session_cost": 2.0})
+    acc.reset_session()
+    assert acc.context_tokens is None
+    assert acc.total_cost == pytest.approx(2.0)
+
+    acc.update({"context_tokens": 50, "session_cost": 0.3})
+    assert acc.total_cost == pytest.approx(2.3)                 # baseline 2.0 + new session 0.3
+
+
+# =========================================================================== #
+# QA review fixes (2026-07-23): 2 MAJOR + 1 MEDIUM accounting-math defects
+# found after the Phase-3 implementation landed.
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# QA-1. MAJOR: OpencodeAdapter.get_usage() must count cache.write and
+# reasoning tokens too, not just input + cache.read + output -- and must
+# prefer the server's own `tokens.total` when it's a sane positive int.
+# --------------------------------------------------------------------------- #
+
+def test_opencode_adapter_get_usage_prefers_total_when_present():
+    adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
+    adapter.session_id = "ses_1"
+    adapter._request = lambda method, path, payload=None, timeout=None: {
+        "tokens": {"input": 100, "output": 50, "reasoning": 20,
+                   "cache": {"read": 10, "write": 5}, "total": 999},
+        "cost": 1.23,
+    }
+    assert adapter.get_usage() == {"context_tokens": 999, "session_cost": 1.23}
+
+
+def test_opencode_adapter_get_usage_sums_all_fields_including_cache_write_and_reasoning():
+    adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
+    adapter.session_id = "ses_1"
+    # No `total` field -> must fall back to summing ALL parts, including
+    # cache.write (15) and reasoning (20) -- the two fields the pre-QA-fix
+    # code silently dropped.
+    adapter._request = lambda method, path, payload=None, timeout=None: {
+        "tokens": {"input": 100, "output": 50, "reasoning": 20,
+                   "cache": {"read": 10, "write": 15}},
+        "cost": 0.5,
+    }
+    usage = adapter.get_usage()
+    assert usage == {"context_tokens": 195, "session_cost": 0.5}   # 100+50+20+10+15
+
+
+def test_opencode_adapter_get_usage_falls_back_to_sum_when_total_missing_or_zero():
+    adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
+    adapter.session_id = "ses_1"
+    adapter._request = lambda method, path, payload=None, timeout=None: {
+        "tokens": {"input": 10, "output": 5, "reasoning": 0,
+                   "cache": {"read": 0, "write": 0}, "total": 0},
+        "cost": 0.0,
+    }
+    assert adapter.get_usage() == {"context_tokens": 15, "session_cost": 0.0}
+
+
+def test_opencode_adapter_get_usage_returns_none_on_request_failure():
+    adapter = sidecar.OpencodeAdapter(base_url="http://fake", project="p", agent_id=1)
+    adapter.session_id = "ses_1"
+
+    def _raise(*a, **kw):
+        raise RuntimeError("boom")
+    adapter._request = _raise
+    assert adapter.get_usage() is None
+
+
+# --------------------------------------------------------------------------- #
+# QA-2. MAJOR: TokenAccountant.update() must never let a stale/smaller cost
+# reading regress `_session_cost` -- it must take the max, so a later
+# reset_session() folds the true high-water mark into the baseline, not a
+# transient dip.
+# --------------------------------------------------------------------------- #
+
+def test_token_accountant_cost_never_regresses_on_stale_reading():
+    acc = sidecar.TokenAccountant(context_limit_tokens=1000)
+    acc.update({"context_tokens": 100, "session_cost": 0.5})
+    acc.update({"context_tokens": 100, "session_cost": 0.3})    # stale/smaller reading
+    assert acc.total_cost == pytest.approx(0.5)                  # must NOT have regressed
+    acc.reset_session()
+    assert acc.total_cost == pytest.approx(0.5)                  # folded high-water mark, not 0.3
+
+
+# --------------------------------------------------------------------------- #
+# QA-3. MEDIUM: --context-limit-tokens <= 0 must be rejected at parse time --
+# otherwise context_pct() returns None/negative forever and the whole safety
+# layer (should_request_clear/exhausted) is silently disabled.
+# --------------------------------------------------------------------------- #
+
+def test_cli_rejects_zero_context_limit_tokens(capsys):
+    with pytest.raises(SystemExit):
+        sidecar.main([
+            "--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+            "--runtime", "opencode", "--opencode-url", "http://y",
+            "--prompt-file", "/nonexistent",
+            "--context-limit-tokens", "0",
+        ])
+    assert "context-limit-tokens" in capsys.readouterr().err
+
+
+def test_cli_rejects_negative_context_limit_tokens(capsys):
+    with pytest.raises(SystemExit):
+        sidecar.main([
+            "--agent-id", "1", "--project", "p", "--dashboard", "http://x",
+            "--runtime", "opencode", "--opencode-url", "http://y",
+            "--prompt-file", "/nonexistent",
+            "--context-limit-tokens", "-100",
+        ])
+    assert "context-limit-tokens" in capsys.readouterr().err

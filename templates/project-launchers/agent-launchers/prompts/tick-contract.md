@@ -12,6 +12,9 @@ it is your turn to act *right now*. Obligations:
 - **Between issues**, before moving on or ending the tick: call `memory_write`
   with a short handoff summary of what you just did, so context can be safely
   reset.
+- Obey the **CONTEXT BUDGET** line in the tick prompt: it is measured by the
+  side-car, not a guess. When it says the context is nearly full, checkpoint
+  + `READY-TO-CLEAR`.
 - End **every** reply with exactly one line, and exactly one, in this form.
   This line **must be the absolute final line of your reply** — nothing
   after it, not even blank lines or a sign-off. Never quote it, echo it, or
