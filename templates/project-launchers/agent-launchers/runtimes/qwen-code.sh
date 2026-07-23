@@ -11,6 +11,7 @@ fi
 
 PROMPT="$(render_prompt "$PROMPT_FILE")"
 LAUNCH_MODE="$(resolve_agent_mode interactive)"
+PROMPT="$(apply_interactive_prompt "$PROMPT" "$LAUNCH_MODE")"
 
 QWEN_ARGS=(--yolo)
 for arg in "$@"; do

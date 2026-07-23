@@ -74,6 +74,25 @@ render_prompt() {
     perl -pe 's/\{\{([A-Z0-9_]+)\}\}/exists $ENV{$1} ? $ENV{$1} : ""/ge' "$prompt_file"
 }
 
+# Interactive/TUI launches run the agent as ONE long-lived process. The per-cycle
+# "Do ONE ... cycle then STOP" directive exists only so the NON-interactive outer
+# loop (run-agent-loop.sh) can relaunch the command each poll; in a TUI it makes
+# the agent complete a single cycle and then sit idle in the open session. In
+# interactive mode, rewrite that directive so the session keeps cycling on its own.
+# No-op for non-interactive, which still needs the one-shot framing.
+apply_interactive_prompt() {
+  local prompt="$1" mode="$2"
+  if [ "$mode" != "interactive" ]; then
+    printf '%s' "$prompt"
+    return 0
+  fi
+  printf '%s' "$prompt" | perl -0777 -pe '
+    s/\bDo ONE\b\s*(.+?)\s*cycle\s+then STOP\./Run $1 cycles continuously — after each cycle, wait for your poll interval, then begin the next; never stop after a single cycle./i;
+    s/\bRun one\b\s*(.+?)\s*cycle\b/Run $1 cycles continuously/i;
+    s/,?\s*then STOP\././gi;
+  '
+}
+
 resolve_agent_mode() {
   local default_mode="${1:-non-interactive}"
   case "${AGENT_MODE:-}" in
@@ -157,6 +176,8 @@ opencode_write_config() {
   OC_ORCH="${ORCH:-}" \
   OC_PROJECT="${PROJECT:-}" \
   OC_YAML="$yaml" \
+  OC_ROLE="${ROLE:-}" \
+  OC_WORKSPACE_ROOT="${WORKSPACE_ROOT:-}" \
   OC_DO_URL="${ORCH_DO_BASE_URL:-$ORCH_DO_BASE_URL_DEFAULT}" \
   OC_QWEN_URL="${QWEN_LOCAL_BASE_URL:-$QWEN_LOCAL_BASE_URL_DEFAULT}" \
   "$pybin" - <<'PY'
@@ -205,6 +226,18 @@ for pid, p in prov.items():
         "name": p["name"],
         "options": {"baseURL": p["base_url"], "apiKey": "{env:%s}" % p["key_env"]},
         "models": {m: {} for m in p["models"]},
+    }
+
+# Senior roles (senior-dev, senior-qa) review/verify across every worktree, so
+# grant their opencode tools access to the whole workspace subtree (all wt-* and
+# test dirs). --dir stays on the role's own worktree, so commits/report_work are
+# unchanged; this only widens read/edit/list/bash beyond that project root. Other
+# roles stay deliberately lane-confined.
+role = os.environ.get("OC_ROLE", "")
+workspace_root = os.environ.get("OC_WORKSPACE_ROOT", "")
+if workspace_root and role.startswith("senior"):
+    cfg["permission"] = {
+        "external_directory": {f"{workspace_root}/**": "allow"},
     }
 
 if orch and project:

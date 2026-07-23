@@ -11,6 +11,7 @@ fi
 
 PROMPT="$(render_prompt "$PROMPT_FILE")"
 LAUNCH_MODE="$(resolve_agent_mode non-interactive)"
+PROMPT="$(apply_interactive_prompt "$PROMPT" "$LAUNCH_MODE")"
 
 # Open-source model selection. Default is glm-5.2; override per launch with
 # ORCH_OPENCODE_MODEL (e.g. orch_model/deepseek-v4-pro, qwen_local/qwen-local).

@@ -8,6 +8,7 @@ PROMPT="$(render_prompt "$PROMPT_FILE")"
 cd "$WORKTREE"
 
 LAUNCH_MODE="$(resolve_agent_mode non-interactive)"
+PROMPT="$(apply_interactive_prompt "$PROMPT" "$LAUNCH_MODE")"
 
 if [ "$PROMPT_NAME" = "orch-manager" ] && [ -z "${CLAUDE_MODEL:-}" ] \
    && [ -x "$LAUNCHER_DIR/model-settings.py" ]; then
@@ -17,6 +18,12 @@ fi
 # Wire the orchestrator MCP server for Claude Code (anthropic model/auth is
 # unchanged). Generated into a temp file and passed with --strict-mcp-config so
 # it does not depend on any pre-existing ~/.claude.json / .mcp.json state.
+# verify_run blocks for the full monorepo suite (~35min). Give the MCP client a
+# tool-call timeout above the engine's 3000s verify ceiling so a green run is
+# received and gated instead of being abandoned client-side (was bouncing #43).
+export MCP_TOOL_TIMEOUT="${MCP_TOOL_TIMEOUT:-3300000}"
+export MCP_TIMEOUT="${MCP_TIMEOUT:-60000}"
+
 CLAUDE_MCP_ARGS=()
 CLAUDE_MCP_FILE=""
 cleanup_claude_mcp() {

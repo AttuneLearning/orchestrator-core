@@ -4,12 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib.sh"
 
+# Per-fleet codex home. codex-cli keeps its session/telemetry store in an
+# embedded SQLite DB ($CODEX_HOME/logs_2.sqlite + WAL). With multiple fleets on
+# one box (e.g. two fleets sharing one host) all defaulting to ~/.codex,
+# every codex process contends on ONE sqlite WAL lock — under load the WAL
+# bloats and writers block in futex, wedging QA workers (0% CPU, no I/O). Giving
+# each fleet its own CODEX_HOME (the workspace root, which differs per checkout)
+# removes the cross-fleet contention. Mirrors opencode.sh's XDG_CONFIG_HOME
+# isolation. An explicit CODEX_HOME still wins; fall back to the workspace root
+# derived from this script's path if WORKSPACE_ROOT isn't exported.
+export CODEX_HOME="${CODEX_HOME:-${WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}}"
+
 PROMPT="$(render_prompt "$PROMPT_FILE")"
 DEFAULT_AGENT_MODE="non-interactive"
 if [ "${ROLE:-}" = "orch-manager" ]; then
   DEFAULT_AGENT_MODE="interactive"
 fi
 LAUNCH_MODE="$(resolve_agent_mode "$DEFAULT_AGENT_MODE")"
+PROMPT="$(apply_interactive_prompt "$PROMPT" "$LAUNCH_MODE")"
 
 INFERENCE_PROFILE="${CODEX_INFERENCE_PROFILE:-}"
 INFERENCE_EXPLICIT=0
@@ -164,6 +176,11 @@ MCP_CONFIG=(
   -c "mcp_servers.orchestrator.command=\"$ORCH/.venv/bin/python\""
   -c "mcp_servers.orchestrator.env.PYTHONPATH=\"$ORCH\""
   -c "mcp_servers.orchestrator.env.ORCH_ROLE=\"$ROLE\""
+  # verify_run blocks for the full monorepo suite (~35min). Codex's default
+  # per-tool MCP timeout was abandoning green verify runs (#43 bounced at 300s
+  # though the subprocess finished at 837s). Raise above the engine's 3000s ceiling.
+  -c "mcp_servers.orchestrator.tool_timeout_sec=3300"
+  -c "mcp_servers.orchestrator.startup_timeout_sec=60"
 )
 
 if [ "${ROLE:-}" = "orch-manager" ]; then

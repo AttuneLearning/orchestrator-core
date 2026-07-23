@@ -11,6 +11,7 @@ if [ "${ROLE:-}" = "orch-manager" ]; then
   fi
   LAUNCH_MODE="$(resolve_agent_mode interactive)"
   PROMPT="$(render_prompt "$PROMPT_FILE")"
+  PROMPT="$(apply_interactive_prompt "$PROMPT" "$LAUNCH_MODE")"
   cd "$WORKTREE"
   # Qwen Code stores MCP config separately from Claude/Codex. Keep this project-scoped
   # and idempotent enough for repeated launches by removing any stale project entry first.
