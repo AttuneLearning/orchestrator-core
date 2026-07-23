@@ -639,6 +639,14 @@ def test_agent_sidecar_opencode_routes_through_sidecar_py(settings, tmp_path):
     prompt_path = Path(argv[argv.index("--prompt-file") + 1])
     prompt_text = prompt_path.read_text()
     assert "cycles continuously" in prompt_text   # interactive rewrite applied
+    # DEFECT-SIDECAR-1 regression (plan §14): the injected prompt MUST carry the
+    # tick contract. Without it the side-car's parse_tick_result never finds a
+    # `TICK RESULT:` marker and every tick logs invalid=False -- the first-soak
+    # failure (2026-07-23) where all 3 ticks were invalid. Assert both that the
+    # contract block was appended AND that its marker grammar reached the worker.
+    assert "Tick contract (side-car protocol" in prompt_text
+    assert "TICK RESULT: WORKED" in prompt_text
+    assert "TICK RESULT: NO WORK" in prompt_text
 
 
 def test_agent_sidecar_claude_uses_print_cmd_for_spawn_cmd(settings, tmp_path):

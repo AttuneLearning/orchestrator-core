@@ -185,7 +185,18 @@ if [ "${AGENT_SIDECAR:-0}" = "1" ]; then
   SIDECAR_PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/sidecar-prompt-${PROJECT:-workspace}-${AGENT_ID}.XXXXXX")"
   RENDERED_PROMPT="$(render_prompt "$PROMPT_FILE")"
   RENDERED_PROMPT="$(apply_interactive_prompt "$RENDERED_PROMPT" interactive)"
-  printf '%s' "$RENDERED_PROMPT" > "$SIDECAR_PROMPT_FILE"
+  # DEFECT-SIDECAR-1 fix (plan §14): the side-car's parse_tick_result requires
+  # the worker to END every reply with a `TICK RESULT: ...` line, but the role
+  # prompt alone never tells it to -- so without this the FIRST soak saw every
+  # tick parse invalid=False (2026-07-23). Append the tick contract to the
+  # injected prompt so every tick carries the marker grammar the parser needs.
+  SIDECAR_TICK_CONTRACT="$LAUNCHER_DIR/prompts/tick-contract.md"
+  if [ ! -f "$SIDECAR_TICK_CONTRACT" ]; then
+    echo "AGENT_SIDECAR=1: missing tick contract at $SIDECAR_TICK_CONTRACT" >&2
+    exit 1
+  fi
+  RENDERED_TICK_CONTRACT="$(render_prompt "$SIDECAR_TICK_CONTRACT")"
+  printf '%s\n\n%s\n' "$RENDERED_PROMPT" "$RENDERED_TICK_CONTRACT" > "$SIDECAR_PROMPT_FILE"
 
   SIDECAR_ARGS=(--agent-id "$AGENT_ID" --project "$PROJECT" --dashboard "$DASHBOARD"
                 --prompt-file "$SIDECAR_PROMPT_FILE")
