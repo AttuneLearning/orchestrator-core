@@ -290,3 +290,79 @@ claude/codex tmux side-car mode used in anger (needs SIDECAR_TMUX_TARGET);
 fleet-wide AGENT_SIDECAR default flip after soaks. Known accepted heuristics:
 tmux idle detection vs animated TUIs (marker-stability collection +
 IDLE_FALLBACK bound the damage), token estimation (§12).
+
+## 14. Post-delivery defects (first soak, 2026-07-23)
+
+First live soak: cadencelms agent-1 (backend dev, opencode) under
+`AGENT_SIDECAR=1`, ran ~6h14m (02:23→08:38 MST) before a manual `^C`
+(clean `SHUTDOWN kill_worker_on_exit=False`). **Durability held** — session
+alive the whole window, continuous heartbeat (505 STATE_POLL), zero STALE,
+zero crash, zero relaunch-for-work. **Work path failed** — all 3 ticks
+`TICK_RESULT valid=False` (violations 1→2→3), one `FORCED_CLEAR reason=context`
+instead of a clean READY-TO-CLEAR handshake. Soak does NOT count; the 6h are
+void. Two defects + a test gap, both integration-seam bugs the phase QA missed
+because tests stubbed the adapter and the injected prompt.
+
+**DEFECT-SIDECAR-1 — injected prompt carries no tick contract (every tick invalid).**
+`parse_tick_result` (`sidecar.py:172`) requires a `TICK RESULT:` marker
+(`_MARKER_RE`, line 148). The grammar lives in
+`agent-launchers/prompts/tick-contract.md` but never reaches the worker:
+`start-agent.sh:185-188` builds the sidecar `--prompt-file` from the role
+prompt only (`render_prompt "$PROMPT_FILE"`), never concatenating the contract.
+Verified live: `grep -c -i "tick result" /tmp/sidecar-prompt-cadencelms-1.*` → 0.
+The worker ran the legacy "print NO WORK and stop" prompt, never told to emit
+`TICK RESULT: …`, so every tick parsed garbled → `valid=False`.
+_Fix:_ in the sidecar branch of `start-agent.sh`, append the rendered
+`prompts/tick-contract.md` to `RENDERED_PROMPT` before writing
+`$SIDECAR_PROMPT_FILE` (contract file already exists and matches the parser
+grammar). Canonical template edit → `install-launchers --force` → relaunch.
+_Status: **FIXED in template (pending publish)**, 2026-07-23._ Applied to
+`templates/project-launchers/start-agent.sh` (renders + appends the contract,
+hard-fails if the contract file is missing). Regression added in
+`tests/test_project_bootstrap.py::test_agent_sidecar_opencode_routes_through_sidecar_py`
+asserting the injected prompt contains the contract block + `TICK RESULT:
+WORKED`/`NO WORK` grammar. Suite green (156 in bootstrap+sidecar). Not yet
+committed, not yet published to workspaces — rides the same
+`install-launchers --force` + relaunch as DEFECT-SIDECAR-2.
+
+**DEFECT-SIDECAR-2 — cumulative session total read as current context size (1589%).**
+`OpencodeAdapter.get_usage()` (`sidecar.py:644`) reads `GET /session/{id}`,
+whose `tokens.total` is cumulative-per-session (its own comment, line 645) — it
+only grows, and is NOT current context-window occupancy. `TokenAccountant`
+divides by `context_limit_tokens` (180k) → tick 2 logged
+`context_tokens=2,860,186 pct=1589.0`, tripping the FORCED_CLEAR backstop. Tell:
+the two 19k/10.6% readings were fresh sessions; the 2.86M was the SAME session
+after a work cycle.
+_Fix:_ derive occupancy from the latest turn, not the session aggregate — read
+`_last_completed_assistant_message()`'s per-message `info.tokens`
+(input + output + reasoning + cache.read + cache.write) as `context_tokens`;
+keep `GET /session` only for cumulative `session_cost` if wanted. Confirm
+per-message `info.tokens` shape against `oc-api-cheatsheet.md` before writing.
+_Status: **FIXED in template (pending publish)**, 2026-07-23._ Rewrote
+`OpencodeAdapter.get_usage()` to read the last completed assistant turn's
+`info.tokens` (via `_last_completed_assistant_message()`, `/message`) through a
+new `_context_tokens_from()` helper that keeps the Phase-3 sum/prefer-total
+math — only the SOURCE changed from session-cumulative to per-turn; cost still
+from `GET /session`. Returns None (unknown budget) when no turn has completed
+yet (post-clear) instead of a bogus 0. NB: `oc-api-cheatsheet.md` does not
+exist in-repo (only referenced in comments); shape confirmed from the
+code/test-encoded `tokens{input,output,reasoning,total,cache{read,write}}`.
+Regression tests added to `tests/test_sidecar.py`: last-turn-not-cumulative
+(session carries the 2.86M trap, reading must be 19051), post-clear→None, and
+the three existing get_usage tests updated to the per-turn source. Suite green
+(158 in bootstrap+sidecar, +2). Not committed, not published.
+
+**TEST-GAP — both bugs slipped Phase 2/3 QA because the seams were stubbed.**
+`parse_tick_result` tests fed synthetic text containing the marker (passed while
+the real prompt produced none); the token test fed a synthetic single usage
+dict (never exercised cumulative-vs-per-turn). Add: (a) a test that renders the
+actual injected sidecar prompt and asserts it contains the `TICK RESULT`
+contract; (b) a multi-turn session fixture asserting `context_tokens` tracks the
+last turn, not the running total.
+
+**Re-soak:** after both fixes land + tests + republish, restart the agent-1
+side-car worker and reset the clock from zero (prior 6h void). Operator elected
+a **6h** side-car soak for this cycle (2026-07-23), not the plan's ≥12h — the
+observation window is shortened by operator decision; the pass criteria
+(work across ≥3 ticks all valid, clean READY-TO-CLEAR handshake, no
+relaunch-for-work, no false-stale) are unchanged.
