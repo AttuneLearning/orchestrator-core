@@ -1,7 +1,11 @@
 # Plan: Durable Token-Aware Workers + Side-Car Watcher
 
-> **Status:** APPROVED (rev 3, 2026-07-22) — operator gave go-ahead; implementation
-> follows the delivery methodology in §11 (model-tiered agent team, phase gates,
+> **Status:** DELIVERED (rev 4, 2026-07-23) — all phases 0-5 implemented, gated,
+> committed (tags phase-0..phase-5 on feat/durable-worker-sidecar) and published
+> to both workspaces; see §13 delivery record. Soaks (24h phase-1 / 12h side-car)
+> in progress post-publish; fleet-wide side-car default flip is gated on them.
+> Previously: APPROVED (rev 3, 2026-07-22) — operator gave go-ahead; implementation
+> followed the delivery methodology in §11 (model-tiered agent team, phase gates,
 > commit per phase, e2e after development).
 > Rev 2 folded in review findings: Phase-1 heartbeat/stale sequencing fix, dormant
 > status, watchdog-vs-verify ceiling, tick protocol (markers, coalescing, clear
@@ -256,3 +260,33 @@ progression. Full e2e testing runs after all development completes. **Commit
   (Phase 5), or per-project env is destroyed.
 - **Dashboard auth** deliberately deferred (owner-accepted, single-owner
   server/network); revisit when adding any additional operator or exposure.
+
+## 13. Delivery record (2026-07-23)
+
+Branch `feat/durable-worker-sidecar`, tags `phase-0`..`phase-5`. Suite grew
+906 → 1086 tests, all green at every phase boundary.
+
+| Phase | Commit | Gate |
+|---|---|---|
+| 0 | baseline commits + branch | pytest 906 green |
+| 1 | e4b5ecb loop-lifetime 20s heartbeat; stale 120s (raised from plan's 90 per QA headroom finding); dashboard 0.0.0.0 verified | sonnet QA + functional heartbeat test (stub dashboard: continuous beats through sleeps, no orphan) |
+| 2 | 21d1e8c sidecar.py + tick-contract.md (opencode) | opus gate ×3 (FAIL→fix→FAIL→fix→PASS): async-inject stale-read baseline, non-fatal HTTP, alive debounce, session ownership by title, suppression choke point, policy coercion, t_max 5100, restart-storm + baseline-sentinel corner cases. Live e2e vs real opencode serve |
+| 3 | 9f1ce06 TokenAccountant, CONTEXT BUDGET ticks, FORCED_CLEAR backstop | sonnet QA (FAIL→fix): cache.write/reasoning counted, monotonic cost, limit validation. Live drain e2e: session rotation + fresh-context budget verified via opencode API |
+| 4 | 3f4a8f5 migration 0024 (cadence fields, wake_signal), heartbeat status working/idle/dormant, wake relay, /agents wake button, MCP heartbeat status | opus gate PASS w/ follow-ups applied (wake key symmetry via registry-resolved key; migrate-before-code documented in migration header). DB backups refreshed first (sync-backups.sh) |
+| 5 | e376bcb TmuxAdapter (claude/codex), balance alert → pause + /alerts Correspondence, AGENT_SIDECAR=1 launch mode, --print-cmd (env-self-contained, COMMAND_TIMEOUT=0) | sonnet QA (FAIL→fix, 8 findings incl. marker truncation monotonicity, per-project port/buffer namespacing + session-directory ownership check, drain /clear idle-gating, restart cooldown 120s). Fake-TUI tmux e2e (found alive()/restart-storm defects live) |
+| — | 22f92f4 install-launchers env-preserve + atomic writes (pulled forward from phase 5) | proven at publish: env checksums byte-identical through --force |
+
+**Publish/cutover executed (2026-07-23, in order):** DB backups → install-launchers
+--force to both workspaces (env preserved, verified by checksum) → `migrate` both
+instances (0024 applied) → dashboard restart (new payload/endpoints live on
+0.0.0.0:8800) → full worker-loop relaunch both fleets via respawn-pane (new 20s
+loop-lifetime heartbeat live) → daemon restart both instances with NO stale env
+override (stale=120 active) → cadencelms agent-1 (backend dev, opencode)
+relaunched under AGENT_SIDECAR=1 as the live side-car soak worker.
+
+**Still open (soak-gated):** 24h zero-false-stale observation; ≥12h side-car
+worker soak (work across ≥3 ticks, clear handshake, no relaunch-for-work);
+claude/codex tmux side-car mode used in anger (needs SIDECAR_TMUX_TARGET);
+fleet-wide AGENT_SIDECAR default flip after soaks. Known accepted heuristics:
+tmux idle detection vs animated TUIs (marker-stability collection +
+IDLE_FALLBACK bound the damage), token estimation (§12).
