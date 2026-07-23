@@ -13,9 +13,9 @@ PROMPT="$(render_prompt "$PROMPT_FILE")"
 LAUNCH_MODE="$(resolve_agent_mode non-interactive)"
 PROMPT="$(apply_interactive_prompt "$PROMPT" "$LAUNCH_MODE")"
 
-# Open-source model selection. Default is glm-5.2; override per launch with
-# ORCH_OPENCODE_MODEL (e.g. orch_model/deepseek-v4-pro, qwen_local/qwen-local).
-OPENCODE_MODEL="${ORCH_OPENCODE_MODEL:-orch_model/glm-5.2}"
+# Open-source model selection. Default is deepseek-4-flash; override per launch
+# with ORCH_OPENCODE_MODEL (e.g. orch_model/deepseek-v4-pro, qwen_local/qwen-local).
+OPENCODE_MODEL="${ORCH_OPENCODE_MODEL:-orch_model/deepseek-4-flash}"
 ensure_opensource_keys
 
 OPENCODE_CONFIG_HOME="$(mktemp -d "${TMPDIR:-/tmp}/opencode-${PROJECT:-workspace}.XXXXXX")"

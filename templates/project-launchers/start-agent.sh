@@ -29,7 +29,7 @@ flags (accepted anywhere on the line):
   --non-interactive    force one-shot/non-interactive mode
   -m, --model MODEL    shortcut or model string valid for the chosen runtime
                        (omit for the runtime default: claude->opus,
-                        codex->gpt-5.4-mini, opencode->glm-5.2;
+                        codex->gpt-5.4-mini, opencode->deepseek-4-flash;
                         list combos: agent-launchers/resolve-model.py --list)
   -h, --help           show this help
 EOF
@@ -62,7 +62,7 @@ RUNTIME="${RUNTIME:-$DEFAULT_RUNTIME}"
 
 # Resolve -m/--model against agent-model.yaml and route to the harness-specific
 # env var. No -m = each harness's default (claude->opus, codex->gpt-5.4-mini,
-# opencode->glm-5.2).
+# opencode->deepseek-4-flash).
 if [ -n "$MODEL_SEL" ]; then
   if ! RESOLVED_MODEL="$("$ORCH/.venv/bin/python" "$LAUNCHER_DIR/resolve-model.py" "$RUNTIME" "$MODEL_SEL")"; then
     echo "model '$MODEL_SEL' is not valid for runtime '$RUNTIME'." >&2
@@ -212,9 +212,9 @@ if [ "${AGENT_SIDECAR:-0}" = "1" ]; then
       # the whole range within ~4900-5920 (50 bands x 20 ports/band).
       SIDECAR_PORT=$((4900 + ($(printf '%s' "$PROJECT" | cksum | cut -d' ' -f1) % 50) * 20 + AGENT_ID))
       # Same model resolution opencode.sh uses: ORCH_OPENCODE_MODEL (set by
-      # -m/--model above) or the glm-5.2 default; split provider/model on
+      # -m/--model above) or the deepseek-4-flash default; split provider/model on
       # the slash the same way opencode.sh's config does.
-      SIDECAR_OPENCODE_MODEL="${ORCH_OPENCODE_MODEL:-orch_model/glm-5.2}"
+      SIDECAR_OPENCODE_MODEL="${ORCH_OPENCODE_MODEL:-orch_model/deepseek-4-flash}"
       SIDECAR_PROVIDER_ID="${SIDECAR_OPENCODE_MODEL%%/*}"
       SIDECAR_MODEL_ID="${SIDECAR_OPENCODE_MODEL#*/}"
 

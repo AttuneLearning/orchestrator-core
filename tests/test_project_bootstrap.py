@@ -187,7 +187,7 @@ def test_opencode_runtime_builds_config_and_command(settings, tmp_path, monkeypa
             "AGENT_ENABLE_LOOP_DEFAULT": "1",
             "AGENT_POLL_DEFAULT": "90",
             "FANOUT_DEFAULT": "3",
-            # opencode model is selected via ORCH_OPENCODE_MODEL (default glm-5.2).
+            # opencode model is selected via ORCH_OPENCODE_MODEL (default deepseek-4-flash).
             "ORCH_OPENCODE_MODEL": "orch_model/deepseek-v4-pro",
         }
     )
@@ -632,6 +632,11 @@ def test_agent_sidecar_opencode_routes_through_sidecar_py(settings, tmp_path):
     assert argv[argv.index("--opencode-dir") + 1] == str(workspace / "wt-backend-dev")
     assert "--opencode-provider-id" in argv
     assert "--opencode-model-id" in argv
+    # Default opencode model when no -m is passed. The effective default lives in
+    # start-agent.sh's hardcoded sidecar fallback (ORCH_OPENCODE_MODEL unset here),
+    # NOT agent-model.yaml — lock it so the default can't silently drift again.
+    assert argv[argv.index("--opencode-provider-id") + 1] == "orch_model"
+    assert argv[argv.index("--opencode-model-id") + 1] == "deepseek-4-flash"
     assert argv[argv.index("--agent-id") + 1] == "1"
     assert argv[argv.index("--project") + 1] == "tendcharting"
     assert argv[argv.index("--dashboard") + 1] == "http://127.0.0.1:8800"

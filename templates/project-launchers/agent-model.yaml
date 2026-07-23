@@ -61,7 +61,7 @@ harnesses:
         provider: openai
   opencode:
     provider: opensource
-    default: glm-5.2
+    default: deepseek-4-flash
     models:
       arcee-trinity-large-thinking:
         model: orch_model/arcee-trinity-large-thinking

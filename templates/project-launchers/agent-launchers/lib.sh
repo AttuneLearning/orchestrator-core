@@ -151,7 +151,7 @@ EOF
 # agent started from an orchestrator-installed directory".
 #
 # Open-source endpoints (opencode only):
-#   orch_model  -> DigitalOcean OpenAI-compatible: glm-5.1, glm-5.2, deepseek-v4-pro
+#   orch_model  -> DigitalOcean OpenAI-compatible: deepseek-4-flash, glm-5.1, glm-5.2, deepseek-v4-pro
 #   qwen_local  -> local qwen3-coder server:        qwen-local
 # Anthropic (claude) and OpenAI (codex) keep their own native config/auth.
 # ---------------------------------------------------------------------------
@@ -190,7 +190,7 @@ project = os.environ.get("OC_PROJECT") or ""
 def _fallback():
     return {
         "orch_model": {"name": "DigitalOcean (OpenAI-Compatible)", "base_url": os.environ["OC_DO_URL"],
-                       "key_env": "MODEL_ACCESS_KEY", "models": ["glm-5.1", "glm-5.2", "deepseek-v4-pro"]},
+                       "key_env": "MODEL_ACCESS_KEY", "models": ["deepseek-4-flash", "glm-5.1", "glm-5.2", "deepseek-v4-pro"]},
         "qwen_local": {"name": "Local Qwen (qwen3-coder)", "base_url": os.environ["OC_QWEN_URL"],
                        "key_env": "QWEN_LOCAL_API_KEY", "models": ["qwen-local"]},
     }

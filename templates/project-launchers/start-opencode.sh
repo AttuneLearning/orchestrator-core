@@ -6,7 +6,7 @@ set -euo pipefail
 # orchestrator config (agent-launchers/orchestrator.env present).
 #
 # Usage: ./start-opencode.sh [-m MODEL] [--dir PATH] [--dry-run] [-- opencode args]
-#   -m/--model  provider/model or alias. Default: glm-5.2
+#   -m/--model  provider/model or alias. Default: deepseek-4-flash
 #               aliases: glm-5.2 | glm-5.1 | deepseek(-v4-pro) | qwen(-local/qwen3-coder)
 #               open-source menu: orch_model/{glm-5.1,glm-5.2,deepseek-v4-pro}, qwen_local/qwen-local
 
@@ -19,7 +19,7 @@ source "$LAUNCHER_DIR/lib.sh"
 
 command -v opencode >/dev/null 2>&1 || { echo "missing opencode CLI on PATH" >&2; exit 1; }
 
-MODEL="orch_model/glm-5.2"
+MODEL="orch_model/deepseek-4-flash"
 WORKDIR=""
 DRY_RUN=0
 PASS=()
