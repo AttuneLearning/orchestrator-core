@@ -733,7 +733,8 @@ def count_by_state(pool: ConnectionPool, table: str) -> dict[str, int]:
 # --------------------------------------------------------------------------- #
 
 _AGENT_COLS = ("id, team, function, runtime, status, last_seen, created_at, "
-               "loop_enabled, poll_interval_seconds, paused_until")
+               "loop_enabled, poll_interval_seconds, paused_until, "
+               "active_window_seconds, dormant_interval_seconds")
 
 
 def register_agent(
@@ -777,20 +778,47 @@ def set_agent_status(pool: ConnectionPool, agent_id: int, status: str) -> None:
         conn.execute("UPDATE agents SET status = %s WHERE id = %s", (status, agent_id))
 
 
-def touch_agent(pool: ConnectionPool, agent_id: int) -> None:
+# Durable-worker side-car status self-report (migration 0024, plan §7) mapped
+# to the DB's status vocabulary. 'dormant' needs no schema change: agents.status
+# is plain unconstrained TEXT (0001_init.sql documents idle|busy|offline in a
+# comment only, no CHECK constraint).
+_HEARTBEAT_STATUS_MAP = {"working": "busy", "idle": "idle", "dormant": "dormant"}
+
+
+def touch_agent(pool: ConnectionPool, agent_id: int, status: Optional[str] = None) -> None:
     """Heartbeat: record that the agent did work — or merely polled — just now.
     A worker that is talking to the coordinator is alive by definition, so this
     also REVIVES an agent the reclaim sweep latched to 'offline' (back to 'idle').
     Without the revive, a worker whose only activity is polling my_queue would be
     marked offline once and never recovered, and the _assign scan would refuse to
-    route work to it — the pull-gate liveness deadlock."""
+    route work to it — the pull-gate liveness deadlock.
+
+    `status` (migration 0024): an optional durable-worker side-car self-report —
+    one of 'working' | 'idle' | 'dormant' — mapped verbatim onto the DB status
+    column (working->busy, idle->idle, dormant->dormant). This is the side-car's
+    OWN authoritative claim about its worker, so when given it OVERRIDES the
+    revive-only default below rather than merely reviving offline->idle: e.g. a
+    'dormant' agent whose next heartbeat carries status='working' becomes
+    'busy'. Old callers that never pass `status` (run-agent-loop.sh's curl, the
+    MCP heartbeat/list_my_work/my_queue tools) get byte-identical behavior to
+    before this migration. An unrecognized string is treated exactly like no
+    status at all — this never raises, so a caller (e.g. the dashboard
+    heartbeat endpoint) can pass untrusted input straight through and still
+    always get a live heartbeat."""
+    mapped = _HEARTBEAT_STATUS_MAP.get(status) if status else None
     with pool.connection() as conn:
-        conn.execute(
-            "UPDATE agents SET last_seen = now(), "
-            "status = CASE WHEN status = 'offline' THEN 'idle' ELSE status END "
-            "WHERE id = %s",
-            (agent_id,),
-        )
+        if mapped is not None:
+            conn.execute(
+                "UPDATE agents SET last_seen = now(), status = %s WHERE id = %s",
+                (mapped, agent_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE agents SET last_seen = now(), "
+                "status = CASE WHEN status = 'offline' THEN 'idle' ELSE status END "
+                "WHERE id = %s",
+                (agent_id,),
+            )
 
 
 def agent_next_poll_seconds(agent: Agent) -> int:
@@ -801,9 +829,16 @@ def agent_next_poll_seconds(agent: Agent) -> int:
 
 def set_agent_loop(pool: ConnectionPool, agent_id: int, *,
                    loop_enabled: Optional[bool] = None,
-                   poll_interval_seconds: Optional[int] = None) -> Optional[Agent]:
-    """Set a pull worker's loop policy. Only provided fields change. Interval is
-    bounded to 60..7200s (reject out-of-range)."""
+                   poll_interval_seconds: Optional[int] = None,
+                   active_window_seconds: Optional[int] = None,
+                   dormant_interval_seconds: Optional[int] = None) -> Optional[Agent]:
+    """Set a pull worker's loop policy. Only provided fields change.
+    poll_interval_seconds is bounded to 60..7200s. active_window_seconds /
+    dormant_interval_seconds (migration 0024, plan §7) are the durable-worker
+    side-car cadence-window overrides, bounded to 300..14400s / 600..86400s
+    respectively — the same ranges the side-car's own _coerce_policy applies
+    when it reads these back, so a value that passes here can never be
+    rejected/clamped on the side-car end."""
     sets: list[str] = []
     params: list[Any] = []
     if loop_enabled is not None:
@@ -812,6 +847,14 @@ def set_agent_loop(pool: ConnectionPool, agent_id: int, *,
         if not (60 <= poll_interval_seconds <= 7200):
             raise ValueError("poll_interval_seconds must be between 60 and 7200")
         sets.append("poll_interval_seconds = %s"); params.append(poll_interval_seconds)
+    if active_window_seconds is not None:
+        if not (300 <= active_window_seconds <= 14400):
+            raise ValueError("active_window_seconds must be between 300 and 14400")
+        sets.append("active_window_seconds = %s"); params.append(active_window_seconds)
+    if dormant_interval_seconds is not None:
+        if not (600 <= dormant_interval_seconds <= 86400):
+            raise ValueError("dormant_interval_seconds must be between 600 and 86400")
+        sets.append("dormant_interval_seconds = %s"); params.append(dormant_interval_seconds)
     if sets:
         params.append(agent_id)
         with pool.connection() as conn:
@@ -828,6 +871,34 @@ def set_agent_pause(pool: ConnectionPool, agent_id: int,
         conn.execute("UPDATE agents SET paused_until = %s WHERE id = %s",
                      (paused_until, agent_id))
     return get_agent(pool, agent_id)
+
+
+def get_wake_at(pool: ConnectionPool, project: str) -> Optional[datetime]:
+    """The most recent wake signal for `project` (migration 0024, plan §7), or
+    None if it has never been bumped. Every side-car polling
+    GET /agents/{id}/pause?project=P compares this against the last value it
+    observed and fires an immediate tick on increase — see
+    Sidecar.check_wake."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT wake_at FROM wake_signal WHERE project = %s", (project,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def bump_wake(pool: ConnectionPool, project: str) -> datetime:
+    """Signal every side-car for `project` to wake immediately (dashboard "Wake
+    all" button, or the orch-manager after promoting new work). UPSERT so the
+    first bump for a never-before-seen project still works. Returns the new
+    wake_at."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "INSERT INTO wake_signal (project, wake_at) VALUES (%s, now()) "
+            "ON CONFLICT (project) DO UPDATE SET wake_at = now() "
+            "RETURNING wake_at",
+            (project,),
+        ).fetchone()
+    return row[0]
 
 
 def find_idle_agent(

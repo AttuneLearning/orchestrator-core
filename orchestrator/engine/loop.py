@@ -998,6 +998,26 @@ class Engine:
                         or issue.assigned_agent is None):
                     continue
                 age = repo.agent_seconds_since_seen(self.pool, issue.assigned_agent)
+                # Dormant guard (migration 0024, plan §7) — READ CAREFULLY, this
+                # is the riskiest line in the phase-4 diff. 'dormant' is a
+                # first-class durable-worker side-car state for its slow-cadence
+                # window, but a dormant side-car still heartbeats on the SAME
+                # ~20s cadence as an active one (touch_agent runs every step,
+                # regardless of state), so its last_seen stays exactly as fresh.
+                # The check below is ALREADY freshness-only, not status-based,
+                # so it already implements the required rule with no extra
+                # branch needed: dormant + fresh last_seen -> `continue` here,
+                # never reclaimed (same as any other live worker); stale
+                # last_seen -> falls through and IS reclaimed below regardless
+                # of whatever status the agent last reported (a crashed
+                # side-car's last write could well have been 'dormant', and a
+                # dead worker is dead no matter what it last claimed to be).
+                # Deliberately NOT adding a second, status-based check here: the
+                # only way one could differ from this is by SKIPPING a reclaim
+                # for a stale-but-dormant-status agent, which would reintroduce
+                # exactly the false-negative-liveness bug this guard exists to
+                # prevent. Keep this the single source of truth for reclaim
+                # eligibility.
                 if age is not None and age <= self.t.agent_stale_seconds:
                     continue  # worker is alive
                 dead = issue.assigned_agent

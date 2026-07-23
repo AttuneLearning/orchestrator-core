@@ -1707,7 +1707,8 @@ def actions_page(pending: list[dict[str, Any]], resolved: list[dict[str, Any]]) 
 
 
 def agents_page(agents: list[dict[str, Any]],
-                activity: Optional[list[dict[str, Any]]] = None) -> str:
+                activity: Optional[list[dict[str, Any]]] = None,
+                project: str = "") -> str:
     def _seen(a: dict[str, Any]) -> str:
         if a.get("stale"):
             return f"<span class='s-failed'>stale ({escape(str(a.get('last_seen') or '')[:19])})</span>"
@@ -1744,6 +1745,23 @@ def agents_page(agents: list[dict[str, Any]],
                 nxt = "—"
         return f"{form}<div class='muted' style='font-size:12px'>next ~ {escape(nxt)}</div>"
 
+    def _cadence_cell(a: dict[str, Any]) -> str:
+        # Durable-worker side-car cadence-window overrides (migration 0024,
+        # plan §7): same pattern as _poll_cell above, posting to the same
+        # /agents/loop endpoint (set_agent_loop bounds each field server-side).
+        aw = int(a.get("active_window_seconds") or 1800)
+        di = int(a.get("dormant_interval_seconds") or 3600)
+        return (
+            "<form method='post' action='/agents/loop' style='display:inline'>"
+            f"<input type='hidden' name='agent_id' value='{a['id']}'>"
+            "active "
+            f"<input name='active_window_seconds' type='number' min='300' max='14400' "
+            f"value='{aw}' style='width:70px;{_inp}'> "
+            "dormant "
+            f"<input name='dormant_interval_seconds' type='number' min='600' max='86400' "
+            f"value='{di}' style='width:70px;{_inp}'> "
+            "<button type='submit'>set</button></form>")
+
     def _pause_cell(a: dict[str, Any]) -> str:
         pu = a.get("paused_until")
         active = bool(pu) and pu > datetime.now(timezone.utc)
@@ -1765,14 +1783,26 @@ def agents_page(agents: list[dict[str, Any]],
         f"<tr><td>#{a['id']}</td><td>{escape(a['team'])}/{escape(a['function'])}</td>"
         f"<td><span class='pill'>{escape(a['status'])}</span></td>"
         f"<td>{escape(a['runtime'])}</td><td>{_seen(a)}</td>"
-        f"<td>{_loop_cell(a)}</td><td>{_poll_cell(a)}</td><td>{_pause_cell(a)}</td></tr>"
+        f"<td>{_loop_cell(a)}</td><td>{_poll_cell(a)}</td><td>{_cadence_cell(a)}</td>"
+        f"<td>{_pause_cell(a)}</td></tr>"
         for a in agents
     )
     registry = (
         "<table><tr><th>ID</th><th>Team/Function</th><th>Status</th><th>Runtime</th>"
-        f"<th>Last seen</th><th>Loop</th><th>Poll (s) · next</th><th>Cooldown</th></tr>{rows}</table>"
+        "<th>Last seen</th><th>Loop</th><th>Poll (s) · next</th>"
+        f"<th>Cadence window (s)</th><th>Cooldown</th></tr>{rows}</table>"
         if rows else "<p class='muted'>None registered.</p>"
     )
+    # "Wake all" (migration 0024, plan §7): bumps wake_signal for the CURRENT
+    # project (the ?project= this page is already showing — same key the
+    # multi-instance dashboard uses to pick a coordinator), so every
+    # durable-worker side-car for it fires an immediate tick on its next state
+    # poll, even mid-dormant-window.
+    wake_all = (
+        f"<form method='post' action='/agents/wake?project={quote(project, safe='')}' "
+        "style='display:inline;margin:8px 0'>"
+        "<button type='submit'>Wake all</button></form>"
+    ) if project else ""
 
     def _who(e: dict[str, Any]) -> str:
         if e.get("team") and e.get("function"):
@@ -1797,5 +1827,5 @@ def agents_page(agents: list[dict[str, Any]],
     )
 
     return page("Agents", (
-        "<h1>Agent registry</h1>" + registry + activity_section
+        "<h1>Agent registry</h1>" + wake_all + registry + activity_section
     ))

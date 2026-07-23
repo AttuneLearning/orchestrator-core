@@ -28,13 +28,22 @@ STALE_AFTER_S = 600  # a busy agent silent this long is flagged stale
 
 
 def agents_with_staleness(pool: ConnectionPool) -> list[dict[str, Any]]:
-    """Agent registry with a computed `stale` flag (busy + heartbeat too old)."""
+    """Agent registry with a computed `stale` flag (busy + heartbeat too old).
+
+    'dormant' (migration 0024, plan §7) is a first-class durable-worker
+    side-car state for its slow-cadence window, and must NEVER read as stale —
+    an hour-dormant worker is alive by design, not dead. The `status == "busy"`
+    condition already excludes it (dormant != busy), but the explicit
+    `!= "dormant"` guard below is kept anyway so this invariant survives even
+    if the busy-only condition is ever loosened (e.g. to also flag stale
+    'idle' agents) without anyone having to rediscover the dormant exemption.
+    """
     out = []
     now = datetime.now(timezone.utc)
     for a in repo.list_agents(pool):
         d = asdict(a)
         d["stale"] = bool(
-            a.status == "busy" and a.last_seen is not None
+            a.status == "busy" and a.status != "dormant" and a.last_seen is not None
             and (now - a.last_seen).total_seconds() > STALE_AFTER_S
         )
         out.append(d)

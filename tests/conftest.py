@@ -44,5 +44,5 @@ def _clean_db(request):
             "TRUNCATE goals, issues, issue_events, agents, memory_notes, "
             "messages, adrs, contracts, issue_contract_deps, system_state, "
             "contract_proposals, pending_actions, contract_lifecycle_ops, "
-            "contract_lifecycle_events RESTART IDENTITY CASCADE"
+            "contract_lifecycle_events, wake_signal RESTART IDENTITY CASCADE"
         )

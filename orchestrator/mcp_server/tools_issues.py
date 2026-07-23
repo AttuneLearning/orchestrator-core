@@ -693,12 +693,18 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None,
         return {"status": "ok"}
 
     @mcp.tool()
-    def heartbeat(agent_id: int) -> dict[str, Any]:
+    def heartbeat(agent_id: int, status: Optional[str] = None) -> dict[str, Any]:
         """Pull workers call this every poll: refreshes last_seen (so the engine's
         liveness reclaim doesn't treat them as dead), reactivates a reclaimed
         worker (offline -> idle), and returns the live loop policy so the worker
         self-paces. `next_poll_seconds` is 0 when looping is disabled, meaning
-        'stop after the queue drains'; otherwise it's the idle poll cadence."""
+        'stop after the queue drains'; otherwise it's the idle poll cadence.
+
+        `status` (migration 0024, plan §7): optional self-report — one of
+        'working' | 'idle' | 'dormant' — for workers running a durable-worker
+        side-car (forwarded verbatim to repository.touch_agent, which maps it
+        onto the DB status column). Omitted by existing callers; backward
+        compatible — behavior with no status is unchanged."""
         agent = repo.get_agent(pool, agent_id)
         if agent is None:
             # No such agent in THIS coordinator's DB — almost always means the MCP
@@ -716,7 +722,7 @@ def register(mcp: FastMCP, pool: ConnectionPool, settings=None,
         # Read status BEFORE touch: touch_agent itself now revives an offline worker
         # (offline -> idle), so reactivation must be observed from the pre-touch state.
         reactivated = agent.status == "offline"
-        repo.touch_agent(pool, agent_id)  # refresh last_seen; revives offline -> idle
+        repo.touch_agent(pool, agent_id, status=status)  # refresh last_seen; revives offline -> idle
         loop_enabled = bool(agent.loop_enabled) if agent else False
         # Cooldown window (migration 0019): if paused_until is in the future, the
         # worker should sleep until then instead of polling; the engine also skips

@@ -168,6 +168,8 @@ class FakeDashboard:
     def __init__(self, poll_interval_seconds: int = 300):
         self.heartbeat_count = 0
         self.heartbeat_fail = False
+        self.last_status = None          # Phase 4: last status heartbeat() carried
+        self.statuses: list[str | None] = []
         self.poll_count = 0
         self.poll_fail = False
         self.policy = {
@@ -175,16 +177,22 @@ class FakeDashboard:
             "loop_enabled": True,
             "poll_interval_seconds": poll_interval_seconds,
         }
+        self.wake_at = None               # Phase 4: ISO string or None
 
-    def heartbeat(self) -> bool:
+    def heartbeat(self, status=None) -> bool:
         self.heartbeat_count += 1
+        self.last_status = status
+        self.statuses.append(status)
         return not self.heartbeat_fail
 
     def get_policy(self):
         self.poll_count += 1
         if self.poll_fail:
             return None
-        return dict(self.policy)
+        payload = dict(self.policy)
+        if self.wake_at is not None:
+            payload["wake_at"] = self.wake_at
+        return payload
 
 
 def make_sidecar(adapter=None, dashboard=None, clock=None, **overrides):
@@ -1327,3 +1335,177 @@ def test_cli_rejects_negative_context_limit_tokens(capsys):
             "--context-limit-tokens", "-100",
         ])
     assert "context-limit-tokens" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4 (plan §7, migration 0024): wake relay -- check_wake dedup rules.
+# --------------------------------------------------------------------------- #
+
+def test_wake_first_observation_establishes_baseline_without_firing(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+    injected_before = len(adapter.injected)
+    pending_before = sc.pending
+    capsys.readouterr()
+
+    sc.check_wake({"wake_at": "2026-01-01T00:00:00+00:00"})
+
+    assert sc._last_wake_at is not None
+    assert sc.pending == pending_before
+    assert len(adapter.injected) == injected_before
+    assert "event=WAKE" not in capsys.readouterr().out
+
+
+def test_wake_increase_fires_exactly_once(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+
+    sc.check_wake({"wake_at": "2026-01-01T00:00:00+00:00"})   # baseline, no fire
+    capsys.readouterr()
+
+    sc.check_wake({"wake_at": "2026-01-01T00:05:00+00:00"})   # strictly greater -> fires
+    assert "event=WAKE" in capsys.readouterr().out
+    assert sc.state == "ACTIVE"
+    assert sc.pending is True
+
+    injected_before = len(adapter.injected)
+    sc.step(clock.t)                       # normal machinery actually delivers it
+    assert len(adapter.injected) == injected_before + 1
+
+    # A second read of the SAME wake_at must never re-fire.
+    capsys.readouterr()
+    sc.check_wake({"wake_at": "2026-01-01T00:05:00+00:00"})
+    assert "event=WAKE" not in capsys.readouterr().out
+
+
+def test_wake_equal_value_does_not_fire():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.check_wake({"wake_at": "2026-01-01T00:00:00+00:00"})   # baseline
+    sc.pending = False
+    sc.check_wake({"wake_at": "2026-01-01T00:00:00+00:00"})   # equal, not greater
+    assert sc.pending is False
+
+
+def test_wake_during_dormant_goes_active_with_immediate_tick():
+    sc, adapter, dashboard, clock = make_sidecar(active_window=1800, dormant_interval=3600)
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+    for _ in range(7):
+        clock.advance(300)
+        sc.step(clock.t)
+        if sc.tick_start_at is not None:
+            adapter.complete("TICK RESULT: NO WORK")
+            sc.step(clock.advance(0.1))
+    assert sc.state == "DORMANT"
+
+    sc.check_wake({"wake_at": "2026-01-01T00:00:00+00:00"})   # baseline only, no fire
+    assert sc.state == "DORMANT"
+
+    injected_before = len(adapter.injected)
+    sc.check_wake({"wake_at": "2026-01-01T00:05:00+00:00"})   # increase
+    assert sc.state == "ACTIVE"
+    assert sc.pending is True
+
+    sc.step(clock.t)                       # delivered through the normal path
+    assert len(adapter.injected) == injected_before + 1
+
+
+def test_state_poll_relays_dashboard_wake_at_end_to_end():
+    """_maybe_poll_state itself feeds the fetched payload into check_wake --
+    not just check_wake called directly."""
+    sc, adapter, dashboard, clock = make_sidecar(state_poll_interval=45)
+    sc.step(clock.t)                       # forced first poll; dashboard.wake_at is
+                                            # still None here, nothing to relay yet
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+
+    dashboard.wake_at = "2026-01-01T00:00:00+00:00"
+    clock.advance(50)                      # comfortably past state_poll_interval (45)
+    sc.step(clock.t)                       # first non-null observation: baseline only
+    assert sc._last_wake_at is not None
+    assert sc.state == "ACTIVE"            # unchanged, no fire yet
+
+    dashboard.wake_at = "2026-01-01T00:05:00+00:00"
+    clock.advance(50)
+    injected_before = len(adapter.injected)
+    sc.step(clock.t)
+    assert len(adapter.injected) == injected_before + 1
+    assert sc.state == "ACTIVE"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: heartbeats now carry a working|idle|dormant status self-report.
+# --------------------------------------------------------------------------- #
+
+def test_heartbeat_carries_working_status_while_tick_in_flight():
+    sc, adapter, dashboard, clock = make_sidecar(heartbeat_interval=20)
+    sc.step(clock.t)                       # tick #1 injected, worker stays busy forever
+    assert sc.tick_start_at is not None
+    clock.advance(20)
+    sc.step(clock.t)                       # heartbeat fires again, tick now in flight
+    assert dashboard.last_status == "working"
+
+
+def test_heartbeat_carries_idle_status_when_active_with_no_tick_in_flight():
+    sc, adapter, dashboard, clock = make_sidecar(heartbeat_interval=20)
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+    assert sc.tick_start_at is None
+    assert sc.state == "ACTIVE"
+    clock.advance(20)
+    sc.step(clock.t)
+    assert dashboard.last_status == "idle"
+
+
+def test_heartbeat_carries_dormant_status_when_dormant():
+    sc, adapter, dashboard, clock = make_sidecar(active_window=1800, dormant_interval=3600,
+                                                 heartbeat_interval=20)
+    sc.step(clock.t)
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+    for _ in range(7):
+        clock.advance(300)
+        sc.step(clock.t)
+        if sc.tick_start_at is not None:
+            adapter.complete("TICK RESULT: NO WORK")
+            sc.step(clock.advance(0.1))
+    assert sc.state == "DORMANT"
+    clock.advance(20)
+    sc.step(clock.t)
+    assert dashboard.last_status == "dormant"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: dashboard-supplied cadence-window overrides (active_window_seconds /
+# dormant_interval_seconds) prefer the policy payload over the CLI defaults,
+# within the same bounds repository.set_agent_loop enforces server-side.
+# --------------------------------------------------------------------------- #
+
+def test_policy_cadence_window_overrides_cli_defaults():
+    sc, adapter, dashboard, clock = make_sidecar(active_window=1800, dormant_interval=3600,
+                                                 state_poll_interval=45)
+    dashboard.policy["active_window_seconds"] = 600
+    dashboard.policy["dormant_interval_seconds"] = 7200
+
+    sc.step(clock.t)                       # forced first-step state poll
+
+    assert sc.active_window == 600
+    assert sc.dormant_interval == 7200
+
+
+def test_policy_cadence_window_out_of_bounds_keeps_cli_value():
+    sc, adapter, dashboard, clock = make_sidecar(active_window=1800, dormant_interval=3600,
+                                                 state_poll_interval=45)
+    dashboard.policy["active_window_seconds"] = 100          # below MIN_ACTIVE_WINDOW_S (300)
+    dashboard.policy["dormant_interval_seconds"] = 999_999   # above MAX_DORMANT_INTERVAL_S (86400)
+
+    sc.step(clock.t)
+
+    assert sc.active_window == 1800
+    assert sc.dormant_interval == 3600

@@ -78,6 +78,15 @@ ALIVE_FAILURE_THRESHOLD = 3
 MIN_POLL_INTERVAL_S = 60
 MAX_POLL_INTERVAL_S = 7200
 
+# Phase 4 (plan §7, migration 0024): bounds enforced on the dashboard-supplied
+# cadence-WINDOW overrides (active_window_seconds / dormant_interval_seconds),
+# matching repository.set_agent_loop's server-side bounds exactly so a value
+# accepted there can never be rejected/clamped here.
+MIN_ACTIVE_WINDOW_S = 300
+MAX_ACTIVE_WINDOW_S = 14400
+MIN_DORMANT_INTERVAL_S = 600
+MAX_DORMANT_INTERVAL_S = 86400
+
 
 def resolve_t_max(value: int | None) -> int:
     """Validate/apply the --t-max default. Refuses anything below the verify
@@ -625,9 +634,17 @@ class DashboardClient:
         self.timeout = timeout
         self._logger = logger or (lambda event, **kv: None)
 
-    def heartbeat(self) -> bool:
+    def heartbeat(self, status: str | None = None) -> bool:
         q = urllib.parse.quote(self.project, safe="")
         url = f"{self.base_url}/agents/{self.agent_id}/heartbeat?project={q}"
+        if status is not None:
+            # Phase 4 (plan §7): self-report working|idle|dormant so the
+            # dashboard/engine's own status column (and the staleness view)
+            # reflect the side-car's real state, not just "last touched".
+            # An invalid value is the dashboard's problem to ignore (it
+            # never 4xxs a heartbeat) -- the side-car always sends one of
+            # its own three known states, never arbitrary text.
+            url += f"&status={urllib.parse.quote(status, safe='')}"
         try:
             req = urllib.request.Request(url, data=b"", method="POST")
             with urllib.request.urlopen(req, timeout=self.timeout):
@@ -798,6 +815,10 @@ class Sidecar:
         # first step() rather than waiting a full interval.
         self.last_heartbeat_at = now - heartbeat_interval - 1
         self.last_state_poll_at = now - state_poll_interval - 1
+        # Phase 4 (plan §7): last wake_at this process has observed, for
+        # check_wake's dedup-on-increase. None means "never observed yet" --
+        # the very first observation only sets this baseline, it never fires.
+        self._last_wake_at: datetime | None = None
         self._stop = False
         self._log_fh = open(log_file, "a") if log_file else None
 
@@ -822,13 +843,57 @@ class Sidecar:
         except Exception:
             return None
 
-    # -- Phase-4 wake-relay hook (no-op placeholder) ---------------------------
+    # -- Phase-4 wake relay (plan §7, migration 0024) --------------------------
     def check_wake(self, state_json: dict) -> None:
-        """TODO(phase-4): relay the orchestrator's wake_at into an immediate
-        tick trigger, deduped on increase. The dashboard payload the side-car
-        already polls doesn't carry wake_at yet, so there's nothing to do
-        here until Phase 4 lands the engine-side field."""
-        return None
+        """Relay the orchestrator's per-project wake_at into an immediate tick,
+        deduped on increase. `state_json` is the same /agents/{id}/pause
+        payload _maybe_poll_state already fetches every state_poll_interval;
+        `wake_at` is an ISO timestamp (or absent/null before anyone has ever
+        bumped it for this project).
+
+        Dedup rule: fire ONLY when wake_at is strictly greater than the last
+        value THIS process observed.
+          - First observation (self._last_wake_at is None): establish the
+            baseline WITHOUT firing. Without this, every side-car (re)start
+            would treat whatever wake_at already happens to exist as a brand
+            new wake signal and immediately tick -- a false wake on every
+            restart, not just on an actual promotion event.
+          - Equal to the last observed value: no-op. A dashboard/network
+            hiccup that returns the same payload twice must never re-fire.
+          - Strictly greater: fires exactly once (bumping the baseline before
+            returning, so the next equal-or-lower read is inert).
+
+        On fire: go ACTIVE (a wake always means "there's new work, stop being
+        dormant") with the active window reset (last_worked_at = now, as if a
+        tick had just completed), and mark a tick pending + due immediately.
+        This deliberately does NOT call _inject_tick directly -- that would
+        bypass the tick_start_at in-flight guard living in _maybe_deliver_tick
+        (this method runs from _maybe_poll_state, earlier in the SAME step,
+        so a real tick could already be in flight). Setting pending+due lets
+        the tick actually fire through the normal _maybe_deliver_tick ->
+        _inject_tick path later in this same step (or the next one, if a tick
+        is still in flight) -- suppression (pause/loop_enabled) and the
+        in-flight guard are honored exactly as for any other trigger."""
+        if not isinstance(state_json, dict):
+            return
+        raw = state_json.get("wake_at")
+        if not raw:
+            return
+        try:
+            wake_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return
+        if self._last_wake_at is None:
+            self._last_wake_at = wake_at
+            return
+        if wake_at <= self._last_wake_at:
+            return
+        self._last_wake_at = wake_at
+        self.state = "ACTIVE"
+        self.last_worked_at = self.clock()
+        self.pending = True
+        self.next_tick_at = self.clock()
+        self._log("WAKE", wake_at=wake_at.isoformat())
 
     # -- signal handling --------------------------------------------------------
     def install_signal_handlers(self) -> None:
@@ -898,11 +963,21 @@ class Sidecar:
         return self.dormant_interval
 
     # -- heartbeat / state poll (always on, independent of ticking) ---------
+    def _current_status(self) -> str:
+        """Phase 4 (plan §7): the side-car's own liveness self-report, sent
+        on every heartbeat. A tick in flight always means 'working' even if
+        the window has technically elapsed (the window check only ever runs
+        between ticks -- see _check_window); otherwise it's the state-machine
+        state verbatim ('idle' for ACTIVE-but-nothing-in-flight, 'dormant')."""
+        if self.tick_start_at is not None:
+            return "working"
+        return "dormant" if self.state == "DORMANT" else "idle"
+
     def _maybe_heartbeat(self, now: float) -> None:
         if now - self.last_heartbeat_at < self.heartbeat_interval:
             return
         self.last_heartbeat_at = now
-        ok = self.dashboard.heartbeat()
+        ok = self.dashboard.heartbeat(status=self._current_status())
         if not ok:
             self._log("HEARTBEAT_FAIL")
 
@@ -924,6 +999,31 @@ class Sidecar:
         self._log("STATE_POLL", ok=True, pause_seconds=self.policy.get("pause_seconds"),
                   loop_enabled=self.policy.get("loop_enabled"),
                   poll_interval_seconds=self.policy.get("poll_interval_seconds"))
+        # Phase 4: cadence-window overrides (active_window_seconds /
+        # dormant_interval_seconds) from the dashboard, when present and
+        # valid, take priority over the --active-window/--dormant-interval
+        # CLI flags this process started with. Unlike poll_interval_seconds/
+        # pause_seconds above, an absent or out-of-bounds value does NOT fall
+        # back to some separate hardcoded default -- it simply leaves
+        # self.active_window/self.dormant_interval at whatever they already
+        # are (the CLI value, until/unless a later poll supplies a valid
+        # override). Wrapped defensively: a malformed payload must degrade to
+        # "keep the current cadence", never raise out of a state-poll.
+        try:
+            aw = _coerce_int_field(raw_policy.get("active_window_seconds"),
+                                    min_v=MIN_ACTIVE_WINDOW_S, max_v=MAX_ACTIVE_WINDOW_S)
+            if aw is not None:
+                self.active_window = aw
+            di = _coerce_int_field(raw_policy.get("dormant_interval_seconds"),
+                                    min_v=MIN_DORMANT_INTERVAL_S, max_v=MAX_DORMANT_INTERVAL_S)
+            if di is not None:
+                self.dormant_interval = di
+        except Exception as exc:
+            self._log("CADENCE_OVERRIDE_ERROR", error=str(exc))
+        # Phase 4: wake relay -- see check_wake's docstring for the dedup
+        # rule. Uses the same raw (pre-coercion) payload since wake_at isn't
+        # part of the cadence policy dict.
+        self.check_wake(raw_policy)
 
     # -- watchdog -------------------------------------------------------------
     def _alive_safe(self) -> bool:

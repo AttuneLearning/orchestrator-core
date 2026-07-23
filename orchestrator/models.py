@@ -153,6 +153,11 @@ class Agent:
     # engine won't assign new work and a pull worker sleeps until then, then resumes.
     # Set on a token-limit backoff (now()+2h) or manually from the dashboard.
     paused_until: Optional[datetime] = None
+    # Durable-worker side-car cadence (migration 0024, plan §7). Per-agent
+    # overrides of the side-car's --active-window/--dormant-interval CLI
+    # defaults; editable from the Agents page like poll_interval_seconds.
+    active_window_seconds: int = 1800
+    dormant_interval_seconds: int = 3600
 
 
 @dataclass

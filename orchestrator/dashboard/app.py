@@ -855,21 +855,32 @@ def create_app(pool: Optional[ConnectionPool] = None,
 
     @app.get("/agents", response_class=HTMLResponse)
     def agents() -> str:
+        # project: the ?project=<key> the multi-instance dashboard already uses
+        # to pick a coordinator (context.py) — reused as the wake_signal key so
+        # "Wake all" bumps exactly the project whose agents are on this page.
         return templates.agents_page(agents_with_staleness(pool),
-                                     repo.recent_agent_activity(pool, 10))
+                                     repo.recent_agent_activity(pool, 10),
+                                     project=context.current_key())
 
     @app.post("/agents/loop")
     def agents_loop(agent_id: int = Form(...),
                     loop_enabled: Optional[str] = Form(None),
-                    poll_interval_seconds: Optional[int] = Form(None)):
+                    poll_interval_seconds: Optional[int] = Form(None),
+                    active_window_seconds: Optional[int] = Form(None),
+                    dormant_interval_seconds: Optional[int] = Form(None)):
         """Human control from the Agents page: toggle a pull worker's poll loop on/off
-        and/or set its idle poll cadence (set_agent_loop bounds it to 60..7200s)."""
+        and/or set its idle poll cadence (set_agent_loop bounds it to 60..7200s).
+        active_window_seconds / dormant_interval_seconds (migration 0024, plan §7)
+        are the durable-worker side-car cadence-window overrides (300..14400s /
+        600..86400s)."""
         le: Optional[bool] = None
         if loop_enabled not in (None, ""):
             le = str(loop_enabled).lower() in ("1", "true", "yes", "on")
         try:
             repo.set_agent_loop(pool, agent_id, loop_enabled=le,
-                                poll_interval_seconds=poll_interval_seconds or None)
+                                poll_interval_seconds=poll_interval_seconds or None,
+                                active_window_seconds=active_window_seconds or None,
+                                dormant_interval_seconds=dormant_interval_seconds or None)
         except Exception:  # noqa: BLE001 — bad interval etc.; just bounce back to the page
             pass
         return RedirectResponse("/agents", status_code=303)
@@ -892,29 +903,82 @@ def create_app(pool: Optional[ConnectionPool] = None,
     def agent_pause_state(agent_id: int):
         """JSON the pull worker polls to self-pace: seconds left on its cooldown,
         plus the dashboard-owned loop policy (loop_enabled + poll_interval_seconds)
-        so the shell loop (run-agent-loop.sh) cadences and on/off from the DB."""
+        so the shell loop (run-agent-loop.sh) cadences and on/off from the DB.
+
+        Migration 0024 (plan §7) additions: `status`, `active_window_seconds`,
+        `dormant_interval_seconds` (the side-car cadence-window overrides), and
+        `wake_at` — the per-project wake signal the side-car's check_wake()
+        watches for an increase to fire an immediate tick.
+
+        `wake_at` is looked up via `context.current_key()`, NOT the raw
+        `?project=` string off the request — this is the SAME resolved key the
+        "Wake all" button/POST /agents/wake bump with (Opus gate follow-up,
+        HIGH: read/write must be provably symmetric — same function, same
+        input). The multi-instance middleware (_coordinator_scope, this
+        module) already resolves whatever raw `?project=` a caller sent
+        through `registry.resolve_key()` into `context.current_key()` for
+        EVERY request (that's how `pool` above gets picked); reading
+        `get_wake_at` off the raw param instead would silently diverge the
+        moment a side-car's own `--project` string isn't an exact registry
+        instance key (e.g. a per-project label vs the dashboard's registry
+        key for it) — the bump lands on the resolved key, the read stayed on
+        the raw one, and the wake relay no-ops with no error anywhere."""
         from datetime import datetime, timezone
         a = repo.get_agent(pool, agent_id)
         pu = getattr(a, "paused_until", None) if a else None
         secs = 0
         if pu is not None:
             secs = max(0, int((pu - datetime.now(timezone.utc)).total_seconds()))
+        wake_at = repo.get_wake_at(pool, context.current_key())
         return JSONResponse({"agent_id": agent_id,
                              "paused_until": pu.isoformat() if pu else None,
                              "pause_seconds": secs,
                              "loop_enabled": bool(getattr(a, "loop_enabled", False)) if a else False,
-                             "poll_interval_seconds": int(getattr(a, "poll_interval_seconds", 300)) if a else 300})
+                             "poll_interval_seconds": int(getattr(a, "poll_interval_seconds", 300)) if a else 300,
+                             "status": getattr(a, "status", None) if a else None,
+                             "active_window_seconds": int(getattr(a, "active_window_seconds", 1800)) if a else 1800,
+                             "dormant_interval_seconds": int(getattr(a, "dormant_interval_seconds", 3600)) if a else 3600,
+                             "wake_at": wake_at.isoformat() if wake_at else None})
 
     @app.post("/agents/{agent_id}/heartbeat")
-    def agent_heartbeat(agent_id: int):
+    def agent_heartbeat(agent_id: int, status: Optional[str] = None):
         """Continuous liveness ping for the run-agent-loop.sh background sidecar.
         Refreshes last_seen (and revives offline->idle) every ~20s for the
         loop's whole lifetime, so a long model run / verify_run never crosses
         agent_stale_seconds and gets falsely reclaimed mid-work. touch_agent
         preserves 'busy'/'idle' status (only offline is promoted), so this never
-        clobbers an actively-working worker."""
-        repo.touch_agent(pool, agent_id)
+        clobbers an actively-working worker.
+
+        `status` (migration 0024, plan §7): optional durable-worker side-car
+        self-report — one of 'working' | 'idle' | 'dormant' — forwarded to
+        touch_agent, which maps it onto the DB status column. This is a plain
+        query/form param (not Form(...)) so it stays fully optional for every
+        existing caller. An invalid/unrecognized value is never a 4xx — a
+        heartbeat endpoint must never fail the very liveness signal that keeps
+        the caller from being reclaimed as dead — it is simply logged and
+        ignored (touch_agent already treats an unrecognized string exactly like
+        no status: revive-only, byte-identical to the pre-migration behavior)."""
+        if status is not None and status not in ("working", "idle", "dormant"):
+            print(f"agent_heartbeat: ignoring invalid status={status!r} for agent {agent_id}",
+                  file=sys.stderr)
+        repo.touch_agent(pool, agent_id, status=status)
         return JSONResponse({"agent_id": agent_id, "ok": True})
+
+    @app.post("/agents/wake")
+    def agents_wake(project: str):
+        """Bump the per-project wake signal (migration 0024, plan §7): every
+        side-car for `project` observes the increase on its next state poll and
+        fires an immediate tick, even mid-dormant-window. Posted to by the
+        "Wake all" button on the Agents page (form POST, hence the redirect
+        back — same convention as /agents/loop and /agents/pause above).
+
+        Bumps `context.current_key()` — the SAME registry-resolved key the
+        request middleware already derived from this exact `?project=` value
+        (not the raw `project` param itself) — so this is guaranteed to bump
+        the identical row GET /agents/{id}/pause reads, for ANY caller, not
+        just the button (which happens to pass an already-resolved key)."""
+        repo.bump_wake(pool, context.current_key())
+        return RedirectResponse("/agents", status_code=303)
 
     @app.get("/tiers", response_class=HTMLResponse)
     def tiers() -> str:
