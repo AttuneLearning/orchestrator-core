@@ -36,9 +36,11 @@ INSTANCE = os.environ.get("ORCH_INSTANCE", "__PROJECT_NAME__")
 WORKSPACE = "__WORKSPACE_ROOT__"
 ORCH_PATH = "__ORCH_PATH__"
 STATE_DIR = os.path.expanduser("~/.orch-watchdog")
-# Stale window: a bit beyond the daemon's AGENT_STALE_SECONDS so we only act once
-# the coordinator itself has given up on the heartbeat.
-STALE_SEC = int(os.environ.get("WATCHDOG_STALE_SEC", "2100"))
+# Stale window: beyond the coordinator's agent_stale_seconds (120s since the
+# loop-lifetime 20s heartbeat, 2026-07-22) so we only hard-restart once the
+# coordinator has already reclaimed the issue; 900s also clears run-agent-loop's
+# per-cycle cap paths so we never kill a merely-slow local-inference cycle.
+STALE_SEC = int(os.environ.get("WATCHDOG_STALE_SEC", "900"))
 MODEL = os.environ.get("WATCHDOG_MODEL", "qwen-local")
 DRY_RUN = "--dry-run" in sys.argv
 

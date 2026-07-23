@@ -30,12 +30,11 @@ sleep 1
 
 export ORCH_INSTANCE=__PROJECT_NAME__
 export REASONER=openai   # direct DO API (config engine_reasoner drives base_url/model/key)
-# Local qwen dev workers run long, heads-down cycles (slow local inference + large
-# context + code+tests) and can't emit a heartbeat mid-run. Give them a 30-min
-# stale window (vs the global 900s) so they aren't falsely marked offline and
-# churned through reclaim while legitimately working. Instance-scoped: this env
-# only affects the __PROJECT_NAME__ daemon and agent_stale_seconds.
-export AGENT_STALE_SECONDS="${AGENT_STALE_SECONDS:-1800}"
+# Stale window now lives in config/settings.yaml (thresholds.agent_stale_seconds,
+# 120s) — safe because run-agent-loop.sh heartbeats every 20s for the loop's whole
+# lifetime. Do NOT force a default here: env overrides yaml, so a hardcoded value
+# would shadow the config. Export only if the operator explicitly set it.
+if [ -n "${AGENT_STALE_SECONDS:-}" ]; then export AGENT_STALE_SECONDS; fi
 
 cd "$ORCH"
 setsid .venv/bin/python -m orchestrator.cli --instance __PROJECT_NAME__ run \

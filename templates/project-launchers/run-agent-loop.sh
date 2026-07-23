@@ -32,8 +32,8 @@
 #      AGENT_CYCLE_TIMEOUT (default 1800s — GAP-3 hard cap per work cycle),
 #      AGENT_WEDGE_REPEATS (default 3 — GAP-3: N consecutive identical-output
 #      cycles = a wedged model looping; pause 2h instead of burning tokens),
-#      AGENT_HEARTBEAT_SECONDS (default 60 — continuous liveness ping while cycle
-#      runs; 0 disables the heartbeat).
+#      AGENT_HEARTBEAT_SECONDS (default 20 — continuous liveness ping for the
+#      lifetime of the loop, through inter-cycle sleeps; 0 disables it).
 set -u
 AID="${1:?usage: run-agent-loop.sh <agent_id> <cmd...>}"; shift
 DASH="${ORCH_DASHBOARD:-__DASHBOARD_URL__}"
@@ -72,12 +72,14 @@ set_pause() {  # minutes
 # tool (heartbeat/my_queue/claim_issue). A long model run or verify_run makes no
 # such call for minutes, so the worker crosses agent_stale_seconds and gets
 # falsely reclaimed while perfectly alive. This sidecar pings a lightweight
-# liveness endpoint every HB_INTERVAL *for the duration of each work cycle*, so
-# liveness is continuous and runtime-agnostic (codex/claude/qwen). It preserves
-# busy/idle status server-side (only offline is revived). The sidecar self-exits
+# liveness endpoint every HB_INTERVAL for the LIFETIME of the loop — through
+# work cycles AND inter-cycle sleeps — so liveness is continuous and
+# runtime-agnostic (codex/claude/qwen); a short stale window (~120s) is safe.
+# It preserves busy/idle status server-side (only offline is revived; a stopped
+# loop's trap kills the pinger, so a dead worker still goes stale). Self-exits
 # if this script dies (kill -0 "$$"), so a SIGKILLed loop leaves no orphan that
 # keeps a dead worker looking alive.
-HB_INTERVAL="${AGENT_HEARTBEAT_SECONDS:-60}"
+HB_INTERVAL="${AGENT_HEARTBEAT_SECONDS:-20}"
 HB_PID=""
 start_heartbeat() {
   [ "$HB_INTERVAL" -gt 0 ] 2>/dev/null || return 0
@@ -104,6 +106,7 @@ echo "== durable log: $LOG =="
 idle=0
 soft=0   # consecutive transient-limit retries in the current streak
 same=0; last_hash=""   # GAP-3 wedge detector state
+start_heartbeat        # loop-lifetime: beats through cycles and inter-cycle sleeps
 while true; do
   # --- dashboard state (pause + loop policy), re-read every cycle so live edits
   #     on the Agents page take effect without relaunching -------------------
@@ -125,9 +128,7 @@ while true; do
   # A TUI needs the real terminal: no </dev/null, no |tee, no timeout wrapper.
   # Capture/classify/wedge machinery is headless-only, so it's skipped here.
   if [ "$INTERACTIVE" = "1" ]; then
-    start_heartbeat
     "$@"
-    stop_heartbeat
     if [ "$loop_enabled" = "false" ]; then
       echo "== agent $AID: dashboard loop_enabled=false -> TUI session ended, stopping ==" | tee -a "$LOG"
       break
@@ -140,10 +141,8 @@ while true; do
   tmpf="$(mktemp)"
   # GAP-3: hard per-cycle wall-clock cap — a hung/CPU-wedged model is killed
   # instead of holding its issue past the stale window (reclaim churn).
-  start_heartbeat
   timeout -k 30 "$CYCLE_TIMEOUT" "$@" </dev/null 2>&1 | tee -a "$tmpf" "$LOG"
   rc="${PIPESTATUS[0]:-0}"
-  stop_heartbeat
   if [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
     echo "== agent $AID: cycle exceeded ${CYCLE_TIMEOUT}s -> killed (GAP-3); backing off ==" | tee -a "$LOG"
     rm -f "$tmpf"; sleep "$eff_poll"; continue

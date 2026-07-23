@@ -908,8 +908,8 @@ def create_app(pool: Optional[ConnectionPool] = None,
     @app.post("/agents/{agent_id}/heartbeat")
     def agent_heartbeat(agent_id: int):
         """Continuous liveness ping for the run-agent-loop.sh background sidecar.
-        Refreshes last_seen (and revives offline->idle) every ~60s WHILE a work
-        cycle runs, so a long model run / verify_run never crosses
+        Refreshes last_seen (and revives offline->idle) every ~20s for the
+        loop's whole lifetime, so a long model run / verify_run never crosses
         agent_stale_seconds and gets falsely reclaimed mid-work. touch_agent
         preserves 'busy'/'idle' status (only offline is promoted), so this never
         clobbers an actively-working worker."""

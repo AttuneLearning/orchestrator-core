@@ -38,7 +38,11 @@ thresholds:
   drift_threshold: 0.5
   retry_cap: 3
   step_budget: 25
-  agent_stale_seconds: 900
+  # 120s: run-agent-loop.sh heartbeats every 20s for the loop lifetime (2026-07-22,
+  # durable-worker plan phase 1) — 6 missed beats before stale, with headroom for
+  # two consecutive slow pings (curl -m 8). Never set below ~4 missed beats:
+  # stale agents get their issues RECLAIMED, so a too-tight window churns work.
+  agent_stale_seconds: 120
   reclaim_cap: 3
   max_depth: 2
   max_subissues: 5
