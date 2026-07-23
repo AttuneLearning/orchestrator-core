@@ -234,5 +234,6 @@ def test_opencode_runtime_builds_config_and_command(settings, tmp_path, monkeypa
 
     assert interactive_args[:2] == ["--model", "orch_model/deepseek-v4-pro"]
     assert "run" not in interactive_args[:1]
-    assert "run one backend cycle for tendcharting" in " ".join(interactive_args)
+    # apply_interactive_prompt rewrites single-cycle directives for TUI launches.
+    assert "Run backend cycles continuously for tendcharting" in " ".join(interactive_args)
     assert default_config == interactive_config
