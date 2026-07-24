@@ -117,6 +117,11 @@ _agent() {
   _reap_driver "$name"
   _drop_window "$name"
   tmux new-window -t "$SESSION" -n "$name" -c "$path"
+  # remain-on-exit: if the TUI process exits (e.g. codex self-exits after a
+  # first-run auto-update, or any crash), keep the pane as a DEAD pane the
+  # side-car's respawn-pane can revive — instead of tmux closing the window,
+  # which would strand the driver on "can't find window" MARKER_ERRORs.
+  tmux set-window-option -t "$SESSION:$name" remain-on-exit on 2>/dev/null || true
   case "$rt" in
     opencode)
       tmux send-keys -t "$SESSION:$name" "$sc" C-m
