@@ -1227,6 +1227,9 @@ def _cmd_init(args, settings) -> int:
     print(f"  2. add a first goal:           orchestrator -i {project} add-goal "
           f"--pipeline {new_settings.default_pipeline} --title \"...\"")
     print("  3. launch the engine + workers.")
+    print("     one-command fleet bring-up (side-cars, dashboard-visible windows):")
+    print("       ./start-agent-sidecars.sh            # start the pull fleet as side-cars")
+    print("       ./start-agent-sidecars.sh --dry-run  # preview the windows + launch plan")
     print("\npreflight (orchestrator doctor):")
     code, report = onboarding.summarize(_run_doctor_checks(new_settings))
     print(report)
