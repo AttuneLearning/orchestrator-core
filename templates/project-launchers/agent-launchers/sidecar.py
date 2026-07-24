@@ -1347,6 +1347,10 @@ class Sidecar:
         # check_wake's dedup-on-increase. None means "never observed yet" --
         # the very first observation only sets this baseline, it never fires.
         self._last_wake_at: datetime | None = None
+        # Plan §15: last orchestrator work-signal (last_work_at) this process has
+        # observed, for check_work_signal's dedup-on-increase. Same baseline rule
+        # as _last_wake_at — first observation sets it without firing.
+        self._last_work_at: datetime | None = None
         self._stop = False
         self._log_fh = open(log_file, "a") if log_file else None
         # Phase 5 (plan §6): last time (self.clock() units) a BALANCE_ALERT
@@ -1433,6 +1437,47 @@ class Sidecar:
         self.pending = True
         self.next_tick_at = self.clock()
         self._log("WAKE", wake_at=wake_at.isoformat())
+
+    def check_work_signal(self, state_json: dict) -> None:
+        """Plan §15: orchestrator-authoritative work signal. `last_work_at` (ISO
+        ts or null) is the newest work event the orchestrator recorded for THIS
+        agent (report_work / code_committed / tests_run on its issues) — the
+        authoritative "did the worker do work", independent of whether the worker
+        emitted a TICK RESULT marker in its reply. When it advances since the last
+        poll the worker demonstrably did real work, so:
+          - reset the active window (last_worked_at = now) → no false
+            `window_elapsed` dormancy for a worker that IS producing,
+          - wake from dormant → resume normal cadence,
+          - clear the protocol-violation counter → a marker-shy but working model
+            (opencode/codex) never trips the 'stuck-suspect' alert or gets
+            watchdog-restarted for "no TICK RESULT".
+        It deliberately does NOT force an extra tick (unlike a wake) — normal
+        cadence proceeds; this only keeps the window/liveness bookkeeping honest.
+
+        Dedup mirrors check_wake: first observation sets the baseline WITHOUT
+        firing (else every restart mis-reads pre-existing work as new); equal =
+        no-op; strictly greater = fire once (baseline bumped before returning)."""
+        if not isinstance(state_json, dict):
+            return
+        raw = state_json.get("last_work_at")
+        if not raw:
+            return
+        try:
+            work_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return
+        if self._last_work_at is None:
+            self._last_work_at = work_at
+            return
+        if work_at <= self._last_work_at:
+            return
+        self._last_work_at = work_at
+        self.last_worked_at = self.clock()
+        self.protocol_violations = 0
+        if self.state == "DORMANT":
+            self.state = "ACTIVE"
+            self._log("ACTIVE", reason="orch_work_signal")
+        self._log("WORK_SIGNAL", last_work_at=work_at.isoformat())
 
     # -- signal handling --------------------------------------------------------
     def install_signal_handlers(self) -> None:
@@ -1563,6 +1608,10 @@ class Sidecar:
         # rule. Uses the same raw (pre-coercion) payload since wake_at isn't
         # part of the cadence policy dict.
         self.check_wake(raw_policy)
+        # Plan §15: orchestrator-authoritative work signal — reset the active
+        # window / wake / clear violations when the orchestrator shows this agent
+        # produced work, independent of any TICK RESULT marker. Same raw payload.
+        self.check_work_signal(raw_policy)
 
     # -- watchdog -------------------------------------------------------------
     def _alive_safe(self) -> bool:

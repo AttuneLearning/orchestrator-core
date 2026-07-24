@@ -208,6 +208,7 @@ class FakeDashboard:
             "poll_interval_seconds": poll_interval_seconds,
         }
         self.wake_at = None               # Phase 4: ISO string or None
+        self.last_work_at = None          # §15: orchestrator work signal, ISO or None
         self.agent_id = 1                 # Phase 5: DashboardClient shape
         self.project = "proj"
 
@@ -230,6 +231,8 @@ class FakeDashboard:
         payload = dict(self.policy)
         if self.wake_at is not None:
             payload["wake_at"] = self.wake_at
+        if self.last_work_at is not None:
+            payload["last_work_at"] = self.last_work_at
         return payload
 
     def pause(self, minutes=120) -> bool:
@@ -2490,3 +2493,89 @@ def test_idle_fallback_disabled_for_adapters_without_idle_quiet_seconds():
         clock.advance(1)
         sc.step(clock.t)
     assert len(adapter.injected) == 0     # never falls back, waits forever
+
+
+# --------------------------------------------------------------------------- #
+# §15: orchestrator-authoritative work signal (check_work_signal)
+# --------------------------------------------------------------------------- #
+
+def test_work_signal_first_observation_establishes_baseline_without_firing(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.protocol_violations = 2
+    worked_before = sc.last_worked_at
+    capsys.readouterr()
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:00:00+00:00"})
+    assert sc._last_work_at is not None
+    assert sc.last_worked_at == worked_before          # window NOT reset on baseline
+    assert sc.protocol_violations == 2                 # not cleared on baseline
+    assert "event=WORK_SIGNAL" not in capsys.readouterr().out
+
+
+def test_work_signal_increase_resets_window_and_clears_violations(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:00:00+00:00"})   # baseline
+    sc.protocol_violations = 3
+    sc.pending = False
+    clock.advance(500)
+    capsys.readouterr()
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:05:00+00:00"})   # greater -> fires
+    assert "event=WORK_SIGNAL" in capsys.readouterr().out
+    assert sc.last_worked_at == clock.t                # active window reset to now
+    assert sc.protocol_violations == 0                 # violations cleared
+    assert sc.pending is False                         # does NOT force a tick (unlike wake)
+
+
+def test_work_signal_equal_value_does_not_fire():
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:00:00+00:00"})   # baseline
+    sc.protocol_violations = 4
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:00:00+00:00"})   # equal -> no-op
+    assert sc.protocol_violations == 4
+
+
+def test_work_signal_wakes_from_dormant(capsys):
+    sc, adapter, dashboard, clock = make_sidecar()
+    sc.state = "DORMANT"
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:00:00+00:00"})   # baseline, no fire
+    assert sc.state == "DORMANT"
+    capsys.readouterr()
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:05:00+00:00"})   # increase
+    assert sc.state == "ACTIVE"
+    assert "event=WORK_SIGNAL" in capsys.readouterr().out
+
+
+def test_work_signal_keeps_active_window_alive_despite_invalid_ticks():
+    """§15 headline: a worker doing real work (orchestrator signal advances) never
+    hits window_elapsed even when it never emits a valid TICK RESULT marker."""
+    sc, adapter, dashboard, clock = make_sidecar(active_window=1800)
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:00:00+00:00"})   # baseline @ t=0
+    clock.advance(1000)
+    sc.check_work_signal({"last_work_at": "2026-01-01T00:16:00+00:00"})   # advances window
+    assert sc.last_worked_at == clock.t                                   # 1000
+    # 1801s past the ORIGINAL window-from-0, but only 801s since the work signal
+    # reset it -> still ACTIVE, not window_elapsed.
+    clock.advance(801)
+    sc.state = "ACTIVE"
+    sc._check_window(clock.t)
+    assert sc.state == "ACTIVE"
+
+
+def test_state_poll_relays_last_work_at_end_to_end():
+    """_maybe_poll_state feeds the fetched payload into check_work_signal."""
+    sc, adapter, dashboard, clock = make_sidecar(state_poll_interval=45)
+    sc.step(clock.t)                       # first poll; last_work_at still None
+    adapter.complete("TICK RESULT: NO WORK")
+    sc.step(clock.advance(0.1))
+
+    dashboard.last_work_at = "2026-01-01T00:00:00+00:00"
+    clock.advance(50)
+    sc.step(clock.t)                       # baseline observation, no fire
+    assert sc._last_work_at is not None
+
+    dashboard.last_work_at = "2026-01-01T00:05:00+00:00"
+    sc.protocol_violations = 2
+    clock.advance(50)
+    worked_before = sc.last_worked_at
+    sc.step(clock.t)                       # increase -> fires through _maybe_poll_state
+    assert sc.last_worked_at >= worked_before
+    assert sc.protocol_violations == 0
