@@ -366,3 +366,87 @@ a **6h** side-car soak for this cycle (2026-07-23), not the plan's ≥12h — th
 observation window is shortened by operator decision; the pass criteria
 (work across ≥3 ticks all valid, clean READY-TO-CLEAR handshake, no
 relaunch-for-work, no false-stale) are unchanged.
+
+## 15. Design change — orchestrator-authoritative work signal (2026-07-23)
+
+**Status:** APPROVED (operator), NOT yet implemented. Supersedes the
+"parser fallback" (option 1) floated against DEFECT-SIDECAR-1's compliance
+sub-issue. Target branch `feat/durable-worker-sidecar`.
+
+### 15.1 Problem this solves
+DEFECT-SIDECAR-1's fix (injecting `tick-contract.md`) delivers the contract, but
+two opencode models proved they will not reliably emit the required
+`TICK RESULT: WORKED #<id>` line: glm-5.2 (first soak) and deepseek-4-flash
+(re-soak, 5/5 ticks `valid=False`, violations 1→5, one FORCED_CLEAR, then
+DORMANT). Only claude complied. Because the side-car learns "did work happen"
+ONLY by text-parsing the worker's reply, a non-compliant model leaves it blind:
+`last_worked_at` never advances → spurious `window_elapsed` dormancy; context
+only ever cleared by the FORCED_CLEAR backstop, never a clean handshake. The
+marker is a fragile, model-dependent channel for information the orchestrator
+**already holds authoritatively.**
+
+### 15.2 Key realization — the info already exists at the orchestrator
+The worker reports work DIRECTLY to the orchestrator via MCP, independent of the
+side-car: `claim_issue`, `report_work`, `gate_decision`. Those land as recorded
+events (`_append_event` in `repository.py`: `code_committed`, `tests_run`, gate
+outcomes) on issues whose owner is the agent (`claim_issue` stamps
+`claimed_by=agent_id`). So "did agent N do real work since time T" is a
+server-side query over EXISTING data — no new worker behavior, no schema change.
+
+The `TICK RESULT` marker duplicates, in fragile reply-text, what the worker
+already tells the orchestrator over a transactional MCP channel. The fix is to
+stop parsing the duplicate and **have the side-car ASK the orchestrator.**
+
+### 15.3 Design — side-car ← orchestrator (poll, not relay)
+Invert the dependency. Do NOT route work through the side-car
+(worker→side-car→orchestrator would be a fragile step backward from the direct
+MCP path). Instead the side-car READS the orchestrator's authoritative record:
+
+- **Server (dashboard):** extend the state-poll response the side-car already
+  fetches — `GET /agents/{agent_id}/pause?project=…` (see `sidecar.py`
+  DashboardClient, `dashboard/app.py:902`) — with a monotonic per-agent work
+  signal, e.g. `last_work_at` (max `created_at` of work events on issues owned
+  by the agent) or a `work_seq` counter. "Work event" = `code_committed` /
+  gate `passed` / green `tests_run` / `report_work`. Bounded to a recent window;
+  it is derived, so **no migration** is required.
+- **Side-car:** in `_maybe_poll_state`, compare the new `last_work_at`/`work_seq`
+  against the value from the prior poll. If it advanced → treat as an
+  authoritative WORKED signal: `last_worked_at = now`, and flip DORMANT→ACTIVE
+  (exactly what a valid `TICK RESULT: WORKED` does today at `sidecar.py:1948`).
+  This decouples the window/cadence decision from the worker's reply formatting.
+
+### 15.4 What stays marker-driven (and why it's fine)
+`READY-TO-CLEAR` (early, worker-chosen context reset) is inherently local — the
+orchestrator can't know the worker's context window is filling. But that path is
+ALREADY backstopped by the TokenAccountant + `FORCED_CLEAR` (Phase 3), which is
+side-car-owned and needs no marker. So after 15.3, the `TICK RESULT` marker
+becomes **advisory, not load-bearing**: a complying model (claude) still gets a
+clean early clear via the marker; a non-complying model (opencode open-source)
+degrades gracefully to orchestrator-signalled work + token-backstop clears.
+Keep parsing the marker when present; never depend on it for correctness.
+
+### 15.5 Phasing
+- **Phase A — server signal.** Add the per-agent work signal to the state-poll
+  payload (dashboard route + repository query). Unit-test the query
+  (work events on owned issues since T; ignores non-work events; monotonic).
+- **Phase B — side-car consumption.** Consume the signal in `_maybe_poll_state`;
+  advance `last_worked_at` / wake on increase. Unit-test in `test_sidecar.py`
+  with a fake dashboard whose work signal advances mid-run: assert the window
+  does NOT elapse and DORMANT→ACTIVE fires, WITHOUT any valid `TICK RESULT`.
+- **Phase C — demote the marker.** Update `tick-contract.md` and comments to
+  describe `TICK RESULT` as advisory; confirm a fully non-emitting worker still
+  soaks cleanly (window kept alive by the orchestrator signal, clears by the
+  token backstop).
+
+### 15.6 Risks / open questions
+- **Attribution precision:** if a work event's owning-agent mapping is stale
+  (issue reassigned mid-tick), the signal could mis-credit. Mitigate by keying
+  on the event's own actor/`claimed_by` at event time rather than current owner.
+- **Latency:** `report_work` may land just after the tick returns; the next
+  ~45s state poll picks it up — acceptable for cadence, which operates on
+  minutes.
+- **Double-count harmlessness:** if BOTH a valid marker and the orchestrator
+  signal fire for one tick, both just set `last_worked_at = now` — idempotent.
+- **New coupling:** the side-car now depends on the dashboard exposing the
+  signal; degrade safely (signal absent/unreachable → fall back to today's
+  marker-only behavior, never crash — same tolerance as the existing poll).
