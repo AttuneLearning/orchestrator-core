@@ -71,11 +71,21 @@ _ensure_session() {
   tmux send-keys -t "$SESSION:orch" "clear; echo '=== orch ($SESSION) — orchestrator console ==='" C-m
 }
 
-# reap a background TUI driver for a given window name (no-op if none)
-_reap_driver() { pkill -f "SIDECAR_TMUX_TARGET=$SESSION:$1\\." 2>/dev/null || true; }
+# reap a background TUI driver for a window. Matches the driver's REAL argv
+# (`sidecar.py … --tmux-target <session>:<name>.`) — the SIDECAR_TMUX_TARGET env
+# var is NOT in the exec'd python's argv. The [s]idecar bracket keeps this pkill
+# pattern from ever matching its OWN command line (pkill -f self-match footgun).
+_reap_driver() { pkill -f "[s]idecar\\.py.*--tmux-target $SESSION:$1\\." 2>/dev/null || true; }
 
-# remove ALL windows with a given name (handles pre-existing duplicates)
-_drop_window() { while tmux kill-window -t "$SESSION:$1" 2>/dev/null; do :; done; }
+# remove ALL windows with a given name, addressed by unambiguous window-id —
+# `kill-window -t session:name` is ambiguous (errors) when names are duplicated.
+_drop_window() {
+  local wid
+  for wid in $(tmux list-windows -t "$SESSION" -F '#{window_id} #{window_name}' 2>/dev/null \
+               | awk -v n="$1" '$2==n{print $1}'); do
+    tmux kill-window -t "$wid" 2>/dev/null || true
+  done
+}
 
 # _agent <name> <worktree_subdir> <launcher> <launch_team_arg> <runtime>
 # console = on-demand: create the banner window only if missing, never kill a live one.
@@ -156,6 +166,8 @@ teardown_agents() {
   for w in be-dev be-qa fe-dev fe-qa sr-dev sr-qa be-dev-2; do
     _reap_driver "$w"; _drop_window "$w"
   done
+  # catch-all: any remaining TUI driver bound to this session (bracket = no self-match)
+  pkill -f "[s]idecar\\.py.*--tmux-target $SESSION:" 2>/dev/null || true
   echo "agent windows + drivers torn down (session '$SESSION' and orch window kept)."
 }
 
