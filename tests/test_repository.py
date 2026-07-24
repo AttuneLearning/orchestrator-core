@@ -86,3 +86,38 @@ def test_adr_key_increments_per_domain(pool):
     a2 = repo.create_adr(pool, "data", "Use pgvector")
     assert a1["adr_key"] == "ADR-DATA-001"
     assert a2["adr_key"] == "ADR-DATA-002"
+
+
+def test_agent_last_work_at_signal(pool):
+    """Plan §15: side-car's orchestrator-authoritative work signal.
+    Tracks the latest work event on the agent's OWNED issues, ignores non-work
+    events and other agents' work, and is monotonic."""
+    goal = repo.create_goal(pool, "Goal")
+    agent = repo.register_agent(pool, "backend", "dev")
+    other = repo.register_agent(pool, "frontend", "dev")
+    mine = repo.create_issue(pool, goal.id, "mine", team="backend")
+    theirs = repo.create_issue(pool, goal.id, "theirs", team="frontend")
+    repo.claim_issue(pool, mine.id, agent.id)
+    repo.claim_issue(pool, theirs.id, other.id)
+
+    # nothing produced yet
+    assert repo.agent_last_work_at(pool, agent.id) is None
+
+    # a non-work event (state churn) must NOT register as work
+    repo.append_log(pool, mine.id, "state_change", {})
+    assert repo.agent_last_work_at(pool, agent.id) is None
+
+    # a work event on my issue registers
+    repo.append_log(pool, mine.id, "tests_run", {"passed": True})
+    t1 = repo.agent_last_work_at(pool, agent.id)
+    assert t1 is not None
+
+    # a later work event advances the signal (monotonic)
+    repo.append_log(pool, mine.id, "code_committed", {"sha": "abc"})
+    t2 = repo.agent_last_work_at(pool, agent.id)
+    assert t2 >= t1
+
+    # work on ANOTHER agent's issue must not move my signal
+    repo.append_log(pool, theirs.id, "code_committed", {"sha": "def"})
+    assert repo.agent_last_work_at(pool, agent.id) == t2
+    assert repo.agent_last_work_at(pool, other.id) is not None

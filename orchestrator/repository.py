@@ -363,6 +363,33 @@ def agent_seconds_since_seen(pool: ConnectionPool, agent_id: int) -> Optional[fl
     return float(row[0])
 
 
+# Event types that mean a worker actually PRODUCED work on an issue (not mere
+# state churn). The durable-worker side-car's orchestrator-authoritative work
+# signal (plan §15) keys on these.
+WORK_EVENT_TYPES = ("code_committed", "tests_run")
+
+
+def agent_last_work_at(pool: ConnectionPool, agent_id: int):
+    """Timestamp of the most recent WORK event (WORK_EVENT_TYPES) on any issue
+    currently assigned to this agent, or None. Monotonic in practice (events only
+    append). Plan §15: the side-car polls this as the authoritative "did agent N
+    do work" signal — derived from the report_work/commit events the worker
+    already records via MCP — instead of parsing a TICK RESULT marker out of the
+    worker's reply. No new worker behavior, no schema change.
+
+    NB (§15.6): attribution is by the issue's CURRENT assigned_agent; a work event
+    on an issue reassigned mid-tick could mis-credit. Acceptable for the cadence
+    decision this feeds; tighten to event-time actor if it ever matters."""
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT MAX(e.created_at) FROM issue_events e "
+            "JOIN issues i ON e.issue_id = i.id "
+            "WHERE i.assigned_agent = %s AND e.event_type = ANY(%s)",
+            (agent_id, list(WORK_EVENT_TYPES)),
+        ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
 def unassign_issue(pool: ConnectionPool, issue_id: int) -> None:
     """Clear an issue's assigned agent (does not touch agent status). Used when a
     pull gate has no eligible external worker, so the gate isn't falsely 'owned'

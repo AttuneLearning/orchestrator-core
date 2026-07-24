@@ -930,6 +930,11 @@ def create_app(pool: Optional[ConnectionPool] = None,
         if pu is not None:
             secs = max(0, int((pu - datetime.now(timezone.utc)).total_seconds()))
         wake_at = repo.get_wake_at(pool, context.current_key())
+        # Plan §15: orchestrator-authoritative work signal. The side-car reads
+        # last_work_at and, when it advances between polls, treats it as a WORKED
+        # tick (reset the active window, wake from dormant) — no dependence on the
+        # worker emitting a TICK RESULT marker in its reply text.
+        last_work_at = repo.agent_last_work_at(pool, agent_id)
         return JSONResponse({"agent_id": agent_id,
                              "paused_until": pu.isoformat() if pu else None,
                              "pause_seconds": secs,
@@ -938,7 +943,8 @@ def create_app(pool: Optional[ConnectionPool] = None,
                              "status": getattr(a, "status", None) if a else None,
                              "active_window_seconds": int(getattr(a, "active_window_seconds", 1800)) if a else 1800,
                              "dormant_interval_seconds": int(getattr(a, "dormant_interval_seconds", 3600)) if a else 3600,
-                             "wake_at": wake_at.isoformat() if wake_at else None})
+                             "wake_at": wake_at.isoformat() if wake_at else None,
+                             "last_work_at": last_work_at.isoformat() if last_work_at else None})
 
     @app.post("/agents/{agent_id}/heartbeat")
     def agent_heartbeat(agent_id: int, status: Optional[str] = None):
