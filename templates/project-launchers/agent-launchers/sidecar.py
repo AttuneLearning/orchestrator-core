@@ -173,7 +173,14 @@ def parse_tick_result(text: str | None) -> TickResult:
     """Tolerant parser: finds the LAST case-insensitive `TICK RESULT:` in
     `text` (the last completed assistant message) and interprets the rest of
     that line. Never raises; a missing/garbled marker just comes back
-    invalid=False so the caller can count it as a protocol violation."""
+    invalid=False so the caller can count it as a protocol violation.
+
+    §15: the marker is now ADVISORY. It is the fast LOCAL path (explicit ids +
+    READY-TO-CLEAR handshake) when a model emits it, but the authoritative
+    "did work happen" is check_work_signal (the orchestrator's work record),
+    which resets the active window and clears the violation counter on its own —
+    so a worker that never emits a valid marker (glm/deepseek/codex) is no longer
+    stranded by this returning invalid=False."""
     if not text:
         return TickResult(valid=False, raw="")
 

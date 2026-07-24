@@ -369,7 +369,12 @@ relaunch-for-work, no false-stale) are unchanged.
 
 ## 15. Design change — orchestrator-authoritative work signal (2026-07-23)
 
-**Status:** APPROVED (operator), NOT yet implemented. Supersedes the
+**Status:** **DELIVERED 2026-07-24** — Phase A (`fedc5ee` engine work signal),
+Phase B (`8f12416` side-car consumes it), Phase C (this commit — marker demoted
+to advisory in tick-contract.md + parser docstring). 173 tests green; deployed
+live (dashboard restarted, fleet relaunched) and validated in production: first
+`WORK_SIGNAL` fired on fe-qa (codex) with `TICK_RESULT=0` — work credited with
+no marker emitted. Supersedes the
 "parser fallback" (option 1) floated against DEFECT-SIDECAR-1's compliance
 sub-issue. Target branch `feat/durable-worker-sidecar`.
 
